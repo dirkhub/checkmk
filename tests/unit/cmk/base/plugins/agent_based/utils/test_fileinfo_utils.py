@@ -371,6 +371,27 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
                 Metric("age_newest", 98209582),
             ],
         ),
+(
+            "my_folder/*.dat",
+            {"group_patterns": [("~my_folder/*.dat", "")]},
+            Fileinfo(
+                reftime=1563288717,
+                files={
+                    "my_folder/*.dat": FileinfoItem(
+                        name="my_folder/*.dat",
+                        missing=True,  # no files found
+                        time=1563288717,
+                    ),
+                },
+            ),
+            [
+                Result(state=State.OK, notice="Include patterns: ~my_folder/*.dat"),
+                Result(state=State.OK, summary="Count: 0"),
+                Metric("count", 0),
+                Result(state=State.OK, summary="Size: 0 B"),
+                Metric("size", 0),
+            ],
+        ),        
     ],
 )
 def test_check_fileinfo_groups_data(  # type:ignore[no-untyped-def]
