@@ -371,7 +371,7 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
                 Metric("age_newest", 98209582),
             ],
         ),
-(
+        (
             "my_folder/*.dat",
             {"group_patterns": [("~my_folder/*.dat", "")]},
             Fileinfo(
@@ -393,7 +393,7 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
                 Result(state=State.OK, summary="Size: 0 B"),
                 Metric("size", 0),
             ],
-        ),        
+        ),
     ],
 )
 def test_check_fileinfo_groups_data(  # type:ignore[no-untyped-def]
