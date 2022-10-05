@@ -380,6 +380,8 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
                     "my_folder/*.dat": FileinfoItem(
                         name="my_folder/*.dat",
                         missing=True,  # no files found
+                        failed=True,
+                        size=None,
                         time=1563288717,
                     ),
                 },
