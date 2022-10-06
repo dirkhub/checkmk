@@ -446,7 +446,7 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
         ),
         (
             [
-                ('Count', 'count', 0, int),
+                ('Count', 'count', 0, saveint),
                 ('Size', 'size', 0, get_filesize_human_readable),
                 ('Largest size', 'size_largest', None, get_filesize_human_readable),
                 ('Smallest size', 'size_smallest', None, get_filesize_human_readable),
@@ -457,7 +457,7 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
             [
                 Result(
                     state=State.OK,
-                    summary="",
+                    summary=None,
                 )
             ],
         )
