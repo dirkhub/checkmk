@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from freezegun import freeze_time
 
-from cmk.base.check_api import get_age_human_readable, get_filesize_human_readable
+from cmk.base.check_api import get_age_human_readable, get_filesize_human_readable, saveint
 from cmk.base.plugins.agent_based.agent_based_api.v1 import Metric, Result, State
 from cmk.base.plugins.agent_based.agent_based_api.v1.type_defs import CheckResult
 from cmk.base.plugins.agent_based.utils.fileinfo import (
