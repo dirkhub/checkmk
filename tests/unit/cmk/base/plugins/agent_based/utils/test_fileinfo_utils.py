@@ -450,8 +450,8 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
                 ('Size', 'size', 0, get_filesize_human_readable),
                 ('Largest size', 'size_largest', None, get_filesize_human_readable),
                 ('Smallest size', 'size_smallest', None, get_filesize_human_readable),
-                ('Oldest age', 'age_oldest', None, <lambda>),
-                ('Newest age', 'age_newest', None, <lambda>),
+                ('Oldest age', 'age_oldest', None, get_age_human_readable),
+                ('Newest age', 'age_newest', None, get_age_human_readable),
                 ('Date pattern', 'date pattern', '', <class 'str'>)
             ],
             {'conjunctions': [(2, ['Max recursion depth reached'])], 'maxcount': (10, 20)}
