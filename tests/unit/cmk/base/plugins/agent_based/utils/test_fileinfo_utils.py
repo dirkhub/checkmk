@@ -453,14 +453,14 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
                 ('Oldest age', 'age_oldest', None, get_age_human_readable),
                 ('Newest age', 'age_newest', None, get_age_human_readable),
             ],
-            {'conjunctions': [(2, ['Max recursion depth reached'])], 'maxcount': (10, 20)}
+            {'conjunctions': [(2, ['Max recursion depth reached'])], 'maxcount': (10, 20)},
             [
                 Result(
                     state=State.OK,
                     summary="",
                 )
             ],
-        )        
+        )
     ],
 )
 def test__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
