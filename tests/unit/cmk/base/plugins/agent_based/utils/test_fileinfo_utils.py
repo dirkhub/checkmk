@@ -460,7 +460,7 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
                     summary=None,
                 )
             ],
-        )
+        ),
     ],
 )
 def test__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
