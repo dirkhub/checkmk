@@ -446,14 +446,14 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
         ),
         (
             [
-                ('Count', 'count', 0, saveint),
-                ('Size', 'size', 0, get_filesize_human_readable),
-                ('Largest size', 'size_largest', None, get_filesize_human_readable),
-                ('Smallest size', 'size_smallest', None, get_filesize_human_readable),
-                ('Oldest age', 'age_oldest', None, get_age_human_readable),
-                ('Newest age', 'age_newest', None, get_age_human_readable),
+                ("Count", "count", 0, saveint),
+                ("Size", "size", 0, get_filesize_human_readable),
+                ("Largest size", "size_largest", None, get_filesize_human_readable),
+                ("Smallest size", "size_smallest", None, get_filesize_human_readable),
+                ("Oldest age", "age_oldest", None, get_age_human_readable),
+                ("Newest age", "age_newest", None, get_age_human_readable),
             ],
-            {'conjunctions': [(2, [('age_oldest_lower', 129600)])], 'maxcount': (10, 20)},
+            {"conjunctions": [(2, [("age_oldest_lower", 129600)])], "maxcount": (10, 20)},
             [
                 Result(
                     state=State.OK,
