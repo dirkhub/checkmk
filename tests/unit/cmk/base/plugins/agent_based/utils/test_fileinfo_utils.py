@@ -456,7 +456,7 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
             {"conjunctions": [(2, [("age_oldest_lower", 129600)])], "maxcount": (10, 20)},
             [
                 Result(
-                    state=State.OK,
+                    state=None,
                     summary=None,
                 )
             ],
