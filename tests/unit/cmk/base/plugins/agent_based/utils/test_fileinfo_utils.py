@@ -388,8 +388,8 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
             ),
             [
                 Result(state=State.OK, notice="Include patterns: ~my_folder/*.dat"),
-                Result(state=State.OK, summary="Count: 1"),
-                Metric("count", 1),
+                Result(state=State.OK, summary="Count: 0"),
+                Metric("count", 0),
                 Result(state=State.OK, summary="Size: 0 B"),
                 Metric("size", 0),
             ],
