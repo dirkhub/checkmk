@@ -443,7 +443,25 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
                     summary="Conjunction: size at 12 B AND newest age below 1 day 0 hours",
                 )
             ],
-        )
+        ),
+        (
+            [
+                ('Count', 'count', 0, saveint),
+                ('Size', 'size', 0, get_filesize_human_readable),
+                ('Largest size', 'size_largest', None, get_filesize_human_readable),
+                ('Smallest size', 'size_smallest', None, get_filesize_human_readable),
+                ('Oldest age', 'age_oldest', None, <lambda>),
+                ('Newest age', 'age_newest', None, <lambda>),
+                ('Date pattern', 'date pattern', '', <class 'str'>)
+            ],
+            {'conjunctions': [(2, ['Max recursion depth reached'])], 'maxcount': (10, 20)}
+            [
+                Result(
+                    state=State.OK,
+                    summary="",
+                )
+            ],
+        )        
     ],
 )
 def test__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
