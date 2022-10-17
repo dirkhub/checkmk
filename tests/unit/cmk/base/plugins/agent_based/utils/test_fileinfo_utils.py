@@ -444,6 +444,18 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
                 )
             ],
         ),
+    ],
+)
+def test__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
+    check_definition, params, expected_result
+) -> None:
+    result = list(_fileinfo_check_conjunctions(check_definition, params))
+    assert result == expected_result
+
+
+@pytest.mark.parametrize(
+    "check_definition, params",
+    [
         (
             [
                 ("Count", "count", 0, saveint),
@@ -453,18 +465,14 @@ def test__fileinfo_check_function(  # type:ignore[no-untyped-def]
                 ("Oldest age", "age_oldest", None, get_age_human_readable),
                 ("Newest age", "age_newest", None, get_age_human_readable),
             ],
-            {"conjunctions": [(2, [("age_oldest_lower", 129600)])], "maxcount": (10, 20)},
-            [
-                Result(
-                    state=None,
-                    summary=None,
-                )
-            ],
+            {"conjunctions": [(2, [("age_oldest_lower", 129600)])], "maxcount": (10, 20)}
         ),
-    ],
+    ]
 )
-def test__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
-    check_definition, params, expected_result
+def test_typeerror__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
+    check_definition, params
 ) -> None:
-    result = list(_fileinfo_check_conjunctions(check_definition, params))
-    assert result == expected_result
+    try:
+        result = list(_fileinfo_check_conjunctions(check_definition, params))
+    except TypeError:
+        fail("TypeError ", result)
