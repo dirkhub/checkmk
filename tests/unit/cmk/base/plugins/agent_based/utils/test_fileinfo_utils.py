@@ -465,9 +465,9 @@ def test__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
                 ("Oldest age", "age_oldest", None, get_age_human_readable),
                 ("Newest age", "age_newest", None, get_age_human_readable),
             ],
-            {"conjunctions": [(2, [("age_oldest_lower", 129600)])], "maxcount": (10, 20)}
+            {"conjunctions": [(2, [("age_oldest_lower", 129600)])], "maxcount": (10, 20)},
         ),
-    ]
+    ],
 )
 def test_typeerror__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
     check_definition, params
