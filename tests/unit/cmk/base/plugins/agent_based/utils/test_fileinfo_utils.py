@@ -473,6 +473,6 @@ def test_typeerror__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
     check_definition, params
 ) -> None:
     try:
-        _fileinfo_check_conjunctions(check_definition, params)
+        _result = list(_fileinfo_check_conjunctions(check_definition, params))
     except TypeError:
         pytest.fail("TypeError in _fileinfo_check_conjunctions with empty file list.")
