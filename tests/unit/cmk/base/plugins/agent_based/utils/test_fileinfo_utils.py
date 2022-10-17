@@ -475,4 +475,4 @@ def test_typeerror__fileinfo_check_conjunctions(  # type:ignore[no-untyped-def]
     try:
         result = list(_fileinfo_check_conjunctions(check_definition, params))
     except TypeError:
-        self.fail("TypeError ", result)
+        pytest.fail("TypeError ", result)
