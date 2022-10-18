@@ -371,7 +371,7 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
                 Metric("age_newest", 98209582),
             ],
         ),
-        pytest.param(
+        (
             "my_folder/*.dat",
             {
                 "group_patterns": [("~my_folder/*.dat", "")],
@@ -397,7 +397,6 @@ def test__filename_matches(  # type:ignore[no-untyped-def]
                 Result(state=State.OK, summary="Size: 0 B"),
                 Metric("size", 0),
             ],
-            id="test no matching pattern for conjunction",
         ),
     ],
 )
