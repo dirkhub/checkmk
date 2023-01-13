@@ -215,7 +215,7 @@ class RescheduleIcon(Icon):
                 if row[what + "_check_command"].startswith("check_mk-"):
                     servicedesc = "Check_MK"
                     icon = "reload_cmk"
-                    txt = _("Reschedule 'Checkmk' service")
+                    txt = _("Reschedule 'Check_MK' service")
 
             url = "onclick:cmk.views.reschedule_check(this, %s, %s, %s, %s);" % (
                 json.dumps(row["site"]),
@@ -398,8 +398,7 @@ class PerfgraphIcon(Icon):
         return 20
 
     def render(self, what, row, tags, custom_vars):
-        pnpgraph_present = row[what + "_pnpgraph_present"]
-        if pnpgraph_present == 1:
+        if row[what + "_pnpgraph_present"] == 1:
             return self._pnp_icon(row, what)
 
     def _pnp_icon(self, row, what):
@@ -411,8 +410,10 @@ class PerfgraphIcon(Icon):
         if is_mobile(request, response):
             return
 
+        graph_icon_name = ("%s_graph" % what) if what in ["host", "service"] else "graph"
+
         return html.render_a(
-            content=html.render_icon("graph", ""),
+            content=html.render_icon(graph_icon_name, ""),
             href=url,
             onmouseout="cmk.hover.hide()",
             onmouseover="cmk.graph_integration.show_hover_graphs(event, %s, %s, %s);"
@@ -1124,6 +1125,8 @@ class AggregationIcon(Icon):
             start = args.find("-a' '") + 5
             end = args.find("' ", start)
             aggr_name = args[start:end]
+            aggr_name = aggr_name.replace("$HOSTADDRESS$", row["host_address"])
+            aggr_name = aggr_name.replace("$HOSTNAME$", row["host_name"])
 
             url = "%s/check_mk/view.py?view_name=aggr_single&aggr_name=%s" % (
                 base_url,

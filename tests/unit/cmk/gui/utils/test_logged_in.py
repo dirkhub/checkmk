@@ -11,19 +11,14 @@ import pytest
 from tests.testlib.users import create_and_destroy_user
 
 import cmk.utils.paths
+from cmk.utils.type_defs import UserId
 
 import cmk.gui.permissions as permissions
 from cmk.gui.config import builtin_role_ids
 from cmk.gui.exceptions import MKAuthException
 from cmk.gui.globals import config
 from cmk.gui.globals import user as global_user
-from cmk.gui.utils.logged_in import (
-    LoggedInNobody,
-    LoggedInSuperUser,
-    LoggedInUser,
-    SuperUserContext,
-    UserContext,
-)
+from cmk.gui.utils.logged_in import LoggedInNobody, LoggedInSuperUser, LoggedInUser, UserContext
 from cmk.gui.watolib.utils import may_edit_ruleset
 
 
@@ -35,9 +30,9 @@ def test_user_context(with_user):
     assert global_user.id is None
 
 
-def test_super_user_context(request_context):
+def test_super_user_context(request_context, run_as_superuser):
     assert global_user.id is None
-    with SuperUserContext():
+    with run_as_superuser():
         assert global_user.role_ids == ["admin"]
     assert global_user.id is None
 
@@ -67,6 +62,16 @@ def test_user_context_nested(with_user, with_admin):
         assert global_user.id == first_user_id
 
     assert global_user.id is None
+
+
+def test_user_context_explicit_permissions(with_user: tuple[UserId, str]) -> None:
+    assert not global_user.may("some_permission")
+    with UserContext(
+        with_user[0],
+        explicit_permissions={"some_permission", "some_other_permission"},
+    ):
+        assert global_user.may("some_permission")
+    assert not global_user.may("some_permission")
 
 
 @pytest.mark.parametrize(
@@ -134,7 +139,7 @@ def test_unauthenticated_users_authorized_sites(monkeypatch, user):
         "site1": {},
     }
 
-    monkeypatch.setattr("cmk.gui.sites.allsites", lambda: {"site1": {}, "site2": {}})
+    monkeypatch.setattr("cmk.gui.sites.get_enabled_sites", lambda: {"site1": {}, "site2": {}})
     assert user.authorized_sites() == {"site1": {}, "site2": {}}
 
 
@@ -142,7 +147,7 @@ def test_unauthenticated_users_authorized_sites(monkeypatch, user):
 def test_unauthenticated_users_authorized_login_sites(monkeypatch, user):
     monkeypatch.setattr("cmk.gui.sites.get_login_slave_sites", lambda: ["slave_site"])
     monkeypatch.setattr(
-        "cmk.gui.sites.allsites",
+        "cmk.gui.sites.get_enabled_sites",
         lambda: {
             "master_site": {},
             "slave_site": {},
@@ -288,6 +293,14 @@ def test_monitoring_user_permissions(mocker, monitoring_user):
         config,
         "roles",
         {
+            # The admin permissions are needed, otherwise the teardown code would not run due to
+            # missing permissions.
+            "admin": {
+                "permissions": {
+                    "wato.users": True,
+                    "wato.edit": True,
+                },
+            },
             "user": {
                 "permissions": {
                     "action.star": False,

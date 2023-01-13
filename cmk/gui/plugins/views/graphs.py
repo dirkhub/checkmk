@@ -54,7 +54,7 @@ multisite_builtin_views.update(
             "show_filters": [],
             "sorters": [],
             "icon": "service_graph",
-            "title": _("Service Graphs"),
+            "title": _("Service graphs"),
             "topic": "history",
         },
         "host_graphs": {
@@ -83,7 +83,7 @@ multisite_builtin_views.update(
             "public": True,
             "show_filters": [],
             "sorters": [],
-            "icon": "graph",
+            "icon": "host_graph",
             "title": _("Host graphs"),
             "topic": "history",
         },
@@ -213,7 +213,7 @@ class PainterServiceGraphs(Painter):
         return "service_graphs"
 
     def title(self, cell):
-        return _("Service Graphs with Timerange Previews")
+        return _("Service graphs with timerange previews")
 
     @property
     def columns(self):

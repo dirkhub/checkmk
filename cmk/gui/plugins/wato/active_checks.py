@@ -250,6 +250,14 @@ def _valuespec_active_checks_icmp():
                 ),
             ),
             (
+                "multiple_services",
+                Checkbox(
+                    title=_("Multiple services"),
+                    label=_("Create a service for every pinged IP address"),
+                    default_value=False,
+                ),
+            ),
+            (
                 "min_pings",
                 Integer(
                     title=_("Number of positive responses required for OK state"),
@@ -506,8 +514,12 @@ def _valuespec_active_checks_dns():
     return Tuple(
         title=_("Check DNS service"),
         help=_(
-            "Check the resolution of a hostname into an IP address by a DNS server. "
-            "This check uses <tt>check_dns</tt> from the standard Nagios plugins."
+            "Check the resolution of a hostname into an IP address by a DNS "
+            "server. This check uses <tt>check_dns</tt> from the standard "
+            "Nagios plugins. Note, that check_dns will always be executed in "
+            "the monitoring site. By default, the configured host(s) that "
+            "this rule applies to is used as DNS server. This behaviour can "
+            "be configured by using the option <tt>DNS Server</tt>. "
         ),
         elements=[
             TextInput(
@@ -535,20 +547,22 @@ def _valuespec_active_checks_dns():
                                 elements=[
                                     FixedValue(
                                         value=None,
-                                        totext=_("this host"),
-                                        title=_("Use this host as a DNS server for the lookup"),
+                                        title=_(
+                                            "Use the address of the host for which the service is generated"
+                                        ),
+                                        totext=_(
+                                            "This is the default behaviour if the option is not set."
+                                        ),
                                     ),
                                     TextInput(
                                         title=_("Specify DNS Server"),
                                         allow_empty=False,
-                                        help=_(
-                                            "Optional DNS server you want to use for the lookup"
-                                        ),
                                     ),
                                     FixedValue(
                                         value="default DNS server",
-                                        totext=_("default DNS server"),
-                                        title=_("Use default DNS server"),
+                                        title=_(
+                                            "Use the default DNS server(s) specified in /etc/resolv.conf"
+                                        ),
                                     ),
                                 ],
                             ),
@@ -2214,13 +2228,18 @@ def _valuespec_active_checks_bi_aggr():
                                 "auth_mode",
                                 DropdownChoice(
                                     title=_("Authentication Mode"),
-                                    default_value="cookie",
+                                    default_value="header",
                                     choices=[
-                                        ("cookie", _("Form (Cookie) based")),
+                                        ("header", _("Authorization Header")),
                                         ("basic", _("HTTP Basic")),
                                         ("digest", _("HTTP Digest")),
                                         ("kerberos", _("Kerberos")),
                                     ],
+                                    deprecated_choices=("cookie",),
+                                    invalid_choice_error=_(
+                                        "The specified choice is no longer available. "
+                                        "Please use another, like 'header' instead."
+                                    ),
                                 ),
                             ),
                             (
@@ -2650,10 +2669,13 @@ def _valuespec_active_checks_by_ssh():
                         "accept_new_host_keys",
                         FixedValue(
                             True,
-                            title=_("Enable automatic host key acceptance"),
+                            title=_(
+                                "Enable automatic host key acceptance (OpenSSH version >= 7.6)"
+                            ),
                             help=_(
                                 "This will automatically accept hitherto-unseen keys"
-                                "but will refuse connections for changed or invalid hostkeys"
+                                "but will refuse connections for changed or invalid hostkeys. "
+                                "This option only works with OpenSSH version >= 7.6."
                             ),
                             totext=_(
                                 "Automatically stores the host key with no manual input requirement"

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import abc
 import time
-from functools import partial
+from functools import partial, total_ordering
 from typing import (
     Any,
     Callable,
@@ -34,6 +34,7 @@ from cmk.utils.structured_data import (
     SDKeys,
     SDPath,
     SDRawPath,
+    SDValue,
     StructuredDataNode,
     Table,
 )
@@ -77,7 +78,7 @@ from cmk.gui.plugins.visuals.inventory import (
 from cmk.gui.plugins.visuals.utils import (
     filter_registry,
     get_livestatus_filter_headers,
-    get_ranged_table,
+    get_ranged_table_filter_name,
     visual_info_registry,
     VisualInfo,
 )
@@ -95,9 +96,30 @@ if TYPE_CHECKING:
 PaintResult = Tuple[str, Union[str, HTML]]
 PaintFunction = Callable[[Any], PaintResult]
 
+_PAINT_FUNCTION_NAME_PREFIX = "inv_paint_"
+_PAINT_FUNCTIONS = {}
+
+
+def update_paint_functions(mapping: Mapping[str, PaintFunction]) -> None:
+    # Update paint functions from
+    # 1. views (local web plugins are loaded including display hints and paint functions)
+    # 2. here
+    _PAINT_FUNCTIONS.update(
+        {k: v for k, v in mapping.items() if k.startswith(_PAINT_FUNCTION_NAME_PREFIX)}
+    )
+
+
+def _get_paint_function_from_globals(paint_name: str) -> PaintFunction:
+    # Do not overwrite local paint functions
+    update_paint_functions({k: v for k, v in globals().items() if k not in _PAINT_FUNCTIONS})
+    return _PAINT_FUNCTIONS[_PAINT_FUNCTION_NAME_PREFIX + paint_name]
+
 
 def _paint_host_inventory_tree(
-    row: Row, invpath: SDRawPath = ".", column: str = "host_inventory"
+    row: Row,
+    invpath: SDRawPath = ".",
+    column: str = "host_inventory",
+    render_single_attribute: bool = False,
 ) -> CellSpec:
     raw_hostname = row.get("host_name")
     assert isinstance(raw_hostname, str)
@@ -142,8 +164,17 @@ def _paint_host_inventory_tree(
         return "", ""
 
     with output_funnel.plugged():
-        child.show(tree_renderer)
+        if isinstance(child, Attributes) and render_single_attribute:
+            # In host views like "Switch port statistics" the value is rendered as a single
+            # attribute and not within a table.
+            if len(attributes := list(child.pairs.items())) == 1:
+                key, value = attributes[-1]
+                tree_renderer.show_attribute(value, _get_display_hint("%s.%s" % (invpath, key)))
+        else:
+            child.show(tree_renderer)
+
         code = HTML(output_funnel.drain())
+
     return td_class, code
 
 
@@ -229,7 +260,9 @@ def _declare_inv_column(
         # not look good for the HW/SW inventory tree
         "printable": is_attribute,
         "load_inv": True,
-        "paint": lambda row: _paint_host_inventory_tree(row, invpath),
+        "paint": lambda row: _paint_host_inventory_tree(
+            row, invpath, render_single_attribute=is_attribute
+        ),
         "sorter": name,
     }
     if short:
@@ -769,8 +802,7 @@ def _find_display_hint_id(invpath: SDRawPath) -> Optional[str]:
 def _convert_display_hint(hint: InventoryHintSpec) -> InventoryHintSpec:
     """Convert paint type to paint function, for the convenciance of the called"""
     if "paint" in hint:
-        paint_function_name = "inv_paint_" + hint["paint"]
-        hint["paint_function"] = globals()[paint_function_name]
+        hint["paint_function"] = _get_paint_function_from_globals(hint["paint"])
 
     return hint
 
@@ -899,7 +931,7 @@ def _declare_invtable_column(
     sortfunc = hint.get("sort", cmp_func)
     if "paint" in hint:
         paint_name = hint["paint"]
-        paint_function: PaintFunction = globals()["inv_paint_" + paint_name]
+        paint_function: PaintFunction = _get_paint_function_from_globals(paint_name)
     else:
         paint_name = "str"
         paint_function = inv_paint_generic
@@ -908,28 +940,30 @@ def _declare_invtable_column(
 
     # Sync this with _declare_inv_column()
     filter_class = hint.get("filter")
+    ident = infoname + "_" + name
+    filter_title: str = topic + ": " + title
     if filter_class:
         filter_registry.register(
             filter_class(
                 inv_info=infoname,
-                ident=infoname + "_" + name,
-                title=topic + ": " + title,
+                ident=ident,
+                title=filter_title,
             )
         )
-    elif (ranged_table := get_ranged_table(infoname)) is not None:
+    elif (ranged_table := get_ranged_table_filter_name(ident)) is not None:
         filter_registry.register(
             FilterInvtableIDRange(
-                inv_info=ranged_table,
-                ident=infoname + "_" + name,
-                title=topic + ": " + title,
+                inv_info=infoname,
+                ident=ranged_table,
+                title=filter_title,
             )
         )
     else:
         filter_registry.register(
             FilterInvtableText(
                 inv_info=infoname,
-                ident=infoname + "_" + name,
-                title=topic + ": " + title,
+                ident=ident,
+                title=filter_title,
             )
         )
 
@@ -2000,11 +2034,45 @@ class ABCNodeRenderer(abc.ABC):
         html.close_table()
 
     def _sort_table_rows(self, hint: InventoryHintSpec, table: Table) -> inventory.InventoryRows:
-        if (keyorder := hint.get("keyorder")) is None:
+        keyorder: Optional[List[str]] = hint.get("keyorder")
+        if keyorder is None:
             return table.rows
 
-        sorting_keys = tuple(k for k in keyorder if k in table.key_columns)
-        return sorted(table.rows, key=lambda r: tuple(r.get(k) or "" for k in sorting_keys))
+        sorting_keys: Tuple[str, ...] = tuple(k for k in keyorder if k in table.key_columns)
+
+        # The sorting of rows is overly complicated here, because of the type SDValue = Any and
+        # because the given values can be from both an inventory tree or from a delta tree.
+        # Therefore, values may also be tuples of old and new value (delta tree), see _compare_dicts
+        # in cmk.utils.structured_data.
+        @total_ordering
+        class _MinType:
+            def __le__(self, other: object) -> bool:
+                return True
+
+            def __eq__(self, other: object) -> bool:
+                return self is other
+
+        min_type = _MinType()
+
+        def _sanitize_value_for_sorting(
+            value: SDValue,
+        ) -> _MinType | SDValue | tuple[_MinType | SDValue, _MinType | SDValue]:
+            # Replace None values with min_type to enable comparison for type SDValue, i.e. Any.
+            if value is None:
+                return min_type
+
+            if isinstance(value, tuple):
+                return (
+                    min_type if value[0] is None else value[0],
+                    min_type if value[1] is None else value[1],
+                )
+
+            return value
+
+        return sorted(
+            table.rows,
+            key=lambda r: tuple(_sanitize_value_for_sorting(r.get(k)) for k in sorting_keys),
+        )
 
     @abc.abstractmethod
     def _show_table_value(
@@ -2040,7 +2108,7 @@ class ABCNodeRenderer(abc.ABC):
             html.open_tr()
             html.th(self._get_header(title, key, "#DDD"), title=sub_invpath)
             html.open_td()
-            self._show_attribute(
+            self.show_attribute(
                 value,
                 hint,
                 retention_intervals=attributes.get_retention_intervals(key),
@@ -2050,7 +2118,7 @@ class ABCNodeRenderer(abc.ABC):
         html.close_table()
 
     @abc.abstractmethod
-    def _show_attribute(
+    def show_attribute(
         self,
         value: Any,
         hint: InventoryHintSpec,
@@ -2130,7 +2198,7 @@ class NodeRenderer(ABCNodeRenderer):
     ) -> None:
         self._show_child_value(value, hint, retention_intervals)
 
-    def _show_attribute(
+    def show_attribute(
         self,
         value: Any,
         hint: InventoryHintSpec,
@@ -2148,7 +2216,7 @@ class DeltaNodeRenderer(ABCNodeRenderer):
     ) -> None:
         self._show_delta_child_value(value, hint)
 
-    def _show_attribute(
+    def show_attribute(
         self,
         value: Any,
         hint: InventoryHintSpec,

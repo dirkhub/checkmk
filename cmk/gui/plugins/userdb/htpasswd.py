@@ -6,13 +6,9 @@
 
 from pathlib import Path
 
-# TODO: Import errors from passlib are suppressed right now since now
-# stub files for mypy are not available.
-from passlib.context import CryptContext  # type: ignore[import]
-from passlib.hash import bcrypt  # type: ignore[import]
-
 import cmk.utils.paths
-import cmk.utils.store as store
+from cmk.utils.crypto import Password, password_hashing
+from cmk.utils.store.htpasswd import Htpasswd
 from cmk.utils.type_defs import UserId
 
 from cmk.gui.exceptions import MKUserError
@@ -23,52 +19,6 @@ from cmk.gui.plugins.userdb.utils import (
     UserConnector,
 )
 from cmk.gui.type_defs import UserSpec
-
-crypt_context = CryptContext(
-    schemes=[
-        "bcrypt",
-        # Kept for compatibility with Checkmk < 2.1
-        "sha256_crypt",
-        # Kept for compatibility with Checkmk < 1.6
-        # htpasswd has still md5 as default, also the docs include the "-m" param
-        "md5_crypt",
-        "apr_md5_crypt",
-        "des_crypt",
-    ]
-)
-
-
-class Htpasswd:
-    """Thin wrapper for loading and saving the htpasswd file"""
-
-    def __init__(self, path: Path) -> None:
-        super().__init__()
-        self._path = path
-
-    def load(self) -> dict[UserId, str]:
-        """Loads the contents of a valid htpasswd file into a dictionary and returns the dictionary"""
-        entries = {}
-
-        with self._path.open(encoding="utf-8") as f:
-            for l in f:
-                if ":" not in l:
-                    continue
-
-                user_id, pw_hash = l.split(":", 1)
-                entries[UserId(user_id)] = pw_hash.rstrip("\n")
-
-        return entries
-
-    def exists(self, user_id: str) -> bool:
-        """Whether or not a user exists according to the htpasswd file"""
-        return user_id in self.load()
-
-    def save(self, entries: dict[UserId, str]) -> None:
-        """Save the dictionary entries (unicode username and hash) to the htpasswd file"""
-        output = (
-            "\n".join(f"{username}:{hash_}" for username, hash_ in sorted(entries.items())) + "\n"
-        )
-        store.save_text_to_file("%s" % self._path, output)
 
 
 # Checkmk supports different authentication frontends for verifying the
@@ -86,20 +36,20 @@ class Htpasswd:
 # - https://httpd.apache.org/docs/2.4/misc/password_encryptions.html
 # - https://passlib.readthedocs.io/en/stable/lib/passlib.apache.html
 #
-def hash_password(password: str) -> str:
-    # The rounds aka workfactor should be more than 10
-    # it defaults to 12 anyways, but I prefer explicity
-    return bcrypt.using(rounds=12).hash(password)
+def hash_password(password: Password[str]) -> str:
+    """Hash a password
 
-
-def check_password(password: str, pwhash: str) -> bool:
+    Invalid inputs raise MKUserError.
+    """
     try:
-        return crypt_context.verify(password, pwhash)
+        return password_hashing.hash_password(password)
+
+    except password_hashing.PasswordTooLongError:
+        raise MKUserError(
+            None, "Passwords over 72 bytes would be truncated and are therefore not allowed!"
+        )
     except ValueError:
-        # ValueError("hash could not be identified")
-        # Is raised in case of locked users because we prefix the hashes with
-        # a "!" sign in this situation.
-        return False
+        raise MKUserError(None, "Password could not be hashed.")
 
 
 @user_connector_registry.register
@@ -116,6 +66,10 @@ class HtpasswdUserConnector(UserConnector):
     def short_title(cls) -> str:
         return _("htpasswd")
 
+    def __init__(self, cfg) -> None:  # type:ignore[no-untyped-def]
+        super().__init__(cfg)
+        self._htpasswd = Htpasswd(Path(cmk.utils.paths.htpasswd_file))
+
     #
     # USERDB API METHODS
     #
@@ -123,24 +77,30 @@ class HtpasswdUserConnector(UserConnector):
     def is_enabled(self) -> bool:
         return True
 
-    def check_credentials(self, user_id: UserId, password: str) -> CheckCredentialsResult:
-        users = self._get_htpasswd().load()
-        if user_id not in users:
-            return None  # not existing user, skip over
+    def check_credentials(self, user_id: UserId, password: Password[str]) -> CheckCredentialsResult:
+        if not (pw_hash := self._htpasswd.get_hash(user_id)):
+            return None  # not user in htpasswd, skip so other connectors can try
 
         if self._is_automation_user(user_id):
             raise MKUserError(None, _("Automation user rejected"))
 
-        if self._password_valid(users[user_id], password):
-            return user_id
-        return False
+        try:
+            password_hashing.verify(password, pw_hash)
+        except (password_hashing.PasswordInvalidError, ValueError):
+            return False
+        else:
+            if password_hashing.needs_update(pw_hash):
+                # The password is valid, but the currently stored hash uses a deprecated
+                # algorithm. Replace the hash.
+                # Since the old algorithm might have allowed passwords longer than 72 bytes
+                # (which bcrypt doesn't), we have to allow truncation here.
+                new_hash = password_hashing.hash_password(password, allow_truncation=True)
+                self._htpasswd.save(user_id, new_hash)
 
-    # ? the exact type of user_id is unclear, str, maybe, based on the line "if user_id not in users" ?
+            return user_id
+
     def _is_automation_user(self, user_id: UserId) -> bool:
         return Path(cmk.utils.paths.var_dir, "web", str(user_id), "automation.secret").is_file()
-
-    def _password_valid(self, pwhash: str, password: str) -> bool:
-        return check_password(password, pwhash)
 
     def save_users(self, users: dict[UserId, UserSpec]) -> None:
         # Apache htpasswd. We only store passwords here. During
@@ -158,7 +118,4 @@ class HtpasswdUserConnector(UserConnector):
             if user.get("password"):
                 entries[uid] = "%s%s" % ("!" if user.get("locked", False) else "", user["password"])
 
-        self._get_htpasswd().save(entries)
-
-    def _get_htpasswd(self) -> Htpasswd:
-        return Htpasswd(Path(cmk.utils.paths.htpasswd_file))
+        self._htpasswd.save_all(entries)

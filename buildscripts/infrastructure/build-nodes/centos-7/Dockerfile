@@ -10,6 +10,7 @@ RUN yum -y --enablerepo=extras install \
     && yum -y install \
     centos-release-scl-rh \
     && yum -y install \
+    bison \
     curl \
     dpkg \
     enchant \
@@ -47,7 +48,6 @@ RUN yum -y makecache \
     httpd-devel \
     joe \
     libXpm-devel \
-    libdbi-devel \
     libevent-devel \
     libffi-devel \
     libgsf-devel \
@@ -112,6 +112,10 @@ RUN /opt/install-protobuf-cpp.sh
 RUN /opt/install-openssl.sh
 RUN /opt/install-python.sh
 RUN /opt/install-freetds.sh
+
+# Now shrink all the binaries and libraries we produced to build a small image
+# in the next step
+RUN /opt/strip_binaries /opt
 
 ### Actual Image ###
 FROM base

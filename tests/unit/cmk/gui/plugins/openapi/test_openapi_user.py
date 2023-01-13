@@ -3,10 +3,11 @@
 # Copyright (C) 2020 tribe29 GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-
 import json
 import random
 import string
+from contextlib import contextmanager
+from typing import Any, Iterator, Mapping, Union
 
 import pytest
 from freezegun import freeze_time
@@ -17,12 +18,16 @@ from tests.unit.cmk.gui.conftest import WebTestAppForCMK
 from cmk.utils import version
 from cmk.utils.type_defs import UserId
 
+from cmk.gui import userdb
 from cmk.gui.plugins.openapi.endpoints.user_config import (
     _api_to_internal_format,
     _internal_to_api_format,
     _load_user,
 )
 from cmk.gui.plugins.openapi.endpoints.utils import complement_customer
+from cmk.gui.type_defs import UserRole
+from cmk.gui.watolib.custom_attributes import save_custom_attrs_to_mk_file, update_user_custom_attrs
+from cmk.gui.watolib.userroles import clone_role, RoleID
 from cmk.gui.watolib.users import edit_users
 
 managedtest = pytest.mark.skipif(not version.is_managed_edition(), reason="see #7213")
@@ -83,12 +88,12 @@ def test_openapi_customer(aut_user_auth_wsgi_app: WebTestAppForCMK, monkeypatch)
 
 
 @managedtest
-def test_openapi_user_minimal_settings(monkeypatch):
+def test_openapi_user_minimal_settings(monkeypatch, run_as_superuser):
     monkeypatch.setattr(
         "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
     )
 
-    with freeze_time("2021-09-24 12:36:00"):
+    with freeze_time("2021-09-24 12:36:00"), run_as_superuser():
         edit_users(
             {
                 "user": {
@@ -171,6 +176,10 @@ def test_openapi_user_minimal_password_settings(
     assert "last_pw_change" not in extensions
     assert "password" not in extensions
 
+    user_from_db = userdb.load_user(resp.json["id"])
+    assert user_from_db["connector"]
+    assert user_from_db["connector"] == "htpasswd"
+
     edit_details = {
         "auth_option": {
             "auth_type": "automation",
@@ -193,6 +202,10 @@ def test_openapi_user_minimal_password_settings(
     assert extensions["enforce_password_change"] is True
     assert extensions["idle_timeout"]["option"] == "disable"
     assert extensions["roles"] == ["user"]
+
+    user_from_db = userdb.load_user(resp.json["id"])
+    assert user_from_db["connector"]
+    assert user_from_db["connector"] == "htpasswd"
 
 
 def test_openapi_all_users(wsgi_app, with_automation_user):
@@ -292,41 +305,41 @@ def test_openapi_user_config(
 
 
 @managedtest
-def test_openapi_user_internal_with_notifications(monkeypatch):
+def test_openapi_user_internal_with_notifications(monkeypatch, run_as_superuser):
     monkeypatch.setattr(
         "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
     )
 
     name = _random_string(10)
 
-    edit_users(
-        {
-            name: {
-                "attributes": {
-                    "ui_theme": None,
-                    "ui_sidebar_position": None,
-                    "nav_hide_icons_title": None,
-                    "icons_per_item": None,
-                    "show_mode": None,
-                    "start_url": None,
-                    "force_authuser": False,
-                    "enforce_pw_change": True,
-                    "alias": "KPECYCq79E",
-                    "locked": False,
-                    "pager": "",
-                    "roles": [],
-                    "contactgroups": [],
-                    "email": "",
-                    "fallback_contact": False,
-                    "password": "$5$rounds=535000$eUtToQgKz6n7Qyqk$hh5tq.snoP4J95gVoswOep4LbUxycNG1QF1HI7B4d8C",
-                    "last_pw_change": 1265013000,
-                    "serial": 1,
-                    "disable_notifications": {"timerange": (1577836800.0, 1577923200.0)},
-                },
-                "is_new_user": True,
-            }
+    user_data = {
+        name: {
+            "attributes": {
+                "ui_theme": None,
+                "ui_sidebar_position": None,
+                "nav_hide_icons_title": None,
+                "icons_per_item": None,
+                "show_mode": None,
+                "start_url": None,
+                "force_authuser": False,
+                "enforce_pw_change": True,
+                "alias": "KPECYCq79E",
+                "locked": False,
+                "pager": "",
+                "roles": [],
+                "contactgroups": [],
+                "email": "",
+                "fallback_contact": False,
+                "password": "$5$rounds=535000$eUtToQgKz6n7Qyqk$hh5tq.snoP4J95gVoswOep4LbUxycNG1QF1HI7B4d8C",
+                "last_pw_change": 1265013000,
+                "serial": 1,
+                "disable_notifications": {"timerange": (1577836800.0, 1577923200.0)},
+            },
+            "is_new_user": True,
         }
-    )
+    }
+    with run_as_superuser():
+        edit_users(user_data)
 
     assert _load_internal_attributes(name) == {
         "alias": "KPECYCq79E",
@@ -409,7 +422,7 @@ def test_openapi_user_edit_auth(aut_user_auth_wsgi_app: WebTestAppForCMK, monkey
 
 
 @managedtest
-def test_openapi_user_internal_auth_handling(monkeypatch):
+def test_openapi_user_internal_auth_handling(monkeypatch, run_as_superuser):
     monkeypatch.setattr(
         "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
     )
@@ -420,34 +433,36 @@ def test_openapi_user_internal_auth_handling(monkeypatch):
 
     name = UserId("foo")
 
-    edit_users(
-        {
-            name: {
-                "attributes": {
-                    "ui_theme": None,
-                    "ui_sidebar_position": None,
-                    "nav_hide_icons_title": None,
-                    "icons_per_item": None,
-                    "show_mode": None,
-                    "start_url": None,
-                    "force_authuser": False,
-                    "enforce_pw_change": True,
-                    "alias": "Foo Bar",
-                    "locked": False,
-                    "pager": "",
-                    "roles": ["user"],
-                    "contactgroups": [],
-                    "email": "",
-                    "fallback_contact": False,
-                    "password": "$5$rounds=535000$eUtToQgKz6n7Qyqk$hh5tq.snoP4J95gVoswOep4LbUxycNG1QF1HI7B4d8C",
-                    "last_pw_change": 1265011200,
-                    "serial": 1,
-                    "disable_notifications": {},
-                },
-                "is_new_user": True,
-            }
+    user_data = {
+        name: {
+            "attributes": {
+                "ui_theme": None,
+                "ui_sidebar_position": None,
+                "nav_hide_icons_title": None,
+                "icons_per_item": None,
+                "show_mode": None,
+                "start_url": None,
+                "force_authuser": False,
+                "enforce_pw_change": True,
+                "alias": "Foo Bar",
+                "locked": False,
+                "pager": "",
+                "roles": ["user"],
+                "contactgroups": [],
+                "email": "",
+                "fallback_contact": False,
+                "password": "$5$rounds=535000$eUtToQgKz6n7Qyqk$hh5tq.snoP4J95gVoswOep4LbUxycNG1QF1HI7B4d8C",
+                "last_pw_change": 1265011200,
+                "serial": 1,
+                "disable_notifications": {},
+            },
+            "is_new_user": True,
         }
-    )
+    }
+
+    with run_as_superuser():
+        edit_users(user_data)
+
     assert _load_internal_attributes(name) == {
         "alias": "Foo Bar",
         "customer": "provider",
@@ -471,14 +486,15 @@ def test_openapi_user_internal_auth_handling(monkeypatch):
             _load_user(name),
             {"auth_option": {"secret": "QWXWBFUCSUOXNCPJUMS@", "auth_type": "automation"}},
         )
-        edit_users(
-            {
-                name: {
-                    "attributes": updated_internal_attributes,
-                    "is_new_user": False,
+        with run_as_superuser():
+            edit_users(
+                {
+                    name: {
+                        "attributes": updated_internal_attributes,
+                        "is_new_user": False,
+                    }
                 }
-            }
-        )
+            )
 
     assert _load_internal_attributes(name) == {
         "alias": "Foo Bar",
@@ -497,20 +513,22 @@ def test_openapi_user_internal_auth_handling(monkeypatch):
         "last_pw_change": 1265011200,
         "enforce_pw_change": True,
         "num_failed_logins": 0,
+        "connector": "htpasswd",
     }
 
     with freeze_time("2010-02-01 09:00:00"):
         updated_internal_attributes = _api_to_internal_format(
             _load_user(name), {"auth_option": {"auth_type": "remove"}}
         )
-        edit_users(
-            {
-                name: {
-                    "attributes": updated_internal_attributes,
-                    "is_new_user": False,
+        with run_as_superuser():
+            edit_users(
+                {
+                    name: {
+                        "attributes": updated_internal_attributes,
+                        "is_new_user": False,
+                    }
                 }
-            }
-        )
+            )
     assert _load_internal_attributes(name) == {
         "alias": "Foo Bar",
         "customer": "provider",
@@ -526,6 +544,7 @@ def test_openapi_user_internal_auth_handling(monkeypatch):
         "last_pw_change": 1265011200,  # no change in time from previous edit
         "enforce_pw_change": True,
         "num_failed_logins": 0,
+        "connector": "htpasswd",
     }
 
 
@@ -559,38 +578,38 @@ def test_openapi_managed_global_edition(aut_user_auth_wsgi_app: WebTestAppForCMK
 
 
 @managedtest
-def test_managed_global_internal(monkeypatch):
+def test_managed_global_internal(monkeypatch, run_as_superuser):
     # this test uses the internal mechanics of the user endpoint
     monkeypatch.setattr(
         "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
     )
 
-    edit_users(
-        {
-            "user": {
-                "attributes": {
-                    "ui_theme": None,
-                    "ui_sidebar_position": None,
-                    "nav_hide_icons_title": None,
-                    "icons_per_item": None,
-                    "show_mode": None,
-                    "start_url": None,
-                    "force_authuser": False,
-                    "enforce_pw_change": False,
-                    "alias": "User Name",
-                    "locked": False,
-                    "pager": "",
-                    "roles": [],
-                    "contactgroups": [],
-                    "customer": None,  # None represents global internally
-                    "email": "",
-                    "fallback_contact": False,
-                    "disable_notifications": {},
-                },
-                "is_new_user": True,
-            }
+    user_data = {
+        "user": {
+            "attributes": {
+                "ui_theme": None,
+                "ui_sidebar_position": None,
+                "nav_hide_icons_title": None,
+                "icons_per_item": None,
+                "show_mode": None,
+                "start_url": None,
+                "force_authuser": False,
+                "enforce_pw_change": False,
+                "alias": "User Name",
+                "locked": False,
+                "pager": "",
+                "roles": [],
+                "contactgroups": [],
+                "customer": None,  # None represents global internally
+                "email": "",
+                "fallback_contact": False,
+                "disable_notifications": {},
+            },
+            "is_new_user": True,
         }
-    )
+    }
+    with run_as_superuser():
+        edit_users(user_data)
     user_internal = _load_user(UserId("user"))
     user_endpoint_attrs = complement_customer(_internal_to_api_format(user_internal))
     assert user_endpoint_attrs["customer"] == "global"
@@ -657,39 +676,40 @@ def test_global_full_configuration(aut_user_auth_wsgi_app: WebTestAppForCMK, mon
     }
 
 
-def test_managed_idle_internal(with_automation_user, monkeypatch):
+def test_managed_idle_internal(with_automation_user, monkeypatch, run_as_superuser):
     # this test uses the internal mechanics of the user endpoint
     monkeypatch.setattr(
         "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
     )
     username, _secret = with_automation_user
 
-    edit_users(
-        {
-            "user": {
-                "attributes": {
-                    "ui_theme": None,
-                    "ui_sidebar_position": None,
-                    "nav_hide_icons_title": None,
-                    "icons_per_item": None,
-                    "show_mode": None,
-                    "start_url": None,
-                    "force_authuser": False,
-                    "enforce_pw_change": False,
-                    "alias": "User Name",
-                    "locked": False,
-                    "pager": "",
-                    "roles": [],
-                    "contactgroups": [],
-                    "customer": None,  # None represents global internally
-                    "email": "",
-                    "fallback_contact": False,
-                    "disable_notifications": {},
-                },
-                "is_new_user": True,
-            }
+    user_data = {
+        "user": {
+            "attributes": {
+                "ui_theme": None,
+                "ui_sidebar_position": None,
+                "nav_hide_icons_title": None,
+                "icons_per_item": None,
+                "show_mode": None,
+                "start_url": None,
+                "force_authuser": False,
+                "enforce_pw_change": False,
+                "alias": "User Name",
+                "locked": False,
+                "pager": "",
+                "roles": [],
+                "contactgroups": [],
+                "customer": None,  # None represents global internally
+                "email": "",
+                "fallback_contact": False,
+                "disable_notifications": {},
+            },
+            "is_new_user": True,
         }
-    )
+    }
+    with run_as_superuser():
+        edit_users(user_data)
+
     user_internal = _load_user(UserId("user"))
     user_endpoint_attrs = complement_customer(_internal_to_api_format(user_internal))
     assert "idle_timeout" not in _load_user(username)
@@ -965,3 +985,163 @@ def _internal_attributes(user_attributes):
             "force_authuser",
         )
     }
+
+
+@managedtest
+def test_openapi_new_user_with_cloned_role(
+    base: str, aut_user_auth_wsgi_app: WebTestAppForCMK, monkeypatch
+):
+    monkeypatch.setattr(
+        "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
+    )
+
+    cloned_role: UserRole = clone_role(RoleID("admin"))
+
+    user_detail = {
+        "username": f"new_user_with_role_{cloned_role.name}",
+        "fullname": f"NewUser_{cloned_role.name}",
+        "customer": "provider",
+        "roles": [cloned_role.name],
+    }
+
+    resp1 = aut_user_auth_wsgi_app.call_method(
+        "post",
+        base + "/domain-types/user_config/collections/all",
+        params=json.dumps(user_detail),
+        headers={"Accept": "application/json"},
+        status=200,
+        content_type="application/json",
+    )
+
+    assert resp1.json["extensions"]["roles"] == [cloned_role.name]
+
+    resp2 = aut_user_auth_wsgi_app.call_method(
+        "put",
+        base + f"/objects/user_config/new_user_with_role_{cloned_role.name}",
+        params=json.dumps({"roles": ["user", "guest"]}),
+        status=200,
+        content_type="application/json",
+        headers={"Accept": "application/json", "If-Match": resp1.headers["Etag"]},
+    )
+
+    assert resp2.json["extensions"]["roles"] == ["user", "guest"]
+
+
+@managedtest
+def test_openapi_new_user_with_non_existing_role(
+    base: str, aut_user_auth_wsgi_app: WebTestAppForCMK
+):
+    userrole = "non-existing-userole"
+    user_detail = {
+        "username": f"new_user_with_role_{userrole}",
+        "fullname": f"NewUser_{userrole}",
+        "customer": "provider",
+        "roles": [userrole],
+    }
+
+    aut_user_auth_wsgi_app.call_method(
+        "post",
+        base + "/domain-types/user_config/collections/all",
+        params=json.dumps(user_detail),
+        headers={"Accept": "application/json"},
+        status=400,
+        content_type="application/json",
+    )
+
+
+@contextmanager
+def custom_user_attributes_ctx(attrs: list[Mapping[str, Union[str, bool]]]) -> Iterator:
+    try:
+        save_custom_attrs_to_mk_file({"user": attrs})
+        update_user_custom_attrs()
+        yield
+    finally:
+        save_custom_attrs_to_mk_file({})
+
+
+def add_default_customer_in_managed_edition(params: dict[str, Any]) -> None:
+    if version.is_managed_edition():
+        params["customer"] = "global"
+
+
+def test_openapi_custom_attributes_of_user(
+    base: str,
+    aut_user_auth_wsgi_app: WebTestAppForCMK,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
+    )
+
+    attr: Mapping[str, Union[str, bool]] = {
+        "name": "judas",
+        "title": "judas",
+        "help": "help",
+        "topic": "basic",
+        "type": "TextAscii",
+        "user_editable": True,
+    }
+
+    user = "rob_halford"
+    params = {
+        "username": user,
+        "fullname": "Mathias Kettner",
+        "interface_options": {
+            "interface_theme": "dark",
+            "sidebar_position": "left",
+            "navigation_bar_icons": "show",
+            "mega_menu_icons": "entry",
+            "show_mode": "enforce_show_more",
+        },
+        "judas": "priest",
+    }
+
+    add_default_customer_in_managed_edition(params)
+
+    with custom_user_attributes_ctx([attr]):
+        aut_user_auth_wsgi_app.post(
+            url=f"{base}/domain-types/user_config/collections/all",
+            status=200,
+            headers={"Accept": "application/json"},
+            content_type="application/json",
+            params=json.dumps(params),
+        )
+
+        resp = aut_user_auth_wsgi_app.call_method(
+            "get",
+            f"{base}/objects/user_config/{user}",
+            status=200,
+            headers={"Accept": "application/json"},
+        )
+        assert resp.json["extensions"]["judas"] == "priest"
+
+
+def test_create_user_with_non_existing_custom_attribute(
+    base: str, aut_user_auth_wsgi_app: WebTestAppForCMK, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "cmk.gui.watolib.global_settings.rulebased_notifications_enabled", lambda: True
+    )
+
+    params = {
+        "username": "cmkuser",
+        "fullname": "Mathias Kettner",
+        "interface_options": {
+            "interface_theme": "dark",
+            "sidebar_position": "left",
+            "navigation_bar_icons": "show",
+            "mega_menu_icons": "entry",
+            "show_mode": "enforce_show_more",
+        },
+        "i_do_not": "exists",
+    }
+
+    add_default_customer_in_managed_edition(params)
+
+    aut_user_auth_wsgi_app.post(
+        url=f"{base}/domain-types/user_config/collections/all",
+        status=400,
+        headers={"Accept": "application/json"},
+        content_type="application/json",
+        params=json.dumps(params),
+    )

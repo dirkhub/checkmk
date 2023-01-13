@@ -4,6 +4,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 import typing
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import (
@@ -39,6 +40,27 @@ Choice = Tuple[ChoiceId, ChoiceText]
 Choices = List[Choice]
 
 
+@dataclass
+class UserRole:
+    name: str
+    alias: str
+    builtin: bool = False
+    permissions: Dict[str, bool] = field(default_factory=dict)
+    basedon: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        userrole_dict = {
+            "alias": self.alias,
+            "permissions": self.permissions,
+            "builtin": self.builtin,
+        }
+
+        if not self.builtin:
+            userrole_dict["basedon"] = self.basedon
+
+        return userrole_dict
+
+
 class ChoiceGroup(NamedTuple):
     title: Text
     choices: Choices
@@ -68,6 +90,7 @@ class SessionInfo:
     session_id: SessionId
     started_at: int
     last_activity: int
+    csrf_token: str = field(default_factory=lambda: uuid.uuid4().__str__())
     flashes: List[str] = field(default_factory=list)
     # In case it is enabled: Was it already authenticated?
     two_factor_completed: bool = False
@@ -267,6 +290,7 @@ class MegaMenu(NamedTuple):
     topics: Callable[[], List[TopicMenuTopic]]
     search: Optional[ABCMegaMenuSearch] = None
     info_line: Optional[Callable[[], str]] = None
+    hide: Callable[[], bool] = lambda: False
 
 
 SearchQuery = str

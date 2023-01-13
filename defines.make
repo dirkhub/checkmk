@@ -41,7 +41,7 @@ EDITION            := free
 EDITION_SHORT      := cfe
 endif
 
-VERSION            := 2.1.0b9
+VERSION            := 2.1.0p20
 OMD_VERSION        := $(VERSION).$(EDITION_SHORT)
 # Do not use the the ".c?e" EDITION_SHORT suffix, the edition is part of the package name
 PKG_VERSION        := $(VERSION)
@@ -64,7 +64,7 @@ SHELL              := /bin/bash
 CLANG_VERSION      := 12
 
 # In our CI we use this compiler, but we are not restricted to this exact version
-GCC_VERSION_MAJOR      := 11
+GCC_VERSION_MAJOR      := 12
 GCC_VERSION_MINOR      := 2
 GCC_VERSION_PATCHLEVEL := 0
 GCC_VERSION	       := "${GCC_VERSION_MAJOR}.${GCC_VERSION_MINOR}.${GCC_VERSION_PATCHLEVEL}"

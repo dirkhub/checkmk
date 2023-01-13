@@ -4,7 +4,7 @@ FROM ${IMAGE_CMK_BASE}
 LABEL maintainer="feedback@checkmk.com"
 
 # Pure build time variable declarations (docker build --build-arg KEY=val)
-ARG CMK_VERSION="2.1.0b9"
+ARG CMK_VERSION="2.1.0p20"
 # Choose one of: raw, enterprise, managed
 ARG CMK_EDITION="raw"
 
@@ -23,6 +23,12 @@ ENV CMK_PASSWORD=""
 # Specify the FQDN of your relay mail server to sent mails to
 ARG MAIL_RELAY_HOST
 ENV MAIL_RELAY_HOST=""
+
+ARG DISTRO_CODENAME="jammy"
+
+# Add helper variable to better detect when running inside container.
+# Used e.g. for omd update
+ENV CMK_CONTAINERIZED="TRUE"
 
 # Make the list of required packages available to the following command
 COPY needed-packages /needed-packages
@@ -61,7 +67,7 @@ RUN set -e \
 
 # Optionally copy an existing Checkmk debian package to the container. In case the file is
 # available that is later used by the build procedure the file will not be downloaded.
-COPY check-mk-${CMK_EDITION}-${CMK_VERSION}_0.buster_*.deb Check_MK-pubkey.gpg /
+COPY check-mk-${CMK_EDITION}-${CMK_VERSION}_0.${DISTRO_CODENAME}*.deb Check_MK-pubkey.gpg /
 
 # Now install the Checkmk version specific things
 # hadolint ignore=DL3003,DL3008,DL4006
@@ -71,7 +77,7 @@ RUN set -e \
     && chmod +x /usr/sbin/policy-rc.d \
     && export DEBIAN_FRONTEND=noninteractive \
     && PKG_NAME="check-mk-${CMK_EDITION}-${CMK_VERSION}" \
-    && PKG_FILE="${PKG_NAME}_0.buster_$(dpkg --print-architecture).deb" \
+    && PKG_FILE="${PKG_NAME}_0.${DISTRO_CODENAME}_$(dpkg --print-architecture).deb" \
     && CREDENTIALS_URL="http://localhost:8000/secret" \
     && if [ ! -e "/${PKG_FILE}" ]; then \
         echo "Receive download credentials from ${CREDENTIALS_URL}..." && \
@@ -81,7 +87,7 @@ RUN set -e \
             | curl -f -o "${PKG_FILE}" -K - "${CMK_DL_URL}/${CMK_VERSION}/${PKG_FILE}" ; \
        fi \
     && gpg -q --import "/Check_MK-pubkey.gpg" \
-    && dpkg-sig --verify "${PKG_FILE}" \
+    && gpg --verify "${PKG_FILE}" \
     && dpkg -i "${PKG_FILE}" \
     && dpkg -i "$(ls /omd/versions/default/share/check_mk/agents/check-mk-agent_*-1_all.deb)" \
     && rm -f -- *.deb *.gpg \

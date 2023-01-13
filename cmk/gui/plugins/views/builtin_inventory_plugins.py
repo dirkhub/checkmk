@@ -433,6 +433,8 @@ inventory_displayhints.update({
     ".hardware.storage.disks:*.serial": {"title": _l("Serial Number")},
     ".hardware.storage.disks:*.size": {"title": _l("Size"), "paint": "size"},
     ".hardware.storage.disks:*.type": {"title": _l("Type")},
+    # this displayhint is for Attributes and NOT for above Table
+    ".hardware.storage.disks.size": {"title": _l("Size"), "paint": "size"},
     ".hardware.volumes.physical_volumes.*:": {
         "title": ("Physical Volumes"),
         "keyorder": [
@@ -661,14 +663,14 @@ inventory_displayhints.update({
         "title": _l("Value"),
     },
 
-    ".software.applications.kube.network:": {
-        "title": _l("Network"),
+    ".networking.kube:": {
+        "title": _l("Kubernetes"),
         "keyorder": ["ip", "address_type"],
     },
-    ".software.applications.kube.network:*.ip": {
+    ".networking.kube:*.ip": {
         "title": _l("IP address"),
     },
-    ".software.applications.kube.network:*.address_type": {
+    ".networking.kube:*.address_type": {
         "title": _l("Type"),
     },
     ".software.applications.kube.containers:": {
@@ -738,6 +740,11 @@ inventory_displayhints.update({
     ".software.applications.kube.pod.node": {"title": _l("Node")},
     ".software.applications.kube.pod.pod_ip": {"title": _l("Pod IP")},
     ".software.applications.kube.pod.qos_class": {"title": _l("QoS class")},
+
+
+    ".software.applications.mobileiron.": {"title": _l("Mobileiron")},
+    ".software.applications.mobileiron.partition_name": {"title": _l("Partition Name")},
+    ".software.applications.mobileiron.registration_state": {"title": _l("Registration State")},
 
     ".software.applications.citrix.": {"title": _l("Citrix")},
     ".software.applications.citrix.controller.": {"title": _l("Controller")},

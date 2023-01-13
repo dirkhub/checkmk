@@ -12,6 +12,7 @@ from typing import Iterator, List, Optional, overload, Tuple, Type, Union
 
 import cmk.utils.render as render
 import cmk.utils.version as cmk_version
+from cmk.utils.crypto import Password
 from cmk.utils.type_defs import timeperiod_spec_alias, UserId
 
 import cmk.gui.background_job as background_job
@@ -20,6 +21,7 @@ import cmk.gui.gui_background_job as gui_background_job
 import cmk.gui.plugins.userdb.utils as userdb_utils
 import cmk.gui.userdb as userdb
 import cmk.gui.watolib as watolib
+import cmk.gui.weblib as weblib
 from cmk.gui.breadcrumb import Breadcrumb
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.globals import config, html, request, transactions, user
@@ -50,7 +52,7 @@ from cmk.gui.plugins.wato.utils import (
     WatoMode,
 )
 from cmk.gui.sites import get_configured_site_choices
-from cmk.gui.table import table_element
+from cmk.gui.table import show_row_count, table_element
 from cmk.gui.type_defs import ActionResult, Choices, UserSpec
 from cmk.gui.utils.escaping import escape_to_html
 from cmk.gui.utils.ntop import get_ntop_connection_mandatory, is_ntop_available
@@ -321,6 +323,8 @@ class ModeUsers(WatoMode):
         timeperiods = watolib.timeperiods.load_timeperiods()
         contact_groups = load_contact_group_information()
 
+        html.div("", id_="row_info")
+
         with table_element("users", None, empty_text=_("No users are defined yet.")) as table:
             online_threshold = time.time() - config.user_online_maxage
             for uid, user_spec in sorted(entries, key=lambda x: x[1].get("alias", x[0]).lower()):
@@ -527,8 +531,15 @@ class ModeUsers(WatoMode):
                     table.cell(_u(vs.title()))
                     html.write_text(vs.value_to_html(user_spec.get(name, vs.default_value())))
 
+        html.hidden_field("selection_id", weblib.selection_id())
         html.hidden_fields()
         html.end_form()
+
+        show_row_count(
+            row_count=(row_count := len(users)),
+            row_info=_("user") if row_count == 1 else _("users"),
+            selection_id="users",
+        )
 
         if not load_contact_group_information():
             url = "wato.py?mode=contact_groups"
@@ -686,6 +697,13 @@ class ModeEditUser(WatoMode):
             )
 
     def action(self) -> ActionResult:
+        def read_password_or_none(field: str) -> Optional[Password]:
+            # make a Password type only if the field has a non-"" value
+            # this is here because we don't have get_validated_type_input on 2.1 yet.
+            if pw := request.get_str_input(field):
+                return Password(pw)
+            return None
+
         if not transactions.check_transaction():
             return redirect(mode_url("users"))
 
@@ -720,19 +738,20 @@ class ModeEditUser(WatoMode):
         # Authentication: Password or Secret
         auth_method = request.var("authmethod")
         if auth_method == "secret":
-            secret = request.get_str_input_mandatory("_auth_secret", "").strip()
+            secret = request.get_str_input_mandatory("_auth_secret", "")
             if secret:
                 user_attrs["automation_secret"] = secret
-                user_attrs["password"] = hash_password(secret)
+                user_attrs["password"] = hash_password(Password(secret))
                 increase_serial = True  # password changed, reflect in auth serial
+                # automation users cannot set the passwords themselves.
+                user_attrs["last_pw_change"] = int(time.time())
+                user_attrs.pop("enforce_pw_change", None)
             elif "automation_secret" not in user_attrs and "password" in user_attrs:
                 del user_attrs["password"]
 
         else:
-            password = request.get_str_input_mandatory("_password_" + self._pw_suffix(), "").strip()
-            password2 = request.get_str_input_mandatory(
-                "_password2_" + self._pw_suffix(), ""
-            ).strip()
+            password = read_password_or_none("_password_" + self._pw_suffix())
+            password2 = read_password_or_none("_password2_" + self._pw_suffix())
 
             # We compare both passwords only, if the user has supplied
             # the repeation! We are so nice to our power users...
@@ -1003,6 +1022,7 @@ class ModeEditUser(WatoMode):
             size=30,
             id_="automation_secret",
             placeholder="******" if "automation_secret" in self._user else "",
+            autocomplete="off",
         )
         html.write_text(" ")
         html.open_b(style=["position: relative", "top: 4px;"])
@@ -1339,4 +1359,4 @@ def select_language(user_spec: UserSpec) -> None:
 
 
 def _is_two_factor_enabled(user_spec: UserSpec) -> bool:
-    return user_spec.get("two_factor_credentials", {}).get("webauthn_credentials") is not None
+    return bool(user_spec.get("two_factor_credentials", {}).get("webauthn_credentials"))

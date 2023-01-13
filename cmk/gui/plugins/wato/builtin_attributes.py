@@ -6,8 +6,7 @@
 import time
 
 import cmk.utils.tags
-from cmk.utils.type_defs import HostName, List
-from cmk.utils.version import Edition, is_plus_edition
+from cmk.utils.type_defs import HostName, List, Union
 
 import cmk.gui.hooks as hooks
 import cmk.gui.userdb as userdb
@@ -20,7 +19,6 @@ from cmk.gui.htmllib import HTML
 from cmk.gui.i18n import _
 from cmk.gui.plugins.wato.utils import (
     ABCHostAttributeNagiosText,
-    ABCHostAttributeNagiosValueSpec,
     ABCHostAttributeValueSpec,
     ConfigHostname,
     host_attribute_registry,
@@ -286,69 +284,6 @@ class HostAttributeAdditionalIPv6Addresses(ABCHostAttributeValueSpec):
         return fields.List(
             fields.String(validate=gui_fields.ValidateIPv6()),
             description="A list of IPv6 addresses.",
-        )
-
-
-@host_attribute_registry.register
-class HostAttributeAgentConnection(ABCHostAttributeNagiosValueSpec):
-    def topic(self):
-        return HostAttributeTopicDataSources
-
-    @classmethod
-    def sort_index(cls):
-        return 64  # after agent, before snmp
-
-    def is_show_more(self) -> bool:
-        # non plus edition currently only has one option
-        return not is_plus_edition()
-
-    def name(self):
-        return "cmk_agent_connection"
-
-    def show_in_table(self):
-        return False
-
-    def show_in_folder(self):
-        return True
-
-    def depends_on_tags(self):
-        return ["checkmk-agent"]
-
-    def nagios_name(self) -> str:
-        return self.name()
-
-    def to_nagios(self, value: str) -> str:
-        return value
-
-    def valuespec(self):
-        return DropdownChoice(
-            title=_("Checkmk agent connection mode"),
-            choices=[
-                ("pull-agent", _("Pull: Checkmk server contacts the agent")),
-                (
-                    "push-agent",
-                    _("Push: Checkmk agent contacts the server (%s only)")
-                    % Edition.CPE.short.upper(),
-                ),
-            ],
-            help=_(
-                "By default the server will try to contact the monitored host and pull the"
-                " data by initializing a TCP connection. "
-                "On the %s you can configure a push configuration, where the monitored host is"
-                " expected to send the data to the monitoring server without being actively"
-                " triggered."
-            )
-            % Edition.CPE.title,
-        )
-
-    def openapi_field(self) -> gui_fields.Field:
-        return fields.String(
-            enum=["pull-agent", "push-agent"],
-            description=(
-                "This configures the communication direction of this host.\n"
-                " * `pull-agent` (default) - The server will try to contact the monitored host and pull the data by initializing a TCP connection\n"
-                " * `push-agent` - the host is expected to send the data to the monitoring server without being triggered\n"
-            ),
         )
 
 
@@ -639,7 +574,7 @@ class HostAttributeNetworkScan(ABCHostAttributeValueSpec):
                     title=_("Run as"),
                     help=_(
                         "Execute the network scan in the Check_MK user context of the "
-                        "choosen user. This user needs the permission to add new hosts "
+                        "chosen user. This user needs the permission to add new hosts "
                         "to this folder."
                     ),
                     choices=self._get_all_user_ids,
@@ -894,11 +829,12 @@ class HostAttributeManagementAddress(ABCHostAttributeValueSpec):
 
     def openapi_field(self) -> gui_fields.Field:
         return fields.String(
-            description="Address (IPv4 or IPv6) under which the management board can be reached.",
+            description="Address (IPv4, IPv6 or hostname) under which the management board can be reached.",
             validate=gui_fields.ValidateAnyOfValidators(
                 [
                     gui_fields.ValidateIPv4(),
                     gui_fields.ValidateIPv6(),
+                    gui_fields.validate_hostname,
                 ]
             ),
         )
@@ -1051,7 +987,9 @@ class HostAttributeSite(ABCHostAttributeValueSpec):
         )
 
     def openapi_field(self) -> gui_fields.Field:
-        return gui_fields.SiteField(description="The site that should monitor this host.")
+        return gui_fields.SiteField(
+            description="The site that should monitor this host.", presence="might_not_exist"
+        )
 
     def get_tag_groups(self, value):
         # Compatibility code for pre 2.0 sites. The SetupSiteChoice valuespec was previously setting
@@ -1113,6 +1051,11 @@ class HostAttributeLockedBy(ABCHostAttributeValueSpec):
                 "The identity is built out of the Site ID, the program name and the connection ID."
             ),
         )
+
+    def filter_matches(
+        self, crit: list[str], value: Union[list[str], tuple[str, str, str]], hostname
+    ) -> bool:
+        return crit == list(value)
 
 
 class LockedByValuespec(Tuple):
@@ -1366,9 +1309,11 @@ class HostAttributeLabels(ABCHostAttributeValueSpec):
     def valuespec(self):
         return Labels(world=Labels.World.CONFIG, label_source=Labels.Source.EXPLICIT)
 
-    def openapi_field(self) -> gui_fields.Field:
+    def openapi_field(self) -> fields.Field:
         return fields.Dict(
             description=self.help(),
+            keys=fields.String(description="The host label key"),
+            values=fields.String(description="The host label value"),
         )
 
     def filter_matches(self, crit, value, hostname):

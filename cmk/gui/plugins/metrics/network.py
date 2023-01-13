@@ -237,6 +237,18 @@ metric_info["time_offset"] = {
     "color": "#9a52bf",
 }
 
+metric_info["last_sync_time"] = {
+    "title": _("Time since last sync"),
+    "unit": "s",
+    "color": "41/b",
+}
+
+metric_info["last_sync_receive_time"] = {
+    "title": _("Time since last NTPMessage"),
+    "unit": "s",
+    "color": "45/b",
+}
+
 metric_info["jitter"] = {
     "title": _("Time dispersion (jitter)"),
     "unit": "s",
@@ -828,6 +840,8 @@ for ctype, ccolor in (
     ("dot11ac", "34/b"),
     ("dot11n2_4", "45/a"),
     ("dot11n5", "46/b"),
+    ("dot11ax2_4", "14/a"),
+    ("dot11ax5", "35/a"),
 ):
     metric_info["wifi_connection_" + ctype] = {
         "title": "802." + ctype,
@@ -1552,6 +1566,18 @@ metric_info["clients_count"] = {
     "color": "22/a",
 }
 
+metric_info["bytes_downloaded"] = {
+    "title": _("Bytes downloaded"),
+    "unit": "bytes",
+    "color": "42/a",
+}
+
+metric_info["bytes_uploaded"] = {
+    "title": _("Bytes uploaded"),
+    "unit": "bytes",
+    "color": "41/b",
+}
+
 # .
 #   .--Graphs--------------------------------------------------------------.
 #   |                    ____                 _                            |
@@ -1720,6 +1746,11 @@ graph_info["time_offset"] = {
     ],
     "range": ("0,time_offset:crit,-", "time_offset:crit"),
     "optional_metrics": ["jitter"],
+}
+
+graph_info["last_sync_time"] = {
+    "title": _("Time since last synchronisation"),
+    "metrics": [("last_sync_time", "line"), ("last_sync_receive_time", "line")],
 }
 
 graph_info["firewall_connections"] = {
@@ -2081,5 +2112,13 @@ graph_info["active_sessions_with_peak_value"] = {
     "scalars": [
         "active_sessions:warn",
         "active_sessions:crit",
+    ],
+}
+
+graph_info["data_transfer"] = {
+    "title": _("Data transfer"),
+    "metrics": [
+        ("bytes_downloaded", "stack"),
+        ("bytes_uploaded", "stack"),
     ],
 }

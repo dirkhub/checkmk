@@ -15,6 +15,7 @@ import itertools
 import json
 import logging
 import sys
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
@@ -22,7 +23,9 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
+    Literal,
     Mapping,
     NamedTuple,
     Optional,
@@ -30,6 +33,7 @@ from typing import (
     Set,
     Tuple,
     TypedDict,
+    TypeVar,
     Union,
 )
 
@@ -62,6 +66,8 @@ NOW = datetime.now()
 # really need more type annotations to comprehend the dict-o-mania below...
 
 AWSStrings = Union[bytes, str]
+
+T = TypeVar("T")
 
 # TODO
 # Rewrite API calls from low-level client to high-level resource:
@@ -387,7 +393,67 @@ def _get_wafv2_web_acls(
     return web_acls
 
 
-# .
+def _fetch_tagged_resources_with_types(tagging_client, resource_type_filters: List[str]) -> list:
+    tagged_resources = []
+    # The get_resource API call has a matching rule (AND) different than the one that we use in
+    # checkmk (OR) so we need to fetch all the resources containing tags first and then apply our
+    # matching rule.
+    # We are calling it with empty `TagFilter` param so get every resource that ever had a tag.
+    # For the tags matching rules or other info, look at the documentation of the API call:
+    # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/resourcegroupstaggingapi.html#ResourceGroupsTaggingAPI.Client.get_resources
+    for page in tagging_client.get_paginator("get_resources").paginate(
+        TagFilters=[],
+        ResourceTypeFilters=resource_type_filters,
+    ):
+        tagged_resources.extend(page.get("ResourceTagMappingList", []))
+
+    return tagged_resources
+
+
+def fetch_resources_matching_tags(
+    tagging_client,
+    tags_to_match: List[Dict[Literal["Key", "Value"], str]],
+    resource_type_filters: List[str],
+) -> Set[str]:
+    """Returns the ARN of all the resources in the region that match **ANY** of the provided tags.
+
+    This is useful when the service-specific API is not returning tags for every resource as this
+    allows you to get all the tags with a single API call rather than calling get_tags for every
+    resource.
+
+    For example, the CloudFront APIs don't allow to get tags for all the distributions and the only
+    way to have the tags would be to call the `list_tags_for_resource` API for every single
+    distribution.
+    To prevent that, we can call this method with
+    `resource_type_filters=['cloudfront:distribution']` and with the tags you want to filter.
+
+    More info on the format of the resources type on the underlying API call documentation:
+    https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/resourcegroupstaggingapi.html#ResourceGroupsTaggingAPI.Client.get_resources
+    """
+
+    if not tags_to_match:
+        return set()
+
+    tags_to_match_by_id = defaultdict(set)
+    for curr_tag in tags_to_match:
+        tags_to_match_by_id[curr_tag["Key"]].add(curr_tag["Value"])
+
+    tagged_resources = _fetch_tagged_resources_with_types(tagging_client, resource_type_filters)
+
+    matching_resources_arn = set()
+    for resource in tagged_resources:
+        resource_tags = resource["Tags"]
+        is_any_tag_matching = any(
+            curr_tag["Key"] in tags_to_match_by_id
+            and curr_tag["Value"] in tags_to_match_by_id[curr_tag["Key"]]
+            for curr_tag in resource_tags
+        )
+        if is_any_tag_matching:
+            matching_resources_arn.add(resource["ResourceARN"])
+    return matching_resources_arn
+
+
+#
 #   .--section API---------------------------------------------------------.
 #   |                       _   _                  _    ____ ___           |
 #   |         ___  ___  ___| |_(_) ___  _ __      / \  |  _ \_ _|          |
@@ -1252,7 +1318,7 @@ class EC2Summary(AWSSection):
                 inst
                 for res in col_reservations
                 for inst in res["Instances"]
-                for tag in inst["Tags"]
+                for tag in inst.get("Tags", [])
                 if tag in tags
             ]
 
@@ -1525,10 +1591,13 @@ class EBSLimits(AWSSectionLimits):
 
         vol_storage_standard = 0
         vol_storage_io1 = 0
+        vol_storage_io2 = 0
         vol_storage_gp2 = 0
+        vol_storage_gp3 = 0
         vol_storage_sc1 = 0
         vol_storage_st1 = 0
         vol_iops_io1 = 0
+        vol_iops_io2 = 0
         for volume in volumes:
             vol_type = volume["VolumeType"]
             vol_size = volume["Size"]
@@ -1537,8 +1606,13 @@ class EBSLimits(AWSSectionLimits):
             elif vol_type == "io1":
                 vol_storage_io1 += vol_size
                 vol_iops_io1 += volume["Iops"]
+            elif vol_type == "io2":
+                vol_storage_io2 += vol_size
+                vol_iops_io2 += volume["Iops"]
             elif vol_type == "gp2":
                 vol_storage_gp2 += vol_size
+            elif vol_type == "gp3":
+                vol_storage_gp3 += vol_size
             elif vol_type == "sc1":
                 vol_storage_sc1 += vol_size
             elif vol_type == "st1":
@@ -1548,6 +1622,7 @@ class EBSLimits(AWSSectionLimits):
 
         # These are total limits and not instance specific
         # Space values are in TiB.
+        # Reference: https://docs.aws.amazon.com/general/latest/gr/ebs-service.html
         self._add_limit(
             "",
             AWSLimit(
@@ -1570,7 +1645,7 @@ class EBSLimits(AWSSectionLimits):
             "",
             AWSLimit(
                 "block_store_space_io1",
-                "Provisioned IOPS SSD space",
+                "Provisioned IOPS SSD (io1) space",
                 300,
                 vol_storage_io1,
             ),
@@ -1579,7 +1654,7 @@ class EBSLimits(AWSSectionLimits):
             "",
             AWSLimit(
                 "block_store_iops_io1",
-                "Provisioned IOPS SSD IO operations per second",
+                "Provisioned IOPS SSD (io1) IO operations per second",
                 300000,
                 vol_storage_io1,
             ),
@@ -1587,10 +1662,37 @@ class EBSLimits(AWSSectionLimits):
         self._add_limit(
             "",
             AWSLimit(
+                "block_store_space_io2",
+                "Provisioned IOPS SSD (io2) space",
+                20,
+                vol_storage_io2,
+            ),
+        )
+        self._add_limit(
+            "",
+            AWSLimit(
+                "block_store_iops_io2",
+                "Provisioned IOPS SSD (io2) IO operations per second",
+                100000,
+                vol_storage_io2,
+            ),
+        )
+        self._add_limit(
+            "",
+            AWSLimit(
                 "block_store_space_gp2",
-                "General Purpose SSD space",
+                "General Purpose SSD (gp2) space",
                 300,
                 vol_storage_gp2,
+            ),
+        )
+        self._add_limit(
+            "",
+            AWSLimit(
+                "block_store_space_gp3",
+                "General Purpose SSD (gp3) space",
+                300,
+                vol_storage_gp3,
             ),
         )
         self._add_limit(
@@ -3436,6 +3538,172 @@ class RDS(AWSSectionCloudwatch):
         return [AWSSectionResult("", computed_content.content)]
 
 
+#   .--CloudFront----------------------------------------------------------.
+#   |          ____ _                 _ _____                _             |
+#   |         / ___| | ___  _   _  __| |  ___| __ ___  _ __ | |_           |
+#   |        | |   | |/ _ \| | | |/ _` | |_ | '__/ _ \| '_ \| __|          |
+#   |        | |___| | (_) | |_| | (_| |  _|| | | (_) | | | | |_           |
+#   |         \____|_|\___/ \__,_|\__,_|_|  |_|  \___/|_| |_|\__|          |
+#   |                                                                      |
+#   +----------------------------------------------------------------------+
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+# .
+
+
+class CloudFrontSummary(AWSSection):
+    def __init__(self, client, tagging_client, region, config, distributor=None):
+        super().__init__(client, region, config, distributor=distributor)
+        self._tagging_client = tagging_client
+        self._names = self._config.service_config["cloudfront_names"]
+        self._tags = self._prepare_tags_for_api_response(
+            self._config.service_config["cloudfront_tags"]
+        )
+
+    @property
+    def name(self):
+        return "cloudfront_summary"
+
+    @property
+    def cache_interval(self):
+        return 300
+
+    @property
+    def granularity(self):
+        return 300
+
+    def _get_colleague_contents(self):
+        return AWSColleagueContents(None, 0.0)
+
+    def get_live_data(self, *args):
+        distributions = []
+
+        for page in self._client.get_paginator("list_distributions").paginate():
+            fetched_distributions = self._get_response_content(
+                page, "DistributionList", dflt={}
+            ).get("Items", [])
+            distributions.extend(fetched_distributions)
+
+        if self._names:
+            return [d for d in distributions if d["Id"] in self._names]
+
+        if self._tags:
+            distributions_arn_matching_tags = fetch_resources_matching_tags(
+                self._tagging_client, self._tags, ["cloudfront:distribution"]
+            )
+            return [d for d in distributions if d["ARN"] in distributions_arn_matching_tags]
+
+        return distributions
+
+    def _compute_content(self, raw_content, colleague_contents):
+        return AWSComputedContent(raw_content.content, raw_content.cache_timestamp)
+
+    def _create_results(self, computed_content):
+        return [AWSSectionResult("", computed_content.content)]
+
+
+class CloudFront(AWSSectionCloudwatch):
+    def __init__(
+        self,
+        client,
+        region,
+        config,
+        host_assignment: Literal["aws_host", "domain_host"],
+        distributor=None,
+    ):
+        super().__init__(client, region, config, distributor=distributor)
+        self.assign_to_origin_domain_host = host_assignment == "domain_host"
+
+    @property
+    def name(self):
+        return "cloudfront_cloudwatch"
+
+    @property
+    def cache_interval(self):
+        return 300
+
+    @property
+    def granularity(self):
+        return 300
+
+    def _get_colleague_contents(self):
+        colleague = self._received_results.get("cloudfront_summary")
+        if colleague and colleague.content:
+            return AWSColleagueContents(colleague.content, colleague.cache_timestamp)
+        return AWSColleagueContents({}, 0.0)
+
+    def _get_metrics(self, colleague_contents):
+        metrics = []
+        for idx, instance in enumerate(colleague_contents.content):
+            distribution_id = instance["Id"]
+            for metric_name, stat, unit in [
+                ("Requests", "Sum", "None"),
+                ("BytesDownloaded", "Sum", "None"),
+                ("BytesUploaded", "Sum", "None"),
+                ("TotalErrorRate", "Average", "Percent"),
+                ("4xxErrorRate", "Average", "Percent"),
+                ("5xxErrorRate", "Average", "Percent"),
+            ]:
+                metric = {
+                    "Id": self._create_id_for_metric_data_query(idx, metric_name),
+                    "Label": distribution_id,
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/CloudFront",
+                            "MetricName": metric_name,
+                            "Dimensions": [
+                                {
+                                    "Name": "DistributionId",
+                                    "Value": distribution_id,
+                                },
+                                {
+                                    "Name": "Region",
+                                    "Value": "Global",
+                                },
+                            ],
+                        },
+                        "Period": self.period,
+                        "Stat": stat,
+                        "Unit": unit,
+                    },
+                }
+                metrics.append(metric)
+        return metrics
+
+    def _get_piggyback_host_by_distribution(self, cloudfront_summary):
+        if not cloudfront_summary:
+            return {}
+
+        host_by_distribution: dict[str, str] = {}
+        for distribution_data in cloudfront_summary:
+            distribution_id = distribution_data.get("Id")
+            origins = distribution_data.get("Origins", {}).get("Items")
+            if not distribution_id or not origins:
+                continue
+            distribution_origin = origins[0].get("DomainName", "")
+            host_by_distribution[distribution_id] = distribution_origin
+        return host_by_distribution
+
+    def _compute_content(self, raw_content, colleague_contents):
+        content_by_host = defaultdict(list)
+        host_by_distribution: Mapping[str, str] = {}
+        if self.assign_to_origin_domain_host:
+            host_by_distribution = self._get_piggyback_host_by_distribution(
+                colleague_contents.content
+            )
+        for distribution_data in raw_content.content:
+            distribution_id = distribution_data.get("Label", "")
+            piggyback_host = host_by_distribution.get(distribution_id, "")
+            content_by_host[piggyback_host].append(distribution_data)
+        return AWSComputedContent(content_by_host, raw_content.cache_timestamp)
+
+    def _create_results(self, computed_content):
+        return [
+            AWSSectionResult(piggyback_host, content)
+            for piggyback_host, content in computed_content.content.items()
+        ]
+
+
 # .
 #   .--Cloudwatch----------------------------------------------------------.
 #   |         ____ _                 _               _       _             |
@@ -4379,6 +4647,10 @@ LambdaMetricStats = Sequence[Mapping[str, str]]
 
 
 class LambdaCloudwatchInsights(AWSSection):
+    # The maximum number of log groups that can be queried with a single API call - source:
+    # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/logs.html#CloudWatchLogs.Client.start_query
+    MAX_LOG_GROUPS_PER_QUERY = 20
+
     def __init__(
         self,
         client,
@@ -4413,8 +4685,8 @@ class LambdaCloudwatchInsights(AWSSection):
 
     @staticmethod
     def query_results(
-        *, client, query_id: str, timeout_seconds: float, sleep_duration=0.1
-    ) -> Optional[LambdaMetricStats]:
+        *, client, query_id: str, timeout_seconds: float, sleep_duration=0.5
+    ) -> Optional[Sequence[LambdaMetricStats]]:
         "Synchronous wrapper for asynchronous query API with timeout checking. (agent should not be blocked)."
         response_results: Mapping[str, Any] = {"status": "Scheduled"}
         query_start = datetime.now().timestamp()
@@ -4431,48 +4703,114 @@ class LambdaCloudwatchInsights(AWSSection):
             sleep(sleep_duration)
         # stat metrics are always in the first element of the results or an empty list
         return (
-            response_results["results"][0]
+            response_results["results"]
             if response_results["results"] and response_results["status"] == "Complete"
             else None
         )
 
-    def _query_with_cloudwatch_insights(
-        self, *, log_group_name: str, query_string: str, timeout_seconds: int
-    ) -> Optional[LambdaMetricStats]:
+    def _group_query_results_by_function(
+        self, query_results: Sequence[LambdaMetricStats]
+    ) -> dict[str, LambdaMetricStats]:
+        grouped_results: dict[str, LambdaMetricStats] = {}
+        for query_result in query_results:
+            if not query_result:
+                continue
+            log_name = [e["value"] for e in query_result if e["field"] == "@log"][0]
+            lambda_fn_name = log_name.split("/")[-1]
+            final_query_result = [e for e in query_result if e["field"] != "@log"]
+            grouped_results[lambda_fn_name] = final_query_result
+        return grouped_results
+
+    def _start_logwatch_query(self, *, log_group_names: list[str], query_string: str) -> str:
         end_time_seconds = int(NOW.timestamp())
         start_time_seconds = int(end_time_seconds - self.period)
         response_query_id = self._client.start_query(
-            logGroupName=log_group_name,
+            logGroupNames=log_group_names,
             startTime=start_time_seconds,
             endTime=end_time_seconds,
             queryString=query_string,
         )
-        return self.query_results(
-            client=self._client,
-            query_id=response_query_id["queryId"],
-            timeout_seconds=timeout_seconds,
-        )
+        return response_query_id["queryId"]
+
+    def _get_splitted_list(self, source_list: list[T], chunk_size: int) -> list[list[T]]:
+        """
+        Split a list into a list of lists where every nested list has a maximum size of `chunk_size`
+        """
+        return [source_list[i : i + chunk_size] for i in range(0, len(source_list), chunk_size)]
+
+    def _get_all_existing_lambda_log_groups(self) -> set[str]:
+        """
+        Fetches all the existing log groups in the AWS account that are related to lambda functions
+        """
+        log_groups: set[str] = set()
+        for page in self._client.get_paginator("describe_log_groups").paginate(
+            logGroupNamePrefix="/aws/lambda/"
+        ):
+            log_groups.update(
+                e["logGroupName"] for e in self._get_response_content(page, "logGroups")
+            )
+        return log_groups
+
+    def _get_existing_log_groups_for_functions(self, function_names: Iterable[str]) -> list[str]:
+        # We are getting all the existing log groups because we want to query logwatch for multiple
+        # log groups at once but the query fails if one of the log groups don't exist so what might
+        # happen is that we query log groups for 2 functions: 1 that has an existing log group and 1
+        # that doesn't have it, in that case the query fails and we are not getting the data for the
+        # function with a log group.
+        # To prevent this, we just query the log groups that exists by checking that before doing
+        # the actual query.
+        all_existing_log_groups = self._get_all_existing_lambda_log_groups()
+        functions_log_groups = [f"/aws/lambda/{fn_name}" for fn_name in function_names]
+        # `all_existing_log_groups` may contain log groups for lambda functions that don't exist
+        # anymore so we are filtering it to just have the log groups for the existing functions
+        return [e for e in functions_log_groups if e in all_existing_log_groups]
 
     def get_live_data(
         self, *args: AWSColleagueContents
     ) -> Mapping[str, Optional[LambdaMetricStats]]:
         (colleague_contents,) = args
-        return {
-            function_arn: results
-            for function_arn in colleague_contents.content.keys()
-            if (
-                results := self._query_with_cloudwatch_insights(
-                    log_group_name=f"/aws/lambda/{_function_arn_to_function_name_dim(function_arn)}",
-                    query_string='filter @type = "REPORT"'
-                    "| stats "
-                    "max(@maxMemoryUsed) as max_memory_used_bytes,"
-                    "max(@initDuration) as max_init_duration_ms,"
-                    'sum(strcontains(@message, "Init Duration")) as count_cold_starts,'
-                    "count() as count_invocations",
-                    timeout_seconds=30,
-                )
-            )
+
+        function_name_to_arn: dict[str, str] = {
+            _function_arn_to_function_name_dim(fn_arn): fn_arn
+            for fn_arn in colleague_contents.content.keys()
         }
+        existing_functions_log_groups = self._get_existing_log_groups_for_functions(
+            function_name_to_arn.keys()
+        )
+        chunked_log_groups: list[list[str]] = self._get_splitted_list(
+            existing_functions_log_groups, self.MAX_LOG_GROUPS_PER_QUERY
+        )
+
+        queries: list[str] = []
+        # Logwatch queries are async jobs so we are first starting all of them and then getting the
+        # result for all of them so that they will be processed in parallel by AWS
+        for curr_log_groups in chunked_log_groups:
+            query_id = self._start_logwatch_query(
+                log_group_names=curr_log_groups,
+                query_string='filter @type = "REPORT"'
+                "| stats "
+                "max(@maxMemoryUsed) as max_memory_used_bytes,"
+                "max(@initDuration) as max_init_duration_ms,"
+                'sum(strcontains(@message, "Init Duration")) as count_cold_starts,'
+                "count() as count_invocations "
+                "by @log",
+            )
+            queries.append(query_id)
+
+        cloudwatch_data: dict[str, LambdaMetricStats] = {}
+        for query_id in queries:
+            query_results = self.query_results(
+                client=self._client,
+                query_id=query_id,
+                timeout_seconds=60,
+            )
+            if not query_results:
+                continue
+            current_data = self._group_query_results_by_function(query_results)
+            for fn_name, fn_stats in current_data.items():
+                fn_arn = function_name_to_arn[fn_name]
+                cloudwatch_data[fn_arn] = fn_stats
+        return cloudwatch_data
 
     def _compute_content(
         self, raw_content: AWSRawContent, colleague_contents: AWSColleagueContents
@@ -4625,6 +4963,103 @@ class Route53Cloudwatch(AWSSectionCloudwatch):
         return [AWSSectionResult("", rows) for _id, rows in computed_content.content.items()]
 
 
+#   .--SNS-----------------------------------------------------------------.
+#   |                          ____  _   _ ____                            |
+#   |                         / ___|| \ | / ___|                           |
+#   |                         \___ \|  \| \___ \                           |
+#   |                          ___) | |\  |___) |                          |
+#   |                         |____/|_| \_|____/                           |
+#   |                                                                      |
+#   +----------------------------------------------------------------------+
+#   |                                                                      |
+#   '----------------------------------------------------------------------'
+# SNS is a messaging service that follows the event-producers -> topics -> subscriptions model
+# producers and topics have a many-to-many-relationship.
+# topics and subscriptions also have a many-to-many-relationship.
+# It therefore makes sense to monitor Subscriptions, Topics, and Producers as the three central
+# building blocks of AWS SNS. Subscriptions and Topics have specific limits per account so they
+# are handled in the limits section. For producers it is more important to look at what exactly
+# they are producing, so the cloudwatch section monitors detailed metrics about incoming traffic.
+
+
+class SNSLimits(AWSSectionLimits):
+    """
+    AWS imposes the following per account limits.
+    Topics (Standard): 100k
+    Topics (FIFO): 1k
+    Subscriptions (Standard): 12.5M
+    Subscriptions (FIFO): 100
+    There are many other limits related to how many API requests one can make per second for
+    various tasks, but these four limits above are the most account-relevant limits.
+    This article might also be a valuable resource: https://www.serverless.com/guides/amazon-sns#:~:text=Amazon%20SNS%20limits,-%E2%80%8D&text=Both%20subscribe%20and%20unsubscribe%20transactions,the%20us%2Deast%2D1%20region
+    """
+
+    @property
+    def name(self) -> str:
+        return "sns_limits"
+
+    @property
+    def cache_interval(self) -> int:
+        return 300
+
+    @property
+    def granularity(self) -> int:
+        return 300
+
+    def _get_colleague_contents(self) -> AWSColleagueContents:
+        return AWSColleagueContents(None, 0.0)
+
+    def get_live_data(self, *args) -> Sequence[Mapping]:
+        topics = [
+            topic
+            for page in self._client.get_paginator("list_topics").paginate()
+            for topic in page["Topics"]
+        ]
+
+        num_of_subscriptions_by_topic = Counter(
+            str(subscription["TopicArn"])
+            for page in self._client.get_paginator("list_subscriptions").paginate()
+            for subscription in page["Subscriptions"]
+        )
+
+        return [
+            {
+                "arn": str(topic["TopicArn"]),
+                "is_fifo": str(topic["TopicArn"]).endswith(".fifo"),
+                "num_subscriptions": num_of_subscriptions_by_topic[str(topic["TopicArn"])],
+            }
+            for topic in topics
+        ]
+
+    def _compute_content(
+        self, raw_content: AWSRawContent, colleague_contents: AWSColleagueContents
+    ) -> AWSComputedContent:
+        topics: Sequence[Mapping] = raw_content.content
+
+        self._add_limit(
+            "",
+            AWSLimit(
+                key="topics_standard",
+                title="Standard Topics",
+                limit=int(100e3),
+                amount=sum(not x["is_fifo"] for x in topics),
+            ),
+            region=self._region,
+        )
+        self._add_limit(
+            "",
+            AWSLimit(
+                key="topics_fifo",
+                title="FIFO Topics",
+                limit=int(1e3),
+                amount=sum(x["is_fifo"] for x in topics),
+            ),
+            region=self._region,
+        )
+
+        return AWSComputedContent(raw_content.content, raw_content.cache_timestamp)
+
+
 # .
 #   .--sections------------------------------------------------------------.
 #   |                               _   _                                  |
@@ -4755,6 +5190,7 @@ class AWSSectionsUSEast(AWSSections):
             self._sections.append(CostsAndUsage(self._init_client("ce"), region, config))
 
         cloudwatch_client = self._init_client("cloudwatch")
+        tagging_client = self._init_client("resourcegroupstaggingapi")
         if "wafv2" in services and config.service_config["wafv2_cloudfront"]:
             wafv2_client = self._init_client("wafv2")
             wafv2_limits_distributor = ResultDistributor()
@@ -4783,6 +5219,22 @@ class AWSSectionsUSEast(AWSSections):
             )
             self._sections.append(route53_health_checks)
             self._sections.append(route53_cloudwatch)
+
+        if "cloudfront" in services:
+            cloudfront_client = self._init_client("cloudfront")
+            cloudfront_summary_distributor = ResultDistributor()
+            cloudfront_summary = CloudFrontSummary(
+                cloudfront_client, tagging_client, region, config, cloudfront_summary_distributor
+            )
+            cloudfront = CloudFront(
+                cloudwatch_client,
+                region,
+                config,
+                config.service_config["cloudfront_host_assignment"],
+            )
+            cloudfront_summary_distributor.add(cloudfront)
+            self._sections.append(cloudfront_summary)
+            self._sections.append(cloudfront)
 
 
 def _create_lamdba_sections(
@@ -5085,6 +5537,13 @@ class AWSSectionsGeneric(AWSSections):
             self._sections.append(lambda_cloudwatch)
             self._sections.append(lambda_cloudwatch_insights)
 
+        if "sns" in services:
+            sns_client = self._init_client("sns")
+            sns_limits_distributor = ResultDistributor()
+            sns_limits = SNSLimits(sns_client, region, config, sns_limits_distributor)
+            if config.service_config.get("sns_limits"):
+                self._sections.append(sns_limits)
+
 
 # .
 #   .--main----------------------------------------------------------------.
@@ -5211,6 +5670,22 @@ AWSServices = [
         filter_by_tags=True,
         limits=False,
     ),
+    AWSServiceAttributes(
+        key="sns",
+        title="SNS",
+        global_service=False,
+        filter_by_names=True,
+        filter_by_tags=True,
+        limits=True,
+    ),
+    AWSServiceAttributes(
+        key="cloudfront",
+        title="CloudFront",
+        global_service=True,
+        filter_by_names=True,
+        filter_by_tags=True,
+        limits=False,
+    ),
 ]
 
 
@@ -5282,6 +5757,10 @@ def parse_arguments(argv):
         "--wafv2-cloudfront",
         action="store_true",
         help="Also monitor global WAFs in front of CloudFront resources.",
+    )
+    parser.add_argument(
+        "--cloudfront-host-assignment",
+        help="Assign CloudFront services to the AWS host or to the origin domain host",
     )
     parser.add_argument("--hostname", required=True)
 
@@ -5485,12 +5964,25 @@ def _configure_aws(args: argparse.Namespace, sys_argv: list) -> AWSConfig:
             args.lambda_limits,
         ),
         ("route53", args.route53_names, (args.route53_tag_key, args.route53_tag_values), None),
+        ("sns", args.sns_names, (args.sns_tag_key, args.sns_tag_values), args.sns_limits),
+        (
+            "cloudfront",
+            args.cloudfront_names,
+            (args.cloudfront_tag_key, args.cloudfront_tag_values),
+            None,
+        ),
     ]:
         aws_config.add_single_service_config("%s_names" % service_key, service_names)
         aws_config.add_service_tags("%s_tags" % service_key, service_tags)
         aws_config.add_single_service_config("%s_limits" % service_key, service_limits)
 
-    for arg in ["s3_requests", "cloudwatch_alarms_limits", "cloudwatch_alarms", "wafv2_cloudfront"]:
+    for arg in [
+        "s3_requests",
+        "cloudwatch_alarms_limits",
+        "cloudwatch_alarms",
+        "wafv2_cloudfront",
+        "cloudfront_host_assignment",
+    ]:
         aws_config.add_single_service_config(arg, getattr(args, arg))
 
     return aws_config

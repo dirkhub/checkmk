@@ -355,7 +355,7 @@ export function fold_sidebar() {
     const button = document.getElementById("side_fold");
     utils.add_class(button, "folded");
 
-    ajax.get_url("sidebar_fold.py?fold=yes");
+    ajax.call_ajax("sidebar_fold.py?fold=yes", {method: "POST"});
 }
 
 function unfold_sidebar() {
@@ -364,7 +364,7 @@ function unfold_sidebar() {
     const button = document.getElementById("side_fold");
     utils.remove_class(button, "folded");
 
-    ajax.get_url("sidebar_fold.py?fold=");
+    ajax.call_ajax("sidebar_fold.py?fold=no", {method: "POST"});
 }
 
 //
@@ -384,6 +384,7 @@ var sidebar_update_interval = null;
 
 export function add_snapin(name) {
     ajax.call_ajax("sidebar_ajax_add_snapin.py?name=" + name, {
+        method: "POST",
         response_handler: function (_data, response) {
             const data = JSON.parse(response);
             if (data.result_code !== 0) {
@@ -450,7 +451,7 @@ export function remove_sidebar_snapin(oLink, url) {
         response_handler: function (id) {
             remove_snapin(id);
         },
-        method: "GET",
+        method: "POST",
     });
 }
 
@@ -509,7 +510,7 @@ export function toggle_sidebar_snapin(oH2, url) {
         utils.change_class(oHead, "open", "closed");
     }
     /* make this persistent -> save */
-    ajax.get_url(url + (closed ? "open" : "closed"));
+    ajax.call_ajax(url + (closed ? "open" : "closed"), {method: "POST"});
 }
 
 // TODO move to managed/web/htdocs/js
@@ -522,7 +523,10 @@ export function switch_customer(customer_id, switch_state) {
 }
 
 export function switch_site(url) {
-    ajax.get_url(url, utils.reload_whole_page, null);
+    ajax.call_ajax(url, {
+        method: "POST",
+        response_handler: utils.reload_whole_page,
+    });
 }
 
 function bulk_update_contents(ids, codes) {
@@ -768,7 +772,10 @@ export function wato_tree_topic_changed(topic_field) {
     }
 
     // Then send the info to python code via ajax call for persistance
-    ajax.get_url("ajax_set_foldertree.py?topic=" + encodeURIComponent(topic) + "&target=");
+    call_ajax("ajax_set_foldertree.py", {
+        method: "POST",
+        post_data: "topic=" + encodeURIComponent(topic) + "&target=",
+    });
 }
 
 export function wato_tree_target_changed(target_field) {
@@ -776,12 +783,10 @@ export function wato_tree_target_changed(target_field) {
     const target = target_field.value;
 
     // Send the info to python code via ajax call for persistance
-    ajax.get_url(
-        "ajax_set_foldertree.py?topic=" +
-            encodeURIComponent(topic) +
-            "&target=" +
-            encodeURIComponent(target)
-    );
+    call_ajax("ajax_set_foldertree.py", {
+        method: "POST",
+        post_data: "topic=" + encodeURIComponent(topic) + "&target=" + encodeURIComponent(target),
+    });
 }
 
 /************************************************
@@ -858,7 +863,7 @@ export function fetch_nagvis_snapin_contents() {
  * Bookmark snapin
  *************************************************/
 
-export function add_bookmark(trans_id = null) {
+export function add_bookmark() {
     const url = parent.frames[0].location;
     const title = parent.frames[0].document.title;
     ajax.call_ajax("add_bookmark.py", {
@@ -866,13 +871,7 @@ export function add_bookmark(trans_id = null) {
         response_handler: utils.update_contents,
         handler_data: "snapin_bookmarks",
         method: "POST",
-        post_data:
-            "title=" +
-            encodeURIComponent(title) +
-            "&url=" +
-            encodeURIComponent(url) +
-            "&_transid=" +
-            encodeURIComponent(trans_id),
+        post_data: "title=" + encodeURIComponent(title) + "&url=" + encodeURIComponent(url),
     });
 }
 

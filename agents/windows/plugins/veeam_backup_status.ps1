@@ -1,4 +1,5 @@
-$CMK_VERSION = "2.1.0b9"
+param ([switch] $Debug)
+$CMK_VERSION = "2.1.0p20"
 ## VEEAM Backups
 ## This powershell script needs to be run with the 64bit powershell
 ## and thus from a 64bit check_mk agent
@@ -28,7 +29,7 @@ catch {
         Add-PSSnapin VeeamPSSnapIn -ErrorAction Stop
     }
     catch {
-        Write-Host "No Veeam powershell modules could be loaded"
+        if ($Debug) {Write-Host "No Veeam powershell modules could be loaded"}
         Exit 1
     }
 }
@@ -65,7 +66,8 @@ foreach ($mycdpjobs in $cdpjobs)
 	$MyCdpJobsName = $mycdpjobs.Name -replace "\'","_" -replace " ","_"
 
 	$MyCdpJobsNextRun = $mycdpjobs.NextRun
-    $MyCdpJobsNextRun = get-date -date $MyCdpJobsNextRun -Uformat %s
+	if ($MyCdpJobsNextRun -ne $null) { $MyCdpJobsNextRun = get-date -date $MyCdpJobsNextRun -Uformat %s }
+	else { $MyCdpJobsNextRun = "null" }
 
 	$MyCdpJobsPolicyState = $mycdpjobs.PolicyState
 
@@ -195,4 +197,3 @@ $errItem = $_.Exception.ItemName
 Write-Error "Totally unexpected and unhandled error occured:`n Item: $errItem`n Error Message: $errMsg"
 Break
 }
-

@@ -185,7 +185,9 @@ def _ensure_connected(user: Optional[LoggedInUser], force_authuser: Optional[Use
     _connect_multiple_sites(user)
     _set_livestatus_auth(user, force_authuser)
 
-    logger.debug("Site states: %r", g.site_status)
+    site_states_to_log = g.site_status.copy()
+    site_states_to_log.update({"secret": "REDACTED"})
+    logger.debug("Site states: %r", site_states_to_log)
 
 
 def _connect_multiple_sites(user: LoggedInUser) -> None:
@@ -485,8 +487,7 @@ def sitenames() -> List[SiteId]:
 # TODO: Cleanup: Make clear that this function is used by the status GUI (and not WATO)
 # and only returns the currently enabled sites. Or should we redeclare the "disabled" state
 # to disable the sites at all?
-# TODO: Rename this!
-def allsites() -> SiteConfigurations:
+def get_enabled_sites() -> SiteConfigurations:
     return {
         name: get_site_config(name)  #
         for name in sitenames()

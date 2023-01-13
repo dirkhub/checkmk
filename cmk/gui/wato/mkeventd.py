@@ -46,7 +46,6 @@ else:
 import cmk.gui.forms as forms
 import cmk.gui.hooks as hooks
 import cmk.gui.mkeventd
-import cmk.gui.sites as sites
 import cmk.gui.watolib as watolib
 from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem
 from cmk.gui.exceptions import MKGeneralException, MKUserError
@@ -101,7 +100,7 @@ from cmk.gui.plugins.wato.utils import (
     SNMPCredentials,
     WatoMode,
 )
-from cmk.gui.sites import allsites, get_event_console_site_choices
+from cmk.gui.sites import get_enabled_sites, get_event_console_site_choices
 from cmk.gui.table import table_element
 from cmk.gui.type_defs import ActionResult, Choices
 from cmk.gui.utils.escaping import escape_to_html
@@ -143,6 +142,7 @@ from cmk.gui.wato.pages.global_settings import (
     ABCGlobalSettingsMode,
     MatchItemGeneratorSettings,
 )
+from cmk.gui.watolib.mkeventd import export_mkp_rule_pack, load_mkeventd_rules, save_mkeventd_rules
 from cmk.gui.watolib.search import (
     ABCMatchItemGenerator,
     match_item_generator_registry,
@@ -167,48 +167,63 @@ def _compiled_mibs_dir() -> Path:
 #   | Declarations of the structure of rules and actions                   |
 #   '----------------------------------------------------------------------'
 
+MACROS_AND_VARS = [
+    ("ID", _l("Event ID")),
+    ("COUNT", _l("Number of occurrances")),
+    ("TEXT", _l("Message text")),
+    ("FIRST", _l("Time of the first occurrence (time stamp)")),
+    ("LAST", _l("Time of the most recent occurrance")),
+    ("COMMENT", _l("Event comment")),
+    ("SL", _l("Service Level")),
+    ("HOST", _l("Host name (as sent by syslog)")),
+    ("ORIG_HOST", _l("Original host name when host name has been rewritten, empty otherwise")),
+    ("CONTACT", _l("Contact information")),
+    ("APPLICATION", _l("Syslog tag / Application")),
+    ("PID", _l("Process ID of the origin process")),
+    ("PRIORITY", _l("Syslog Priority")),
+    ("FACILITY", _l("Syslog Facility")),
+    ("RULE_ID", _l("ID of the rule")),
+    ("STATE", _l("State of the event (0/1/2/3)")),
+    ("PHASE", _l("Phase of the event (open in normal situations, closed when cancelling)")),
+    ("OWNER", _l("Owner of the event")),
+    ("MATCH_GROUPS", _l("Text groups from regular expression match, separated by spaces")),
+    ("MATCH_GROUP_1", _l("Text of the first match group from expression match")),
+    ("MATCH_GROUP_2", _l("Text of the second match group from expression match")),
+    (
+        "MATCH_GROUP_3",
+        _l("Text of the third match group from expression match (and so on...)"),
+    ),
+]
 
-def substitute_help():
-    _help_list = [
-        ("$ID$", _("Event ID")),
-        ("$COUNT$", _("Number of occurrances")),
-        ("$TEXT$", _("Message text")),
-        ("$FIRST$", _("Time of the first occurrence (time stamp)")),
-        ("$LAST$", _("Time of the most recent occurrance")),
-        ("$COMMENT$", _("Event comment")),
-        ("$SL$", _("Service Level")),
-        ("$HOST$", _("Host name (as sent by syslog)")),
-        ("$ORIG_HOST$", _("Original host name when host name has been rewritten, empty otherwise")),
-        ("$CONTACT$", _("Contact information")),
-        ("$APPLICATION$", _("Syslog tag / Application")),
-        ("$PID$", _("Process ID of the origin process")),
-        ("$PRIORITY$", _("Syslog Priority")),
-        ("$FACILITY$", _("Syslog Facility")),
-        ("$RULE_ID$", _("ID of the rule")),
-        ("$STATE$", _("State of the event (0/1/2/3)")),
-        ("$PHASE$", _("Phase of the event (open in normal situations, closed when cancelling)")),
-        ("$OWNER$", _("Owner of the event")),
-        ("$MATCH_GROUPS$", _("Text groups from regular expression match, separated by spaces")),
-        ("$MATCH_GROUP_1$", _("Text of the first match group from expression match")),
-        ("$MATCH_GROUP_2$", _("Text of the second match group from expression match")),
-        (
-            "$MATCH_GROUP_3$",
-            _("Text of the third match group from expression match (and so on...)"),
-        ),
-    ]
 
-    # TODO: While loading this module there is no "html" object available for generating the HTML
-    # code below. The HTML generating code could be independent of a HTML request.
+def _macros_help() -> HTML:
+    _help_list = [(f"${macro_name}$", description) for macro_name, description in MACROS_AND_VARS]
+
     _help_rows = [
-        html.render_tr(html.render_td(key) + html.render_td(value)) for key, value in _help_list
+        html.render_tr(html.render_td(key) + html.render_td(str(value)))
+        for key, value in _help_list
     ]
 
     return (
-        escape_to_html(
-            _("The following macros will be substituted by value from the actual event:")
-        )
+        _("Text-body of the email to send. ")
+        + _("The following macros will be substituted by value from the actual event:")
         + html.render_br()
         + html.render_br()
+        + html.render_table(HTML().join(_help_rows), class_="help")
+    )
+
+
+def _vars_help() -> HTML:
+    _help_list = [(f"CMK_{macro_name}", description) for macro_name, description in MACROS_AND_VARS]
+
+    _help_rows = [
+        html.render_tr(html.render_td(key) + html.render_td(str(value)))
+        for key, value in _help_list
+    ]
+
+    return (
+        _("This script will be executed using the BASH shell. ")
+        + _("This information is available as environment variables")
         + html.render_table(HTML().join(_help_rows), class_="help")
     )
 
@@ -915,7 +930,7 @@ def vs_mkeventd_rule(customer=None):
                 help=_("Apply this rule only on the following sites"),
                 choices=get_event_console_site_choices(),
                 locked_choices=list(
-                    allsites().keys() - dict(get_event_console_site_choices()).keys()
+                    get_enabled_sites().keys() - dict(get_event_console_site_choices()).keys()
                 ),
                 locked_choices_text_singular=_("%d locked site"),
                 locked_choices_text_plural=_("%d locked sites"),
@@ -1286,42 +1301,6 @@ def vs_mkeventd_rule(customer=None):
 #   +----------------------------------------------------------------------+
 #   |  Loading and saving of rule packs                                    |
 #   '----------------------------------------------------------------------'
-
-
-def load_mkeventd_rules():
-    rule_packs = ec.load_rule_packs()
-
-    # TODO: We should really separate the rule stats from this "config load logic"
-    rule_stats = _get_rule_stats_from_ec()
-
-    for rule_pack in rule_packs:
-        pack_hits = 0
-        for rule in rule_pack["rules"]:
-            hits = rule_stats.get(rule["id"], 0)
-            rule["hits"] = hits
-            pack_hits += hits
-        rule_pack["hits"] = pack_hits
-
-    return rule_packs
-
-
-def _get_rule_stats_from_ec() -> Dict[str, int]:
-    # Add information about rule hits: If we are running on OMD then we know
-    # the path to the state retention file of mkeventd and can read the rule
-    # statistics directly from that file.
-    rule_stats: Dict[str, int] = {}
-    for rule_id, count in sites.live().query("GET eventconsolerules\nColumns: rule_id rule_hits\n"):
-        rule_stats.setdefault(rule_id, 0)
-        rule_stats[rule_id] += count
-    return rule_stats
-
-
-def save_mkeventd_rules(rule_packs):
-    ec.save_rule_packs(rule_packs, config.mkeventd_pprint_rules)
-
-
-def export_mkp_rule_pack(rule_pack):
-    ec.export_rule_pack(rule_pack, config.mkeventd_pprint_rules)
 
 
 @sample_config_generator_registry.register
@@ -1793,39 +1772,8 @@ class ModeEventConsoleRulePacks(ABCEventConsoleMode):
                         % (rule_pack["id"], rule_pack["title"], len(rule_pack["rules"])),
                     )
                     html.icon_button(delete_url, _("Delete this rule pack"), "delete")
-                elif type_ == ec.RulePackType.exported:
-                    dissolve_url = make_action_link(
-                        [("mode", "mkeventd_rule_packs"), ("_dissolve", nr)]
-                    )
-                    html.icon_button(
-                        dissolve_url,
-                        _("Remove this rule pack from the Extension Packages module"),
-                        {
-                            "icon": "mkps",
-                            "emblem": "disable",
-                        },
-                    )
-                elif type_ == ec.RulePackType.modified_mkp:
-                    reset_url = make_action_link([("mode", "mkeventd_rule_packs"), ("_reset", nr)])
-                    html.icon_button(
-                        reset_url,
-                        _("Reset rule pack to the MKP version"),
-                        {
-                            "icon": "mkps",
-                            "emblem": "disable",
-                        },
-                    )
-                    sync_url = make_action_link(
-                        [("mode", "mkeventd_rule_packs"), ("_synchronize", nr)]
-                    )
-                    html.icon_button(
-                        sync_url,
-                        _("Synchronize MKP with modified version"),
-                        {
-                            "icon": "mkps",
-                            "emblem": "refresh",
-                        },
-                    )
+                else:
+                    html.disabled_icon_button("trans")  # Invisible dummy button for icon spacing
 
                 rules_url_vars = [("mode", "mkeventd_rules"), ("rule_pack", id_)]
                 if found_packs.get(id_):
@@ -1847,18 +1795,51 @@ class ModeEventConsoleRulePacks(ABCEventConsoleMode):
                                 "emblem": "add",
                             },
                         )
-
-                    table.cell("", css="buttons")
-                    if type_ == ec.RulePackType.unmodified_mkp:
-                        html.icon(
-                            "mkps", _("This rule pack is provided via the MKP %s.") % id_to_mkp[id_]
-                        )
                     elif type_ == ec.RulePackType.exported:
+                        dissolve_url = make_action_link(
+                            [("mode", "mkeventd_rule_packs"), ("_dissolve", nr)]
+                        )
+                        html.icon_button(
+                            dissolve_url,
+                            _("Remove this rule pack from the Extension Packages module"),
+                            {
+                                "icon": "mkps",
+                                "emblem": "disable",
+                            },
+                        )
+                    elif type_ == ec.RulePackType.modified_mkp:
+                        reset_url = make_action_link(
+                            [("mode", "mkeventd_rule_packs"), ("_reset", nr)]
+                        )
+                        html.icon_button(
+                            reset_url,
+                            _("Reset rule pack to the MKP version"),
+                            {
+                                "icon": "mkps",
+                                "emblem": "disable",
+                            },
+                        )
+                        sync_url = make_action_link(
+                            [("mode", "mkeventd_rule_packs"), ("_synchronize", nr)]
+                        )
+                        html.icon_button(
+                            sync_url,
+                            _("Synchronize MKP with modified version"),
+                            {
+                                "icon": "mkps",
+                                "emblem": "refresh",
+                            },
+                        )
+
+                    table.cell(_("State"), css="buttons")
+                    if type_ == ec.RulePackType.exported:
                         html.icon(
                             "mkps",
-                            _(
-                                "This is rule pack can be packaged with the Extension Packages module."
-                            ),
+                            _("This rule pack can be packaged with the Extension Packages module."),
+                        )
+                    elif type_ == ec.RulePackType.unmodified_mkp:
+                        html.icon(
+                            "mkps", _("This rule pack is provided via the MKP %s.") % id_to_mkp[id_]
                         )
                     elif type_ == ec.RulePackType.modified_mkp:
                         html.icon(
@@ -3046,12 +3027,15 @@ class ModeEventConsoleMIBs(ABCEventConsoleMode):
         (cmk.gui.mkeventd.mib_upload_dir() / filename).unlink()
 
         # Also delete the compiled files
+        def append_suffix(path: Path, suffix: str) -> Path:
+            return path.with_suffix(path.suffix + suffix)
+
         compiled_mibs_dir = _compiled_mibs_dir()
         for f in [
-            compiled_mibs_dir / mib_name + ".py",
-            compiled_mibs_dir / mib_name + ".pyc",
-            compiled_mibs_dir / filename.rsplit(".", 1)[0].upper() + ".py",
-            compiled_mibs_dir / filename.rsplit(".", 1)[0].upper() + ".pyc",
+            append_suffix(compiled_mibs_dir / mib_name, ".py"),
+            append_suffix(compiled_mibs_dir / mib_name, ".pyc"),
+            (compiled_mibs_dir / filename.upper()).with_suffix(".py"),
+            (compiled_mibs_dir / filename.upper()).with_suffix(".pyc"),
         ]:
             f.unlink(missing_ok=True)
 
@@ -3937,10 +3921,7 @@ class ConfigVariableEventConsoleActions(ConfigVariable):
                                                     "body",
                                                     TextAreaUnicode(
                                                         title=_("Body"),
-                                                        help=lambda: _(
-                                                            "Text-body of the email to send. "
-                                                        )
-                                                        + substitute_help(),
+                                                        help=_macros_help,
                                                         cols=64,
                                                         rows=10,
                                                     ),
@@ -3958,16 +3939,7 @@ class ConfigVariableEventConsoleActions(ConfigVariable):
                                                     "script",
                                                     TextAreaUnicode(
                                                         title=_("Script body"),
-                                                        help=lambda: _(
-                                                            "This script will be executed using the BASH shell. "
-                                                        )
-                                                        + substitute_help()
-                                                        + "<br>"
-                                                        + _(
-                                                            "These information are also available as environment variables with the prefix "
-                                                            "<tt>CMK_</tt>. For example the text of the event is available as "
-                                                            "<tt>CMK_TEXT</tt> as environment variable."
-                                                        ),
+                                                        help=_vars_help,
                                                         cols=64,
                                                         rows=10,
                                                     ),

@@ -7,7 +7,7 @@
 # yapf: disable
 
 import copy
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import pytest
 
@@ -17,7 +17,7 @@ from cmk.utils.livestatus_helpers.testing import MockLiveStatusConnection
 import cmk.gui.plugins.views
 import cmk.gui.views
 from cmk.gui.globals import config, html, user
-from cmk.gui.plugins.views.utils import transform_painter_spec
+from cmk.gui.plugins.views.utils import ABCDataSource, Cell, Painter, transform_painter_spec
 from cmk.gui.plugins.visuals.utils import Filter
 from cmk.gui.type_defs import PainterSpec
 from cmk.gui.valuespec import ValueSpec
@@ -671,6 +671,25 @@ def test_registered_datasources():
         assert ds.keys == spec["keys"]
         assert ds.id_keys == spec["idkeys"]
         assert ds.infos == spec["infos"]
+
+def test_painter_export_title(monkeypatch) -> None:
+    painters: list[Painter] = [painter_class() for painter_class in cmk.gui.plugins.views.utils.painter_registry.values()]
+    painters_and_cells: list[Tuple[Painter, Cell]] = [
+                                                      (
+                                                       painter,
+                                                       cmk.gui.plugins.views.utils.Cell(cmk.gui.views.View("", {}, {}),PainterSpec(painter.ident))
+                                                      )
+                                                      for painter in painters
+                                                     ]
+
+    dummy_ident: str = "einszwo"
+    for painter, cell in painters_and_cells:
+        cell._painter_params = {"ident": dummy_ident} # pylint: disable=protected-access
+        expected_title: str = painter.ident
+        if painter.ident in ["host_custom_variable", "service_custom_variable"]:
+            expected_title += "_%s" % dummy_ident
+        assert painter.export_title(cell) == expected_title
+
 
 
 def test_legacy_register_painter(monkeypatch):
@@ -2443,7 +2462,7 @@ def test_create_view_basics():
 
     assert view.name == view_name
     assert view.spec == view_spec
-    assert isinstance(view.datasource, cmk.gui.plugins.views.utils.ABCDataSource)
+    assert isinstance(view.datasource, ABCDataSource)
     assert isinstance(view.datasource.table, cmk.gui.plugins.views.utils.RowTable)
     assert view.row_limit is None
     assert view.user_sorters is None
@@ -2653,6 +2672,7 @@ def test_registered_display_hints():
     '.hardware.storage.disks:*.size',
     '.hardware.storage.disks:*.type',
     '.hardware.storage.disks:*.vendor',
+    '.hardware.storage.disks.size',
     '.hardware.system.',
     '.hardware.system.expresscode',
     '.hardware.system.manufacturer',
@@ -2694,6 +2714,9 @@ def test_registered_display_hints():
     '.networking.interfaces:*.speed',
     '.networking.interfaces:*.vlans',
     '.networking.interfaces:*.vlantype',
+    '.networking.kube:',
+    '.networking.kube:*.address_type',
+    '.networking.kube:*.ip',
     '.networking.routes:',
     '.networking.routes:*.device',
     '.networking.routes:*.gateway',
@@ -2862,9 +2885,6 @@ def test_registered_display_hints():
     '.software.applications.kube.metadata.name',
     '.software.applications.kube.metadata.namespace',
     '.software.applications.kube.metadata.object',
-    '.software.applications.kube.network:',
-    '.software.applications.kube.network:*.address_type',
-    '.software.applications.kube.network:*.ip',
     '.software.applications.kube.node.',
     '.software.applications.kube.node.architecture',
     '.software.applications.kube.node.container_runtime_version',
@@ -2916,6 +2936,9 @@ def test_registered_display_hints():
     '.software.applications.kubernetes.service_info.cluster_ip',
     '.software.applications.kubernetes.service_info.load_balancer_ip',
     '.software.applications.kubernetes.service_info.type',
+    '.software.applications.mobileiron.',
+    '.software.applications.mobileiron.partition_name',
+    '.software.applications.mobileiron.registration_state',
     '.software.applications.mssql.',
     '.software.applications.mssql.instances:',
     '.software.applications.mssql.instances:*.clustered',

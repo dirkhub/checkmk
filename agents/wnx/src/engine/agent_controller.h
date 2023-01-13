@@ -21,19 +21,21 @@ namespace cma::ac {
 constexpr std::string_view kLegacyPullFile{"allow-legacy-pull"};
 constexpr std::string_view kControllerFlagFile{"controller-flag"};
 constexpr std::string_view kCmkAgentUnistall{"cmk_agent_uninstall.txt"};
-constexpr std::string_view kCmkAgentMarkerNew{
+constexpr std::string_view kCmkAgentMarkerNewDeprecated{
     "Check MK monitoring and management Service - "};
+constexpr std::string_view kCmkAgentMarkerLatest{
+    "Checkmk monitoring agent service - "};
 constexpr std::string_view kCmdLineAsDaemon{"daemon"};
 constexpr std::string_view kCmdLinePort{"-P"};
 constexpr std::string_view kCmdLineChannel{"--agent-channel"};
 constexpr std::string_view kCmdLineAllowedIp{"-A"};
 constexpr std::string_view kCmdLineVersion{"-V"};
 constexpr std::string_view kCmdLineStatus{"status --json"};
-constexpr uint16_t kWindowsInternalPort{50001};
+constexpr uint16_t kWindowsInternalPort{28250};
 
 std::filesystem::path GetController(const std::filesystem::path &service);
 std::filesystem::path GetWorkController();
-bool CreateTomlConfig(const std::filesystem::path &service);
+bool CreateTomlConfig(const std::filesystem::path &toml_file);
 std::wstring BuildCommandLine(const std::filesystem::path &controller);
 std::optional<uint32_t> StartAgentController(
     const std::filesystem::path &service);
@@ -54,6 +56,7 @@ std::filesystem::path TomlConfigFile();
 uint16_t GetConfiguredAgentChannelPort();
 bool GetConfiguredLocalOnly();
 bool GetConfiguredCheck();
+bool GetConfiguredAllowElevated();
 bool IsConfiguredEmergencyOnCrash();
 
 /// To be called once when cap is installed

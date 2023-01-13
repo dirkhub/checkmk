@@ -1,6 +1,10 @@
 // library for uploading packages
 package lib
 
+versioning = load 'buildscripts/scripts/lib/versioning.groovy'
+downloads_path = "/var/downloads/checkmk/"
+hashfile_extension = ".hash"
+
 def upload(Map args) {
     // needed args + desc:
     // NAME: Name of the artifact to display
@@ -9,22 +13,32 @@ def upload(Map args) {
     // CMK_VERS: Version that should be uploaded
     // UPLOAD_DEST: Where should the packages be uploaded to
     // PORT: Port fo upload dest
-    stage(args.NAME + ' upload package') {
-        def FILE_BASE = get_file_base(args.FILE_PATH)
-        def ARCHIVE_BASE = get_archive_base(FILE_BASE)
-        
+    def FILE_BASE = get_file_base(args.FILE_PATH)
+    def ARCHIVE_BASE = get_archive_base(FILE_BASE)
+
+    create_hash(args.FILE_PATH)
+
+    stage(args.FILE_NAME + ' upload package and hash file') {
         via_rsync(ARCHIVE_BASE, args.CMK_VERS, args.FILE_NAME, args.UPLOAD_DEST, args.PORT)
+        via_rsync(ARCHIVE_BASE, args.CMK_VERS, args.FILE_NAME + hashfile_extension, args.UPLOAD_DEST, args.PORT)
     }
 }
 
 def download_deb(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, EDITION, DISTRO) {
-    def FILE_PATTERN = "check-mk-${EDITION}-${CMK_VERSION}_0.${DISTRO}_amd64.deb"
+    CMK_VERSION_RC_LESS = versioning.strip_rc_number_from_version(CMK_VERSION);
+    def FILE_PATTERN = "check-mk-${EDITION}-${CMK_VERSION_RC_LESS}_0.${DISTRO}_amd64.deb"
     download_version_dir(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, FILE_PATTERN, DISTRO)
 }
 
 def download_source_tar(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, EDITION) {
-    def FILE_PATTERN = "check-mk-${EDITION}-${CMK_VERSION}.*.tar.gz"
+    CMK_VERSION_RC_LESS = versioning.strip_rc_number_from_version(CMK_VERSION);
+    def FILE_PATTERN = "check-mk-${EDITION}-${CMK_VERSION_RC_LESS}.*.tar.gz"
     download_version_dir(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, FILE_PATTERN, 'source tar')
+}
+
+def download_docker_tar(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, EDITION) {
+    def FILE_PATTERN = versioning.get_docker_artifact_name(EDITION, CMK_VERSION)
+    download_version_dir(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, FILE_PATTERN, 'docker tar')
 }
 
 def download_version_dir(DOWNLOAD_SOURCE, PORT, CMK_VERSION, DOWNLOAD_DEST, PATTERN = "*", INFO = 'all packages') {
@@ -79,22 +93,42 @@ def via_rsync(ARCHIVE_BASE, CMK_VERS, FILE_NAME, UPLOAD_DEST, PORT) {
     }
 }
 
-def create_hashes(ARCHIVE_DIR) {
-    stage("Create file hashes") {
-        def HASHES_PATH = ARCHIVE_DIR + "/HASHES"
-        sh("cd ${ARCHIVE_DIR} ; sha256sum -- *.{tar.gz,rpm,deb,cma,cmk} | sort -k 2 > ${HASHES_PATH}")
+def create_hash(FILE_PATH) {
+    stage("Create file hash") {
+        sh("""
+            cd \$(dirname ${FILE_PATH});
+            sha256sum -- \$(basename ${FILE_PATH}) > "\$(basename ${FILE_PATH})${hashfile_extension}";
+        """);
     }
 }
 
-def deploy_to_website(UPLOAD_URL, PORT, CMK_VERS) {
-    stage("Deploy to Website") {
-        withCredentials([file(credentialsId: 'Release_Key', variable: 'RELEASE_KEY')]) {
-            sh """
-                ssh -o StrictHostKeyChecking=no -i ${RELEASE_KEY} -p ${PORT} ${UPLOAD_URL} \
-                    ln -sf /var/downloads/checkmk/${CMK_VERS} /smb-share-customer/checkmk
-            """
-        }
+def execute_cmd_on_archive_server(cmd) {
+    withCredentials([file(credentialsId: 'Release_Key', variable: 'RELEASE_KEY')]) {
+        sh """
+           ssh -o StrictHostKeyChecking=no -i ${RELEASE_KEY} -p ${WEB_DEPLOY_PORT} ${WEB_DEPLOY_URL} "${cmd}"
+        """
     }
+}
+
+def deploy_to_website(CMK_VERS) {
+    stage("Deploy to Website") {
+        // CMK_VERS can contain a rc information like v2.1.0p6-rc1.
+        // On the website, we only want to have official releases.
+        def TARGET_VERSION = versioning.strip_rc_number_from_version(CMK_VERS)
+
+        // We also do not want to keep rc versions on the archive.
+        // So rename the folder in case we have a rc
+        if (TARGET_VERSION != CMK_VERS) {
+            execute_cmd_on_archive_server("mv ${downloads_path}${CMK_VERS} ${downloads_path}${TARGET_VERSION};")
+        }
+        execute_cmd_on_archive_server("ln -sf " +
+            "${downloads_path}${TARGET_VERSION} /smb-share-customer/checkmk/${TARGET_VERSION};");
+    }
+}
+
+def cleanup_rc_candidates_of_version(CMK_VERS) {
+    def TARGET_VERSION = versioning.strip_rc_number_from_version(CMK_VERS)
+    execute_cmd_on_archive_server("rm -rf ${downloads_path}${TARGET_VERSION}-rc*;")
 }
 
 return this

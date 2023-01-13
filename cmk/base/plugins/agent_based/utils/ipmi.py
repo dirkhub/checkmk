@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # Copyright (C) 2019 tribe29 GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
@@ -9,6 +8,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Literal,
     Mapping,
     Optional,
@@ -129,6 +129,24 @@ def _sensor_levels_to_check_levels(
     return warn, sensor_crit
 
 
+def _check_status_txt(
+    status_txt: str,
+    status_txt_mapping: StatusTxtMapping,
+    user_configured_states: Iterable[tuple[str, State]],
+) -> Result:
+    for status_txt_beginning, mon_state in user_configured_states:
+        if status_txt.startswith(status_txt_beginning):
+            return Result(
+                state=mon_state,
+                summary=f"Status: {status_txt}",
+                details="Monitoring state of sensor status set by user-configured rules",
+            )
+    return Result(
+        state=status_txt_mapping(status_txt),
+        summary=f"Status: {status_txt}",
+    )
+
+
 def check_ipmi_detailed(
     item: str,
     params: Mapping[str, Any],
@@ -136,61 +154,56 @@ def check_ipmi_detailed(
     temperature_metrics_only: bool,
     status_txt_mapping: StatusTxtMapping,
 ) -> type_defs.CheckResult:
-
-    # stay compatible with older versions
-    yield Result(
-        state=status_txt_mapping(sensor.status_txt),
-        summary="Status: %s" % sensor.status_txt,
+    yield _check_status_txt(
+        sensor.status_txt,
+        status_txt_mapping,
+        (
+            (status_txt_beginning, State(mon_state_int))
+            for status_txt_beginning, mon_state_int in params.get("sensor_states", [])
+        ),
     )
 
-    if sensor.value is not None:
-        metric = None
-        if not temperature_metrics_only:
-            metric = Metric(
-                item.replace("/", "_"),
-                sensor.value,
-                levels=(sensor.warn_high, sensor.crit_high),
-            )
+    if sensor.value is None:
+        return
 
-        # Do not save performance data for FANs. This produces a lot of data and is - in my
-        # opinion - useless.
-        elif "temperature" in item.lower() or "temp" in item.lower() or sensor.unit == "C":
-            metric = Metric(
-                "value",
-                sensor.value,
-                levels=(None, sensor.crit_high),
-            )
-
-        sensor_result, *_ = check_levels(
+    metric = None
+    if not temperature_metrics_only:
+        metric = Metric(
+            item.replace("/", "_"),
             sensor.value,
-            levels_upper=_sensor_levels_to_check_levels(sensor.warn_high, sensor.crit_high),
-            levels_lower=_sensor_levels_to_check_levels(sensor.warn_low, sensor.crit_low),
-            render_func=_unit_to_render_func(sensor.unit),
+            levels=(sensor.warn_high, sensor.crit_high),
         )
-        yield Result(
-            state=sensor_result.state,
-            summary=sensor_result.summary,
-        )
-        if metric:
-            yield metric
 
-        num_result = _check_numerical_levels(
-            item,
+    # Do not save performance data for FANs. This produces a lot of data and is - in my
+    # opinion - useless.
+    elif "temperature" in item.lower() or "temp" in item.lower() or sensor.unit == "C":
+        metric = Metric(
+            "value",
             sensor.value,
-            params,
-            sensor.unit,
+            levels=(None, sensor.crit_high),
         )
-        if num_result is not None:
-            yield num_result
 
-    for wato_status_txt, wato_status in params.get("sensor_states", []):
-        if sensor.status_txt.startswith(wato_status_txt):
-            yield Result(state=State(wato_status), summary="User-defined state")
-            break
+    sensor_result, *_ = check_levels(
+        sensor.value,
+        levels_upper=_sensor_levels_to_check_levels(sensor.warn_high, sensor.crit_high),
+        levels_lower=_sensor_levels_to_check_levels(sensor.warn_low, sensor.crit_low),
+        render_func=_unit_to_render_func(sensor.unit),
+    )
+    yield Result(
+        state=sensor_result.state,
+        summary=sensor_result.summary,
+    )
+    if metric:
+        yield metric
 
-    # Sensor reports 'nc' ('non critical'), so we set the state to WARNING
-    if sensor.status_txt.startswith("nc"):
-        yield Result(state=State.WARN, summary="Sensor is non-critical")
+    num_result = _check_numerical_levels(
+        item,
+        sensor.value,
+        params,
+        sensor.unit,
+    )
+    if num_result is not None:
+        yield num_result
 
 
 def check_ipmi_summarized(

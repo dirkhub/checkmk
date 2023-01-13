@@ -1,10 +1,43 @@
 import logging
 import time
-from typing import Any, List, NamedTuple, NewType, Optional
+from collections.abc import Mapping
+from typing import Any, AnyStr, List, NamedTuple, NoReturn, Optional
 
 import requests
 
+from tests.testlib.rest_api_client import RequestHandler, Response
+
 logger = logging.getLogger("rest-session")
+
+
+class RequestSessionRequestHandler(RequestHandler):
+    def __init__(self):
+        self.session = requests.session()
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        query_params: Optional[Mapping[str, str]] = None,
+        body: Optional[AnyStr] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Response:
+        if headers is not None:
+            actual_headers = dict(headers)
+        else:
+            actual_headers = {}
+        resp = self.session.request(
+            method=method,
+            url=url,
+            params=query_params,
+            data=body,
+            headers=actual_headers,
+            allow_redirects=False,
+        )
+        return Response(status_code=resp.status_code, body=resp.text.encode(), headers=resp.headers)
+
+    def set_credentials(self, username: str, password: str) -> None:
+        self.session.headers["Authorization"] = f"Bearer {username} {password}"
 
 
 class RestSessionException(Exception):
@@ -185,10 +218,50 @@ class CMKOpenApiSession(requests.Session):
         if response.status_code != 204:
             raise UnexpectedResponse.from_response(response)
 
-    def discover_services(self, hostname: str) -> None:
+    def discover_services(self, hostname: str) -> NoReturn:
         response = self.post(
-            f"/objects/host/{hostname}/actions/discover_services/invoke",
-            json={"mode": "new"},
+            "/domain-types/service_discovery_run/actions/start/invoke",
+            json={"host_name": hostname, "mode": "refresh"},
+            # We want to get the redirect response and handle that below. So don't let requests
+            # handle that for us.
+            allow_redirects=False,
+        )
+        if response.status_code == 302:
+            raise Redirect(redirect_url=response.headers["Location"])  # activation pending
+        raise UnexpectedResponse.from_response(response)
+
+    # Would be nice to consolidate this function and activate_changes_and_wait_for_completion,
+    # but we will have to extend the API a bit to have the same functionality first.
+    def discover_services_and_wait_for_completion(self, hostname: str) -> None:
+        timeout = 60
+        start = time.time()
+        try:
+            self.discover_services(hostname)
+        except Redirect as redirect:
+            redirect_url = redirect.redirect_url
+            body = {}
+            while redirect_url:
+                if time.time() > (start + timeout):
+                    raise TimeoutError("wait for completion on service discovery timed out")
+
+                response = self.get(redirect_url)
+                if response.status_code != 200:
+                    raise UnexpectedResponse.from_response(response)
+
+                body = response.json()
+                if body["extensions"]["active"]:
+                    time.sleep(0.5)
+                    continue  # Job is still running, wait for the result
+
+                if body["extensions"]["state"] == "finished":
+                    break  # Finished as intended
+
+                raise RuntimeError("Unhandled state: %r" % body)
+
+        # TODO: Once we have a "tabula rasa" mode, we can remove this second invocaton
+        response = self.post(
+            "/domain-types/service_discovery_run/actions/start/invoke",
+            json={"host_name": hostname, "mode": "fix_all"},
         )
         if response.status_code != 200:
             raise UnexpectedResponse.from_response(response)

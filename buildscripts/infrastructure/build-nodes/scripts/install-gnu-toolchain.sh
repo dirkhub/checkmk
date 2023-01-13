@@ -18,11 +18,11 @@ GCC_VERSION="${GCC_MAJOR}.${GCC_MINOR}.${GCC_PATCHLEVEL}"
 GCC_ARCHIVE_NAME="gcc-${GCC_VERSION}.tar.gz"
 GCC_URL="${MIRROR_URL}gcc/gcc-${GCC_VERSION}/${GCC_ARCHIVE_NAME}"
 
-BINUTILS_VERSION="2.36.1"
+BINUTILS_VERSION="2.39"
 BINUTILS_ARCHIVE_NAME="binutils-${BINUTILS_VERSION}.tar.gz"
 BINUTILS_URL="${MIRROR_URL}binutils/${BINUTILS_ARCHIVE_NAME}"
 
-GDB_VERSION="11.1"
+GDB_VERSION="12.1"
 GDB_ARCHIVE_NAME="gdb-${GDB_VERSION}.tar.gz"
 GDB_URL="${MIRROR_URL}gdb/${GDB_ARCHIVE_NAME}"
 
@@ -32,7 +32,10 @@ PREFIX=${TARGET_DIR}/${DIR_NAME}
 BUILD_DIR=/opt/src
 
 # Increase this to enforce a recreation of the build cache
-BUILD_ID=1
+# NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE
+# Only the GCC_VERSION is part of the cache key, so be sure to bump this, too,
+# e.g. when changing the binutils or gdb version!
+BUILD_ID=43
 
 download_sources() {
     # Get the sources from nexus or upstream
@@ -62,8 +65,23 @@ build_binutils() {
     tar xzf binutils-${BINUTILS_VERSION}.tar.gz
     mkdir binutils-${BINUTILS_VERSION}-build
     cd binutils-${BINUTILS_VERSION}-build
+    # HACK: Dispatching on the distro is not nice, we should really check the versions.
+    case "$DISTRO" in
+        centos-7)
+            echo "makeinfo too old, gprofng's docs won't build"
+            BINUTILS_CONFIGURE_ADD_OPTS="--disable-gprofng"
+            ;;
+        sles-12*)
+            echo "bison 2.7 is too old, gprofng requires bison 3.0.4 or later"
+            BINUTILS_CONFIGURE_ADD_OPTS="--disable-gprofng"
+            ;;
+        *)
+            BINUTILS_CONFIGURE_ADD_OPTS=""
+            ;;
+    esac
     ../binutils-${BINUTILS_VERSION}/configure \
-        --prefix=${PREFIX}
+        "${BINUTILS_CONFIGURE_ADD_OPTS}" \
+        --prefix="${PREFIX}"
     make -j4
     make install
 }

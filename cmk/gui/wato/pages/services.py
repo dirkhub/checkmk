@@ -55,23 +55,29 @@ from cmk.gui.plugins.wato.utils import mode_registry, WatoMode
 from cmk.gui.plugins.wato.utils.context_buttons import make_host_status_link
 from cmk.gui.sites import sitenames
 from cmk.gui.table import Foldable, table_element
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.urls import DocReference
 from cmk.gui.view_utils import format_plugin_output, render_labels
 from cmk.gui.wato.pages.hosts import ModeEditHost
-from cmk.gui.watolib import automation_command_registry, AutomationCommand
 from cmk.gui.watolib.activate_changes import get_pending_changes_info, get_pending_changes_tooltip
+from cmk.gui.watolib.automation_commands import automation_command_registry, AutomationCommand
 from cmk.gui.watolib.changes import make_object_audit_log_url
-from cmk.gui.watolib.check_mk_automations import active_check, update_host_labels
+from cmk.gui.watolib.check_mk_automations import active_check
 from cmk.gui.watolib.rulespecs import rulespec_registry
 from cmk.gui.watolib.services import (
     checkbox_id,
-    Discovery,
     DiscoveryAction,
     DiscoveryOptions,
     DiscoveryResult,
     DiscoveryState,
     execute_discovery_job,
     get_check_table,
+    has_active_job,
+    has_discovery_action_specific_permissions,
+    initial_discovery_result,
+    perform_fix_all,
+    perform_host_label_discovery,
+    perform_service_discovery,
     StartDiscoveryRequest,
 )
 from cmk.gui.watolib.utils import may_edit_ruleset
@@ -239,25 +245,26 @@ class AutomationServiceDiscoveryJob(AutomationCommand):
 @page_registry.register_page("ajax_service_discovery")
 class ModeAjaxServiceDiscovery(AjaxPage):
     def page(self):
+        check_csrf_token()
         user.need_permission("wato.hosts")
 
         api_request: AjaxDiscoveryRequest = self.webapi_request()
         html.request.del_var("request")  # Do not add this to URLs constructed later
-        api_request.setdefault("update_target", None)
-        api_request.setdefault("update_source", None)
+        update_target = api_request.get("update_target", None)
+        update_source = api_request.get("update_source", None)
         api_request.setdefault("update_services", [])
+        update_services = api_request.get("update_services", [])
 
         # Make Folder() be able to detect the current folder correctly
         html.request.set_var("folder", api_request["folder_path"])
 
         folder = watolib.Folder.folder(api_request["folder_path"])
-        self._host = folder.host(api_request["host_name"])
-        if not self._host:
+        host = folder.host(api_request["host_name"])
+        if not host:
             raise MKUserError("host", _("You called this page with an invalid host name."))
-        self._host.need_permission("read")
+        host.need_permission("read")
 
-        self._options = self._get_discovery_options(api_request)
-
+        discovery_options = DiscoveryOptions(**api_request["discovery_options"])
         # Reuse the discovery result already known to the GUI or fetch a new one?
         previous_discovery_result = (
             DiscoveryResult.deserialize(raw)
@@ -265,21 +272,19 @@ class ModeAjaxServiceDiscovery(AjaxPage):
             else None
         )
 
-        if self._use_previous_discovery_result(api_request, previous_discovery_result):
-            assert previous_discovery_result is not None
-            discovery_result = previous_discovery_result
-        else:
-            discovery_result = self._get_check_table()
+        # If the user has the wrong permissions, then we still return a discovery result
+        # which is different from the REST API behavior.
+        if not has_discovery_action_specific_permissions(discovery_options.action):
+            discovery_options = discovery_options._replace(action=DiscoveryAction.NONE)
 
-        job_actions = [
-            DiscoveryAction.NONE,
-            DiscoveryAction.REFRESH,
-            DiscoveryAction.TABULA_RASA,
-            DiscoveryAction.STOP,
-        ]
-
-        if self._options.action not in job_actions and transactions.check_transaction():
-            discovery_result = self._handle_action(discovery_result, api_request)
+        discovery_result = self._perform_discovery_action(
+            host=host,
+            discovery_options=discovery_options,
+            previous_discovery_result=previous_discovery_result,
+            update_source=update_source,
+            update_target=update_target,
+            update_services=update_services,
+        )
 
         if not discovery_result.check_table_created and previous_discovery_result:
             discovery_result = DiscoveryResult(
@@ -292,33 +297,113 @@ class ModeAjaxServiceDiscovery(AjaxPage):
                 changed_labels=previous_discovery_result.changed_labels,
             )
 
-        self._update_persisted_discovery_options()
+        show_checkboxes = user.discovery_checkboxes
+        if show_checkboxes != discovery_options.show_checkboxes:
+            user.discovery_checkboxes = discovery_options.show_checkboxes
+        show_parameters = user.parameter_column
+        if show_parameters != discovery_options.show_parameters:
+            user.parameter_column = discovery_options.show_parameters
+        show_discovered_labels = user.discovery_show_discovered_labels
+        if show_discovered_labels != discovery_options.show_discovered_labels:
+            user.discovery_show_discovered_labels = discovery_options.show_discovered_labels
+        show_plugin_names = user.discovery_show_plugin_names
+        if show_plugin_names != discovery_options.show_plugin_names:
+            user.discovery_show_plugin_names = discovery_options.show_plugin_names
 
         renderer = DiscoveryPageRenderer(
-            self._host,
-            self._options,
+            host,
+            discovery_options,
         )
         page_code = renderer.render(discovery_result, api_request)
         fix_all_code = renderer.render_fix_all(discovery_result)
 
         # Clean the requested action after performing it
-        performed_action = self._options.action
-        self._options = self._options._replace(action=DiscoveryAction.NONE)
+        performed_action = discovery_options.action
+        discovery_options = discovery_options._replace(action=DiscoveryAction.NONE)
 
         return {
-            "is_finished": not self._is_active(discovery_result),
+            "is_finished": not has_active_job(discovery_result),
             "job_state": discovery_result.job_status["state"],
             "message": self._get_status_message(discovery_result, performed_action),
             "body": page_code,
             "fixall": fix_all_code,
-            "page_menu": self._get_page_menu(),
+            "page_menu": self._get_page_menu(discovery_options, host),
             "pending_changes_info": get_pending_changes_info(),
             "pending_changes_tooltip": get_pending_changes_tooltip(),
-            "discovery_options": self._options._asdict(),
+            "discovery_options": discovery_options._asdict(),
             "discovery_result": discovery_result.serialize(),
         }
 
-    def _get_page_menu(self) -> str:
+    def _perform_discovery_action(
+        self,
+        host: watolib.CREHost,
+        discovery_options: DiscoveryOptions,
+        previous_discovery_result: Optional[DiscoveryResult],
+        update_source: Optional[str],
+        update_target: Optional[str],
+        update_services: List[str],
+    ) -> DiscoveryResult:
+        if discovery_options.action == DiscoveryAction.NONE:
+            return initial_discovery_result(discovery_options, host, previous_discovery_result)
+
+        if discovery_options.action in (
+            DiscoveryAction.REFRESH,
+            DiscoveryAction.TABULA_RASA,
+            DiscoveryAction.STOP,
+        ):
+            if transactions.check_transaction():
+                return get_check_table(
+                    StartDiscoveryRequest(host, host.folder(), discovery_options)
+                )
+            return initial_discovery_result(discovery_options, host, previous_discovery_result)
+
+        discovery_result = initial_discovery_result(
+            discovery_options, host, previous_discovery_result
+        )
+        if not transactions.check_transaction():
+            return discovery_result
+
+        action = discovery_options.action
+        if action == DiscoveryAction.FIX_ALL:
+            discovery_result = perform_fix_all(
+                discovery_options=discovery_options,
+                discovery_result=discovery_result,
+                host=host,
+            )
+        elif action == DiscoveryAction.UPDATE_HOST_LABELS:
+            discovery_result = perform_host_label_discovery(
+                discovery_options=discovery_options,
+                discovery_result=discovery_result,
+                host=host,
+            )
+        elif action in (
+            DiscoveryAction.SINGLE_UPDATE,
+            DiscoveryAction.BULK_UPDATE,
+            DiscoveryAction.UPDATE_SERVICES,
+        ):
+            discovery_result = perform_service_discovery(
+                discovery_options=discovery_options,
+                discovery_result=discovery_result,
+                update_services=update_services,
+                update_source=update_source,
+                update_target=update_target,
+                host=host,
+            )
+        elif action == DiscoveryAction.UPDATE_SERVICES:
+            discovery_result = perform_service_discovery(
+                discovery_options=discovery_options,
+                discovery_result=discovery_result,
+                update_services=update_services,
+                update_source=None,
+                update_target=None,
+                host=host,
+            )
+        else:
+            raise MKUserError("discovery", f"Unknown discovery action: {discovery_options.action}")
+
+        return discovery_result
+
+    def _get_page_menu(self, discovery_options: DiscoveryOptions, host: watolib.CREHost) -> str:
         """Render the page menu contents to reflect contect changes
 
         The page menu needs to be updated, just like the body of the page. We previously tried an
@@ -326,16 +411,16 @@ class ModeAjaxServiceDiscovery(AjaxPage):
         refresh), but it was a lot more complex to realize and resulted in inconsistencies. This is
         the simpler solution and less error prone.
         """
-        page_menu = service_page_menu(self._get_discovery_breadcrumb(), self._host, self._options)
+        page_menu = service_page_menu(self._get_discovery_breadcrumb(host), host, discovery_options)
         with output_funnel.plugged():
             PageMenuRenderer().show(
                 page_menu, hide_suggestions=not user.get_tree_state("suggestions", "all", True)
             )
             return output_funnel.drain()
 
-    def _get_discovery_breadcrumb(self) -> Breadcrumb:
+    def _get_discovery_breadcrumb(self, host: watolib.CREHost) -> Breadcrumb:
         with request.stashed_vars():
-            request.set_var("host", self._host.name())
+            request.set_var("host", host.name())
             mode = ModeDiscovery()
             return make_main_menu_breadcrumb(mode.main_menu()) + mode.breadcrumb()
 
@@ -350,7 +435,7 @@ class ModeAjaxServiceDiscovery(AjaxPage):
         ]
 
         if discovery_result.job_status["state"] == JobStatusStates.INITIALIZED:
-            if self._is_active(discovery_result):
+            if has_active_job(discovery_result):
                 return _("Initializing discovery...")
             if not cmk_check_entries:
                 return _("No discovery information available. Please perform a rescan.")
@@ -420,112 +505,6 @@ class ModeAjaxServiceDiscovery(AjaxPage):
             return " ".join(messages)
 
         return None
-
-    def _get_discovery_options(self, api_request: dict) -> DiscoveryOptions:
-
-        options = DiscoveryOptions(**api_request["discovery_options"])
-
-        # Refuse action requests in case the user is not permitted
-        if options.action != DiscoveryAction.NONE and not user.may("wato.services"):
-            options = options._replace(action=DiscoveryAction.NONE)
-
-        if options.action != DiscoveryAction.TABULA_RASA and not (
-            user.may("wato.service_discovery_to_undecided")
-            and user.may("wato.service_discovery_to_monitored")
-            and user.may("wato.service_discovery_to_ignored")
-            and user.may("wato.service_discovery_to_removed")
-        ):
-            options = options._replace(action=DiscoveryAction.NONE)
-
-        return options
-
-    def _use_previous_discovery_result(self, api_request, previous_discovery_result):
-        if not previous_discovery_result:
-            return False
-
-        if (
-            self._options.action
-            in [DiscoveryAction.TABULA_RASA, DiscoveryAction.REFRESH, DiscoveryAction.STOP]
-            and transactions.check_transaction()
-        ):
-            return False
-
-        if self._is_active(previous_discovery_result):
-            return False
-
-        return True
-
-    def _is_active(self, discovery_result):
-        return discovery_result.job_status["is_active"]
-
-    def _get_check_table(self) -> DiscoveryResult:
-        return get_check_table(
-            StartDiscoveryRequest(self._host, self._host.folder(), self._options)
-        )
-
-    def _update_persisted_discovery_options(self):
-        show_checkboxes = user.discovery_checkboxes
-        if show_checkboxes != self._options.show_checkboxes:
-            user.discovery_checkboxes = self._options.show_checkboxes
-
-        show_parameters = user.parameter_column
-        if show_parameters != self._options.show_parameters:
-            user.parameter_column = self._options.show_parameters
-
-        show_discovered_labels = user.discovery_show_discovered_labels
-        if show_discovered_labels != self._options.show_discovered_labels:
-            user.discovery_show_discovered_labels = self._options.show_discovered_labels
-
-        show_plugin_names = user.discovery_show_plugin_names
-        if show_plugin_names != self._options.show_plugin_names:
-            user.discovery_show_plugin_names = self._options.show_plugin_names
-
-    def _handle_action(
-        self, discovery_result: DiscoveryResult, api_request: dict
-    ) -> DiscoveryResult:
-        user.need_permission("wato.services")
-
-        if self._options.action in [
-            DiscoveryAction.UPDATE_HOST_LABELS,
-            DiscoveryAction.FIX_ALL,
-        ]:
-            self._do_update_host_labels(discovery_result)
-
-        if self._options.action in [
-            DiscoveryAction.SINGLE_UPDATE,
-            DiscoveryAction.BULK_UPDATE,
-            DiscoveryAction.FIX_ALL,
-            DiscoveryAction.UPDATE_SERVICES,
-        ]:
-            discovery = Discovery(self._host, self._options, api_request)
-            discovery.do_discovery(discovery_result)
-
-        if self._options.action in [
-            DiscoveryAction.SINGLE_UPDATE,
-            DiscoveryAction.BULK_UPDATE,
-            DiscoveryAction.FIX_ALL,
-            DiscoveryAction.UPDATE_SERVICES,
-            DiscoveryAction.UPDATE_HOST_LABELS,
-        ]:
-            # did discovery! update the check table
-            discovery_result = self._get_check_table()
-
-        if not self._host.locked():
-            self._host.clear_discovery_failed()
-
-        return discovery_result
-
-    def _do_update_host_labels(self, discovery_result):
-        message = _("Updated discovered host labels of '%s' with %d labels") % (
-            self._host.name(),
-            len(discovery_result.host_labels),
-        )
-        watolib.add_service_change(self._host, "update-host-labels", message)
-        update_host_labels(
-            self._host.site_id(),
-            self._host.name(),
-            discovery_result.host_labels,
-        )
 
 
 class DiscoveryPageRenderer:
@@ -1454,6 +1433,7 @@ class ModeAjaxExecuteCheck(AjaxPage):
         self._item = request.get_str_input_mandatory("item")
 
     def page(self):
+        check_csrf_token()
         try:
             active_check_result = active_check(
                 self._site,

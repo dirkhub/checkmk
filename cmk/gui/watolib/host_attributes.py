@@ -25,7 +25,7 @@ from cmk.gui.exceptions import MKGeneralException, MKUserError
 from cmk.gui.globals import config, html, request
 from cmk.gui.htmllib import HTML
 from cmk.gui.i18n import _, _u
-from cmk.gui.sites import allsites
+from cmk.gui.sites import get_enabled_sites
 from cmk.gui.type_defs import Choices
 from cmk.gui.utils import escaping
 from cmk.gui.valuespec import Checkbox, DropdownChoice, TextInput, Transform, ValueSpec
@@ -980,7 +980,7 @@ class ABCHostAttributeHostTagList(ABCHostAttributeTag, abc.ABC):
 class ABCHostAttributeHostTagCheckbox(ABCHostAttributeTag, abc.ABC):
     """A checkbox for a host tag group"""
 
-    def valuespec(self) -> Checkbox:
+    def _valuespec(self) -> Checkbox:
         choice = self._tag_group.get_tag_choices()[0]
         return Checkbox(
             title=self._tag_group.title,
@@ -990,17 +990,19 @@ class ABCHostAttributeHostTagCheckbox(ABCHostAttributeTag, abc.ABC):
             onclick="cmk.wato.fix_visibility();",
         )
 
+    def valuespec(self) -> Transform:
+        return Transform(
+            valuespec=self._valuespec(),
+            forth=lambda s: s == self._tag_value(),
+            back=lambda s: self._tag_value() if s is True else None,
+        )
+
     @property
     def is_checkbox_tag(self) -> bool:
         return True
 
     def render_input(self, varprefix: str, value: Optional[TagID]) -> None:
-        super().render_input(varprefix, bool(value))
-
-    def from_html_vars(self, varprefix: str) -> Optional[TagID]:
-        if super().from_html_vars(varprefix):
-            return self._tag_value()
-        return None
+        self._valuespec().render_input(varprefix + self.name(), bool(value))
 
     def _tag_value(self) -> Optional[TagID]:
         return self._tag_group.get_tag_choices()[0][0]
@@ -1208,7 +1210,7 @@ def _validate_general_host_attributes(host_attributes, new):
                 attr.validate_input(value, "")
 
         # The site attribute gets an extra check
-        if name == "site" and value not in allsites().keys():
+        if name == "site" and value not in get_enabled_sites().keys():
             raise MKUserError(None, _("Unknown site %s") % escaping.escape_attribute(value))
 
 

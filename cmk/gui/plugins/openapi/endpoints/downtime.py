@@ -49,10 +49,11 @@ from cmk.gui.livestatus_utils.commands.downtimes import QueryException
 from cmk.gui.plugins.openapi.restful_objects import (
     constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
-from cmk.gui.plugins.openapi.utils import problem
+from cmk.gui.plugins.openapi.utils import problem, serve_json
 
 from cmk import fields
 
@@ -78,9 +79,39 @@ HOST_NAME_SHOW = {
     )
 }
 
+PERMISSIONS = permissions.Ignore(
+    permissions.AnyPerm(
+        [
+            permissions.Perm("general.see_all"),
+            permissions.Perm("bi.see_all"),
+            permissions.Perm("mkeventd.seeall"),
+        ]
+    )
+)
+
+
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("action.downtimes"),
+        PERMISSIONS,
+    ]
+)
+
 
 class DowntimeParameter(BaseSchema):
-    query = gui_fields.query_field(Downtimes, required=False)
+    query = gui_fields.query_field(
+        Downtimes,
+        required=False,
+        example=json.dumps(
+            {
+                "op": "and",
+                "expr": [
+                    {"op": "=", "left": "host_name", "right": "example.com"},
+                    {"op": "=", "left": "type", "right": "0"},
+                ],
+            }
+        ),
+    )
 
 
 @Endpoint(
@@ -92,6 +123,7 @@ class DowntimeParameter(BaseSchema):
     request_schema=request_schemas.CreateHostRelatedDowntime,
     additional_status_codes=[422],
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
     update_config_generation=False,
 )
 def create_host_related_downtime(params):
@@ -161,6 +193,7 @@ def create_host_related_downtime(params):
     request_schema=request_schemas.CreateServiceRelatedDowntime,
     additional_status_codes=[422],
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
     update_config_generation=False,
 )
 def create_service_related_downtime(params):
@@ -241,14 +274,33 @@ def create_service_related_downtime(params):
         DowntimeParameter,
     ],
     response_schema=response_schemas.DomainObjectCollection,
+    permissions_required=PERMISSIONS,
 )
 def show_downtimes(param):
     """Show all scheduled downtimes"""
+    return _show_downtimes(param)
+
+
+def _show_downtimes(param):
+    """
+    Examples:
+
+        >>> import json
+        >>> from cmk.gui.livestatus_utils.testing import simple_expect
+        >>> from cmk.gui.plugins.openapi.restful_objects.params import to_openapi
+        >>> from cmk.utils.livestatus_helpers.expressions import tree_to_expr
+        >>> with simple_expect() as live:
+        ...    _ = live.expect_query("GET downtimes\\nColumns: host_name type\\nFilter: host_name = example.com\\nFilter: type = 0\\nAnd: 2")
+        ...    q = Query([Downtimes.host_name, Downtimes.type])
+        ...    q = q.filter(tree_to_expr(json.loads(to_openapi([DowntimeParameter], "query")[0]['example']), "downtimes"))
+        ...    list(q.iterate(live))
+        []
+
+    """
     live = sites.live()
     sites_to_query = param.get("sites")
     if sites_to_query:
         live.only_sites = sites_to_query
-
     q = Query(
         [
             Downtimes.id,
@@ -262,21 +314,17 @@ def show_downtimes(param):
             Downtimes.comment,
         ]
     )
-
     query_expr = param.get("query")
     if query_expr is not None:
         q = q.filter(query_expr)
-
     host_name = param.get("host_name")
     if host_name is not None:
         q = q.filter(And(Downtimes.host_name.op("=", host_name), Downtimes.is_service.equals(0)))
-
     service_description = param.get("service_description")
     if service_description is not None:
         q = q.filter(Downtimes.service_description.contains(service_description))
-
     gen_downtimes = q.iterate(live)
-    return _serve_downtimes(gen_downtimes)
+    return serve_json(_serialize_downtimes(gen_downtimes))
 
 
 @Endpoint(
@@ -292,6 +340,7 @@ def show_downtimes(param):
         }
     ],
     response_schema=response_schemas.DomainObject,
+    permissions_required=PERMISSIONS,
 )
 def show_downtime(params):
     """Show downtime"""
@@ -320,14 +369,7 @@ def show_downtime(params):
             title="The requested downtime was not found",
             detail=f"The downtime id {downtime_id} did not match any downtime",
         )
-    return _serve_downtime(downtime)
-
-
-def _serve_downtime(downtime_details):
-    response = Response()
-    response.set_data(json.dumps(_serialize_single_downtime(downtime_details)))
-    response.set_content_type("application/json")
-    return response
+    return serve_json(_serialize_single_downtime(downtime))
 
 
 @Endpoint(
@@ -338,6 +380,7 @@ def _serve_downtime(downtime_details):
     skip_locking=True,
     request_schema=request_schemas.DeleteDowntime,
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
     update_config_generation=False,
 )
 def delete_downtime(params):
@@ -372,13 +415,6 @@ def delete_downtime(params):
             detail=f"The downtime-type {delete_type!r} is not supported.",
         )
     return Response(status=204)
-
-
-def _serve_downtimes(downtimes):
-    response = Response()
-    response.set_data(json.dumps(_serialize_downtimes(downtimes)))
-    response.set_content_type("application/json")
-    return response
 
 
 def _serialize_downtimes(downtimes):

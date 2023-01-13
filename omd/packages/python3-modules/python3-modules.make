@@ -11,7 +11,7 @@ PYTHON3_MODULES_DEPS := $(REPO_PATH)/Pipfile.lock \
 	$(wildcard $(REPO_PATH)/agent-receiver/agent_receiver/*.py)
 
 # Increase the number before the "-" to enforce a recreation of the build cache
-PYTHON3_MODULES_BUILD_ID := $(call cache_pkg_build_id,16,$(PYTHON3_MODULES_DEPS))
+PYTHON3_MODULES_BUILD_ID := $(call cache_pkg_build_id,18,$(PYTHON3_MODULES_DEPS))
 
 PYTHON3_MODULES_UNPACK:= $(BUILD_HELPER_DIR)/$(PYTHON3_MODULES_DIR)-unpack
 PYTHON3_MODULES_PATCHING := $(BUILD_HELPER_DIR)/$(PYTHON3_MODULES_DIR)-patching
@@ -61,6 +61,7 @@ $(PYTHON3_MODULES_BUILD): $(PYTHON_CACHE_PKG_PROCESS) $(OPENSSL_CACHE_PKG_PROCES
 	    export LDFLAGS="-Wl,--strip-debug -Wl,--rpath,/omd/versions/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/lib $(PACKAGE_PYTHON_LDFLAGS) $(PACKAGE_FREETDS_LDFLAGS) $(PACKAGE_OPENSSL_LDFLAGS)" ; \
 	    export LD_LIBRARY_PATH="$(PACKAGE_PYTHON_LD_LIBRARY_PATH):$(PACKAGE_OPENSSL_LD_LIBRARY_PATH)" ; \
 	    export PATH="$(PACKAGE_PYTHON_BIN):$$PATH" ; \
+	    export CFLAGS="-I$(PACKAGE_PYTHON_INCLUDE_PATH) $$CFLAGS" ; \
 	    $(PACKAGE_PYTHON_EXECUTABLE) -m pip install \
 		`: dont use precompiled things, build with our build env ` \
 		--no-binary=":all:" \

@@ -22,7 +22,21 @@ oneTimeSetUp () {
     mkdir -p "$MK_CONFDIR/mk_oracle.d"
 
     # shellcheck disable=SC1090
-    . "$MK_ORACLE_PLUGIN_PATH" >/dev/null 2>&1
+    MK_SOURCE_ONLY=true . "$MK_ORACLE_PLUGIN_PATH"
+
+    pwd() { echo "check_mk_agent/plugins"; }
+
+    set_os_env
+
+    # Fake the sqlplus binary
+    ORACLE_HOME=${SHUNIT_TMPDIR}/ora_home
+    FAKE_SQLPLUS=${ORACLE_HOME}/bin/sqlplus
+    mkdir -p ${ORACLE_HOME}/bin
+    cat <<EOF >"${FAKE_SQLPLUS}"
+echo "SQL*Plus: Release 19.2.3.4.5 - Production
+Version 19.3.0.0.0"
+EOF
+    chmod +x ${FAKE_SQLPLUS}
 
     # Overwrite functions from mk_oracle which cannot/won't be unit tested for now
     mk_ora_sqlplus () { true; }
@@ -35,7 +49,9 @@ oneTimeSetUp () {
     do_async_custom_sqls () { true; }
     do_testmode_custom_sql () { true; }
 
+    sql_iostats() { echo "mocked-sql_iostats"; }
     sql_performance () { echo "mocked-sql_performance"; }
+    sql_systemparameter() { echo "mocked-sql_systemparameter"; }
     sql_tablespaces () { echo "mocked-sql_tablespaces"; }
     sql_dataguard_stats () { echo "mocked-sql_dataguard_stats"; }
     sql_recovery_status () { echo "mocked-sql_recovery_status"; }
@@ -74,7 +90,42 @@ tearDown () {
     unset custom_sqls_sections custom_sqls_sids
 }
 
-#.
+# .
+
+#   ---helpers-------------------------------------------------------------
+
+test_get_sqlplus_version_with_precision() {
+    sqlplus_version="$(get_sqlplus_version_with_precision 5)"
+    assertEquals "19.2.3.4.5" "${sqlplus_version}"
+
+    sqlplus_version="$(get_sqlplus_version_with_precision 2)"
+    assertEquals "19.2" "${sqlplus_version}"
+}
+
+test_mk_oracle_set_ora_version() {
+    # Get version via sqlplus
+    set_ora_version
+    assertEquals "192" "${NUMERIC_ORACLE_VERSION}"
+    assertEquals "19234" "${NUMERIC_ORACLE_VERSION_FOUR_PARTS}"
+
+    # Get version with remote instances
+    REMOTE_INSTANCE="<user>:<password>:<role>:<host>:<port>:<piggybackhost>:<sid>:12.3:<tnsalias>"
+    set_ora_version $( echo "${REMOTE_INSTANCE}" | cut -d":" -f8)
+    assertEquals "123" "${NUMERIC_ORACLE_VERSION}"
+    assertEquals "123" "${NUMERIC_ORACLE_VERSION_FOUR_PARTS}"
+
+    REMOTE_INSTANCE="<user>:<password>:<role>:<host>:<port>:<piggybackhost>:<sid>:12.3.4.5:<tnsalias>"
+    set_ora_version $( echo "${REMOTE_INSTANCE}" | cut -d":" -f8)
+    assertEquals "123" "${NUMERIC_ORACLE_VERSION}"
+    assertEquals "12345" "${NUMERIC_ORACLE_VERSION_FOUR_PARTS}"
+
+    # Get version from env test variable
+    MK_ORA_TESTVERSION="18.1"
+    set_ora_version "${ORACLE_VERSION}"
+    assertEquals "181" "${NUMERIC_ORACLE_VERSION}"
+    assertEquals "181" "${NUMERIC_ORACLE_VERSION_FOUR_PARTS}"
+
+}
 
 #   ---load_config----------------------------------------------------------
 

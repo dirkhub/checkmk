@@ -1394,7 +1394,7 @@ class PainterSvcPnpgraph(Painter):
         return "svc_pnpgraph"
 
     def title(self, cell: Cell) -> str:
-        return _("Service Graphs")
+        return _("Service graphs")
 
     @property
     def columns(self) -> List[ColumnName]:
@@ -1534,23 +1534,13 @@ def _paint_custom_notes(what: str, row: Row) -> CellSpec:
     host = row["host_name"]
     svc = row.get("service_description")
     if what == "service":
-        dirs = notes_matching_pattern_entries(
-            [
-                Path(
-                    cmk.utils.paths.default_config_dir,
-                    "/notes/services",
-                )
-            ],
-            host,
-        )
+        dirs = [
+            Path(cmk.utils.paths.default_config_dir) / "notes/services" / host,
+            Path(cmk.utils.paths.default_config_dir) / "notes/services" / "*",
+        ]
         item = svc
     else:
-        dirs = [
-            Path(
-                cmk.utils.paths.default_config_dir,
-                "/notes/hosts",
-            )
-        ]
+        dirs = [Path(cmk.utils.paths.default_config_dir) / "notes/hosts"]
         item = host
 
     assert isinstance(item, str)
@@ -1710,6 +1700,9 @@ class ABCPainterCustomVariable(Painter, abc.ABC):
 
     def short_title(self, cell: Cell) -> str:
         return self._dynamic_title(cell.painter_parameters())
+
+    def export_title(self, cell: Cell) -> str:
+        return "%s_%s" % (self.ident, cell.painter_parameters()["ident"])
 
     def _dynamic_title(self, params: Optional[Dict[str, Any]] = None) -> str:
         if params is None:
@@ -5331,7 +5324,7 @@ class _PainterHostKubernetes(Painter):
 
     @property
     def columns(self) -> List[ColumnName]:
-        return ["host_labels", "host_name"]
+        return ["host_labels", "host_name", "site"]
 
     def render(self, row: Row, cell: Cell) -> CellSpec:
         labels = row.get("host_labels", {})
@@ -5353,6 +5346,7 @@ class _PainterHostKubernetes(Painter):
                 # name of the dashboard we are linking to
                 ("name", f"kubernetes_{self._kubernetes_object_type}"),
                 ("host", row["host_name"]),
+                ("site", row["site"]),
             ],
             filename="dashboard.py",
         )

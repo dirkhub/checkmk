@@ -16,6 +16,7 @@ from cmk.utils.type_defs import timeperiod_spec_alias
 import cmk.gui.hooks as hooks
 import cmk.gui.plugins.userdb.utils as userdb_utils
 import cmk.gui.userdb as userdb
+import cmk.gui.watolib.mkeventd as mkeventd
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.globals import html, request, user
 from cmk.gui.groups import (
@@ -54,7 +55,7 @@ def _clear_group_information_request_cache() -> None:
 
 
 def add_group(name: GroupName, group_type: GroupType, extra_info: GroupSpec) -> None:
-    _check_modify_group_permissions(group_type)
+    check_modify_group_permissions(group_type)
     all_groups = load_group_information()
     groups = all_groups.get(group_type, {})
 
@@ -78,7 +79,7 @@ def add_group(name: GroupName, group_type: GroupType, extra_info: GroupSpec) -> 
 
 
 def edit_group(name: GroupName, group_type: GroupType, extra_info: GroupSpec) -> None:
-    _check_modify_group_permissions(group_type)
+    check_modify_group_permissions(group_type)
     all_groups = load_group_information()
     groups = all_groups.get(group_type, {})
 
@@ -119,8 +120,7 @@ def edit_group(name: GroupName, group_type: GroupType, extra_info: GroupSpec) ->
 
 
 def delete_group(name: GroupName, group_type: GroupType) -> None:
-    _check_modify_group_permissions(group_type)
-
+    check_modify_group_permissions(group_type)
     # Check if group exists
     all_groups = load_group_information()
     groups = all_groups.get(group_type, {})
@@ -156,7 +156,7 @@ def _add_group_change(group: GroupSpec, action_name: str, text: str) -> None:
     add_change(action_name, text, sites=group_sites)
 
 
-def _check_modify_group_permissions(group_type: GroupType) -> None:
+def check_modify_group_permissions(group_type: GroupType) -> None:
     required_permissions = {
         "contact": ["wato.users"],
         "host": ["wato.groups"],
@@ -282,6 +282,7 @@ def find_usages_of_contact_group(name: GroupName) -> List[Tuple[str, str]]:
     used_in += _find_usages_of_contact_group_in_hosts_and_folders(name, Folder.root_folder())
     used_in += _find_usages_of_contact_group_in_notification_rules(name)
     used_in += _find_usages_of_contact_group_in_dashboards(name)
+    used_in += _find_usages_of_contact_group_in_ec_rules(name)
 
     return used_in
 
@@ -408,6 +409,28 @@ def _find_usages_of_contact_group_in_dashboards(name: str) -> List[Tuple[str, st
                     ),
                 )
             )
+    return used_in
+
+
+def _find_usages_of_contact_group_in_ec_rules(name: str) -> List[Tuple[str, str]]:
+    """Is the contactgroup used in an eventconsole rule?"""
+    used_in: List[Tuple[str, str]] = []
+    rule_packs = mkeventd.load_mkeventd_rules()
+    for pack in rule_packs:
+        for nr, rule in enumerate(pack.get("rules", [])):
+            if name in rule.get("contact_groups", {}).get("groups", []):
+                used_in.append(
+                    (
+                        "%s: %s" % (_("Event console rule"), rule["id"]),
+                        folder_preserving_link(
+                            [
+                                ("mode", "mkeventd_edit_rule"),
+                                ("edit", nr),
+                                ("rule_pack", pack["id"]),
+                            ]
+                        ),
+                    )
+                )
     return used_in
 
 

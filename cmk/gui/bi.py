@@ -147,6 +147,7 @@ def api_get_aggregation_state(
             is_single_host_aggregation = len(required_hosts) == 1
             aggregations[aggr_title] = {
                 "state": node_result_bundle.actual_result.state,
+                "output": node_result_bundle.actual_result.output,
                 "hosts": required_hosts,
                 "acknowledged": node_result_bundle.actual_result.acknowledged,
                 "in_downtime": node_result_bundle.actual_result.downtime_state != 0,
@@ -990,11 +991,13 @@ def bi_livestatus_query(
     query: str,
     only_sites: Optional[List[SiteId]] = None,
     output_format: LivestatusOutputFormat = LivestatusOutputFormat.PYTHON,
+    fetch_full_data: bool = False,
 ) -> LivestatusResponse:
 
     with sites.output_format(output_format), sites.only_sites(only_sites), sites.prepend_site():
         try:
-            sites.live().set_auth_domain("bi")
+            auth_domain = "bi_fetch_full_data" if fetch_full_data else "bi"
+            sites.live().set_auth_domain(auth_domain)
             return sites.live().query(query)
         finally:
             sites.live().set_auth_domain("read")

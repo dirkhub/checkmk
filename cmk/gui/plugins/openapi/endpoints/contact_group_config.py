@@ -23,6 +23,7 @@ A contact group object can have the following relations present in `links`:
 from cmk.utils import version
 
 from cmk.gui import watolib
+from cmk.gui.globals import endpoint, user
 from cmk.gui.http import Response
 from cmk.gui.plugins.openapi.endpoints.utils import (
     fetch_group,
@@ -38,11 +39,28 @@ from cmk.gui.plugins.openapi.endpoints.utils import (
 from cmk.gui.plugins.openapi.restful_objects import (
     constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
 from cmk.gui.plugins.openapi.restful_objects.parameters import NAME_FIELD
-from cmk.gui.watolib.groups import add_group, edit_group, load_contact_group_information
+from cmk.gui.plugins.openapi.utils import serve_json
+from cmk.gui.utils.logged_in import SuperUserContext
+from cmk.gui.watolib.groups import (
+    add_group,
+    check_modify_group_permissions,
+    edit_group,
+    load_contact_group_information,
+)
+
+PERMISSIONS = permissions.Perm("wato.users")
+
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        PERMISSIONS,
+    ]
+)
 
 
 @Endpoint(
@@ -52,9 +70,12 @@ from cmk.gui.watolib.groups import add_group, edit_group, load_contact_group_inf
     etag="output",
     request_schema=request_schemas.InputContactGroup,
     response_schema=response_schemas.DomainObject,
+    permissions_required=RW_PERMISSIONS,
 )
 def create(params):
     """Create a contact group"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.users")
     body = params["body"]
     name = body["name"]
     group_details = {"alias": body.get("alias")}
@@ -71,9 +92,12 @@ def create(params):
     method="post",
     request_schema=request_schemas.BulkInputContactGroup,
     response_schema=response_schemas.DomainObjectCollection,
+    permissions_required=RW_PERMISSIONS,
 )
 def bulk_create(params):
-    """Bulk create host groups"""
+    """Bulk create contact groups"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.users")
     body = params["body"]
     entries = body["entries"]
     contact_group_details = prepare_groups("contact", entries)
@@ -84,7 +108,7 @@ def bulk_create(params):
         contact_group_names.append(group_name)
 
     contact_groups = fetch_specific_groups(contact_group_names, "contact")
-    return constructors.serve_json(serialize_group_list("contact_group_config", contact_groups))
+    return serve_json(serialize_group_list("contact_group_config", contact_groups))
 
 
 @Endpoint(
@@ -92,13 +116,15 @@ def bulk_create(params):
     ".../collection",
     method="get",
     response_schema=response_schemas.LinkedValueDomainObjectCollection,
+    permissions_required=PERMISSIONS,
 )
 def list_group(params):
     """Show all contact groups"""
+    user.need_permission("wato.users")
     collection = [
         {"id": k, "alias": v["alias"]} for k, v in load_contact_group_information().items()
     ]
-    return constructors.serve_json(
+    return serve_json(
         serialize_group_list("contact_group_config", collection),
     )
 
@@ -110,9 +136,11 @@ def list_group(params):
     response_schema=response_schemas.ContactGroup,
     etag="output",
     path_params=[NAME_FIELD],
+    permissions_required=PERMISSIONS,
 )
 def show(params):
     """Show a contact group"""
+    user.need_permission("wato.users")
     name = params["name"]
     group = fetch_group(name, "contact")
     return serve_group(group, serialize_group("contact_group_config"))
@@ -124,11 +152,17 @@ def show(params):
     method="delete",
     path_params=[NAME_FIELD],
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
 )
 def delete(params):
     """Delete a contact group"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.users")
     name = params["name"]
-    watolib.delete_group(name, "contact")
+    check_modify_group_permissions("contact")
+    with endpoint.do_not_track_permissions(), SuperUserContext():
+        # HACK: We need to supress this, due to lots of irrelevant dashboard permissions
+        watolib.delete_group(name, "contact")
     return Response(status=204)
 
 
@@ -138,9 +172,12 @@ def delete(params):
     method="post",
     request_schema=request_schemas.BulkDeleteContactGroup,
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
 )
 def bulk_delete(params):
     """Bulk delete contact groups"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.users")
     body = params["body"]
     entries = body["entries"]
     for group_name in entries:
@@ -150,8 +187,11 @@ def bulk_delete(params):
             status=400,
             message=f"contact group {group_name} was not found",
         )
-    for group_name in entries:
-        watolib.delete_group(group_name, "contact")
+    with endpoint.do_not_track_permissions(), SuperUserContext():
+        for group_name in entries:
+            # We need to supress this, because a lot of dashboard permissions are checked for
+            # various reasons.
+            watolib.delete_group(group_name, "contact")
     return Response(status=204)
 
 
@@ -163,9 +203,12 @@ def bulk_delete(params):
     response_schema=response_schemas.ContactGroup,
     etag="both",
     request_schema=request_schemas.UpdateGroup,
+    permissions_required=RW_PERMISSIONS,
 )
 def update(params):
     """Update a contact group"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.users")
     name = params["name"]
     group = fetch_group(name, "contact")
     constructors.require_etag(constructors.etag_of_dict(group))
@@ -180,6 +223,7 @@ def update(params):
     method="put",
     request_schema=request_schemas.BulkUpdateContactGroup,
     response_schema=response_schemas.DomainObjectCollection,
+    permissions_required=RW_PERMISSIONS,
 )
 def bulk_update(params):
     """Bulk update contact groups
@@ -188,9 +232,9 @@ def bulk_update(params):
     [Updating Values]("lost update problem"), which is normally prevented by the ETag locking
     mechanism. Use at your own risk.
     """
+    user.need_permission("wato.edit")
+    user.need_permission("wato.users")
     body = params["body"]
     entries = body["entries"]
     updated_contact_groups = update_groups("contact", entries)
-    return constructors.serve_json(
-        serialize_group_list("contact_group_config", updated_contact_groups)
-    )
+    return serve_json(serialize_group_list("contact_group_config", updated_contact_groups))

@@ -261,6 +261,7 @@ class DiscoveryResult:
     clustered_new: int = 0
     clustered_old: int = 0
     clustered_vanished: int = 0
+    clustered_ignored: int = 0
 
     # None  -> No error occured
     # ""    -> Not monitored (disabled host)
@@ -293,7 +294,6 @@ class SourceType(enum.Enum):
 
 class HostKey(NamedTuple):
     hostname: HostName
-    ipaddress: Optional[HostAddress]
     source_type: SourceType
 
 
@@ -351,3 +351,5 @@ class HostLabelValueDict(TypedDict):
 
 
 DiscoveredHostLabelsDict = Dict[str, HostLabelValueDict]
+
+HTTPMethod = Literal["get", "put", "post", "delete"]

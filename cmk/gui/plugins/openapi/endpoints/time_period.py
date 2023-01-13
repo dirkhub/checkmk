@@ -14,7 +14,6 @@ You can find an introduction to time periods in the
 
 import datetime as dt
 import http.client
-import json
 from typing import Any, Dict, List, Tuple, Union
 
 from marshmallow.utils import from_iso_time
@@ -22,15 +21,17 @@ from marshmallow.utils import from_iso_time
 import cmk.utils.defines as defines
 from cmk.utils.type_defs import TimeperiodSpec
 
+from cmk.gui.globals import user
 from cmk.gui.http import Response
 from cmk.gui.plugins.openapi.restful_objects import (
     constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
 from cmk.gui.plugins.openapi.restful_objects.parameters import NAME_FIELD
-from cmk.gui.plugins.openapi.utils import ProblemException
+from cmk.gui.plugins.openapi.utils import ProblemException, serve_json
 from cmk.gui.watolib.timeperiods import (
     load_timeperiod,
     load_timeperiods,
@@ -40,6 +41,15 @@ from cmk.gui.watolib.timeperiods import (
 
 TIME_RANGE = Tuple[str, str]
 
+PERMISSIONS = permissions.Perm("wato.timeperiods")
+
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        PERMISSIONS,
+    ]
+)
+
 
 @Endpoint(
     constructors.collection_href("time_period"),
@@ -48,9 +58,12 @@ TIME_RANGE = Tuple[str, str]
     etag="output",
     request_schema=request_schemas.InputTimePeriod,
     response_schema=response_schemas.DomainObject,
+    permissions_required=RW_PERMISSIONS,
 )
 def create_timeperiod(params):
     """Create a time period"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.timeperiods")
     body = params["body"]
     name = body["name"]
     exceptions = _format_exceptions(body.get("exceptions", []))
@@ -70,10 +83,12 @@ def create_timeperiod(params):
     additional_status_codes=[405],
     request_schema=request_schemas.UpdateTimePeriod,
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
 )
 def update_timeperiod(params):
     """Update a time period"""
-
+    user.need_permission("wato.edit")
+    user.need_permission("wato.timeperiods")
     body = params["body"]
     name = params["name"]
     if name == "24X7":
@@ -107,9 +122,12 @@ def update_timeperiod(params):
     path_params=[NAME_FIELD],
     etag="input",
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
 )
 def delete(params):
     """Delete a time period"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.timeperiods")
     name = params["name"]
     time_periods = load_timeperiods()
     if name not in time_periods:
@@ -125,9 +143,11 @@ def delete(params):
     method="get",
     path_params=[NAME_FIELD],
     response_schema=response_schemas.ConcreteTimePeriod,
+    permissions_required=PERMISSIONS,
 )
 def show_time_period(params):
     """Show a time period"""
+    user.need_permission("wato.timeperiods")
     name = params["name"]
     time_periods = load_timeperiods()
     if name not in time_periods:
@@ -141,9 +161,11 @@ def show_time_period(params):
     ".../collection",
     method="get",
     response_schema=response_schemas.DomainObjectCollection,
+    permissions_required=PERMISSIONS,
 )
 def list_time_periods(params):
     """Show all time periods"""
+    user.need_permission("wato.timeperiods")
     time_periods = []
     for time_period_id, time_period_details in load_timeperiods().items():
         alias = time_period_details["alias"]
@@ -162,13 +184,11 @@ def list_time_periods(params):
         "value": time_periods,
         "links": [constructors.link_rel("self", constructors.collection_href("time_period"))],
     }
-    return constructors.serve_json(time_period_collection)
+    return serve_json(time_period_collection)
 
 
 def _serve_time_period(time_period):
-    response = Response()
-    response.set_data(json.dumps(time_period))
-    response.set_content_type("application/json")
+    response = serve_json(time_period)
     response.headers.add("ETag", constructors.etag_of_dict(time_period).to_header())
     return response
 

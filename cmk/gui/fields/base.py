@@ -76,7 +76,16 @@ class BaseSchema(Schema):
 
 
 class FieldWrapper:
-    def __init__(self, field: fields.Field):
+    """Wrapper for marshmallow fields.
+
+    We need this because marshmallow automatically registers fields as attributes on schemas to its
+    `declared_fields` dictionary and removes it from the class's __dict__.
+
+    This is not what we want in some cases. Therefore, we wrap the fields to make sure they are not
+    registered as attributes.
+    """
+
+    def __init__(self, field: fields.Field) -> None:
         self.field = field
 
 
@@ -104,7 +113,10 @@ class ValueTypedDictSchema(BaseSchema):
     def _serialize_field(self, data, field: fields.Field):
         result = {}
         for key, value in data.items():
-            field._validate(value)
+            try:
+                field._validate(value)
+            except ValidationError as exc:
+                raise ValidationError({key: exc.messages}) from exc
             try:
                 result[key] = field.serialize(obj=data, attr=key)
             except ValueError as exc:
@@ -114,7 +126,10 @@ class ValueTypedDictSchema(BaseSchema):
     def _deserialize_field(self, data, field: fields.Field):
         result = {}
         for key, value in data.items():
-            field._validate(value)
+            try:
+                field._validate(value)
+            except ValidationError as exc:
+                raise ValidationError({key: exc.messages}) from exc
             result[key] = field.deserialize(value=value, data=data, attr=key)
         return result
 
@@ -481,7 +496,7 @@ Keys 'optional1', 'required1' occur more than once.
         errors: typing.Union[str, typing.List, typing.Dict],
     ) -> None:
         if isinstance(errors, dict):
-            error_store.errors.update(errors)
+            error_store.store_error(errors)
         elif isinstance(errors, list):
             error_store.errors.setdefault("_schema", []).extend(errors)
         elif isinstance(errors, str):

@@ -29,7 +29,7 @@ from .agent_based_api.v1 import (
     State,
 )
 from .agent_based_api.v1.type_defs import CheckResult, DiscoveryResult, StringTable
-from .utils.timesync import tolerance_check
+from .utils.timesync import store_sync_time, tolerance_check
 
 
 class Peer(NamedTuple):
@@ -192,6 +192,7 @@ def check_ntp_summary(
     params: Mapping[str, Any],
     section: Section,
 ) -> CheckResult:
+    value_store = get_value_store()
     # We only are interested in our system peer or pulse per second source (pps)
     peer = section.get(None)
     if peer is None:
@@ -200,11 +201,13 @@ def check_ntp_summary(
                 state=State.OK, summary=f"Found {len(section)} peers, but none is suitable"
             )
         yield from tolerance_check(
-            set_sync_time=None,
+            sync_time=None,
             levels_upper=params.get("alert_delay"),
             notice_only=False,
-            now=time.time(),
-            value_store=get_value_store(),
+            value_store=value_store,
+            metric_name=None,
+            label="Time since last sync",
+            value_store_key="time_server",
         )
         return
 
@@ -215,13 +218,7 @@ def check_ntp_summary(
         }
 
     yield from check_ntp(peer.name, params, section)
-    yield from tolerance_check(
-        set_sync_time=time.time(),
-        levels_upper=params.get("alert_delay"),
-        notice_only=True,
-        now=time.time(),
-        value_store=get_value_store(),
-    )
+    store_sync_time(value_store, time.time(), value_store_key="time_server")
     yield Result(state=State.OK, notice=f"Synchronized on {peer.name}")
 
 

@@ -7,6 +7,8 @@ use super::{cli, constants, types};
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use log::debug;
+#[cfg(windows)]
+use log::info;
 #[cfg(unix)]
 use nix::unistd;
 use std::env;
@@ -51,15 +53,10 @@ pub struct PathResolver {
 #[cfg(unix)]
 impl PathResolver {
     pub fn new(home_dir: &Path) -> PathResolver {
-        let etc_dir = PathBuf::from(constants::ETC_DIR);
         PathResolver {
             home_dir: PathBuf::from(home_dir),
-            config_path: home_dir
-                .join(constants::CONFIG_FILE)
-                .exists_or(etc_dir.join(constants::CONFIG_FILE)),
-            registration_preset_path: home_dir
-                .join(constants::REGISTRATION_PRESET_FILE)
-                .exists_or(etc_dir.join(constants::REGISTRATION_PRESET_FILE)),
+            config_path: home_dir.join(constants::CONFIG_FILE),
+            registration_preset_path: home_dir.join(constants::REGISTRATION_PRESET_FILE),
             registry_path: home_dir.join(Path::new(constants::REGISTRY_FILE)),
             legacy_pull_path: home_dir.join(Path::new(constants::LEGACY_PULL_FILE)),
         }
@@ -176,20 +173,31 @@ fn init_logging(
 
 #[cfg(unix)]
 fn become_user(username: &str) -> AnyhowResult<unistd::User> {
-    let user = unistd::User::from_name(username)?.context(format!(
+    let target_user = unistd::User::from_name(username)?.context(format!(
         "Could not find dedicated Checkmk agent user {}",
         username
     ))?;
 
-    unistd::setgid(user.gid).context(format!(
+    // If we already are the right user, return early. Otherwise, eg. setting the supplementary
+    // group ids will fail due to insufficient permissions.
+    if target_user.uid == unistd::getuid() {
+        return Ok(target_user);
+    }
+
+    unistd::setgroups(&[target_user.gid]).context(format!(
+        "Failed to set supplementary group id {} corresponding to user {}",
+        target_user.gid, target_user.name,
+    ))?;
+    unistd::setgid(target_user.gid).context(format!(
         "Failed to set group id {} corresponding to user {}",
-        user.gid, user.name,
+        target_user.gid, target_user.name,
     ))?;
-    unistd::setuid(user.uid).context(format!(
+    unistd::setuid(target_user.uid).context(format!(
         "Failed to set user id {} corresponding to user {}",
-        user.uid, user.name,
+        target_user.uid, target_user.name,
     ))?;
-    Ok(user)
+
+    Ok(target_user)
 }
 
 #[cfg(unix)]
@@ -201,7 +209,7 @@ fn determine_paths(user: unistd::User) -> AnyhowResult<PathResolver> {
 fn determine_paths() -> AnyhowResult<PathResolver> {
     // Alternative home dir can be passed for testing/debug reasons
     if let Ok(debug_home_dir) = std::env::var(constants::ENV_HOME_DIR) {
-        debug!("Using debug HOME_DIR: {}", debug_home_dir);
+        info!("Using debug HOME_DIR: {}", debug_home_dir);
         return Ok(PathResolver::new(&PathBuf::from(debug_home_dir)));
     }
 

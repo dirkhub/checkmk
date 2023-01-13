@@ -50,12 +50,82 @@ else
     exec </dev/null 2>/dev/null
 fi
 
+_free_mem_index_vmstat() {
+    # The number of output columns in the vmstat command changed in newer versions. We want the
+    # entry under 'fre' (not a typo).
+    # https://man.openbsd.org/OpenBSD-6.0/vmstat.8
+    # https://man.openbsd.org/vmstat.8
+    idx=1
+    for col in "$@"; do
+        if [ "$col" = "fre" ]; then
+            printf "%s" "$idx"
+            return 0
+        fi
+        idx=$((idx + 1))
+    done
+    return 1
+}
+
+_free_mem_with_unit_vmstat() {
+    # Newer vmstat versions print "1M" instead of "1024" as free memory
+    # SUP-11138
+    # https://github.com/openbsd/src/blob/1c702c4a4395025332d4340f326500c590811dc8/usr.bin/vmstat/vmstat.c#L368
+    case "${1}" in
+        *M)
+            mem_free_mb_with_unit="${1}"
+            printf "%s" "${mem_free_mb_with_unit%?} MB"
+            ;;
+        *)
+            printf "%s" "${1} kB"
+            ;;
+    esac
+}
+
+_free_mem_with_unit() {
+    vmstat_output=$(vmstat)
+
+    # shellcheck disable=SC2046  # we want word splitting here
+    if ! mem_free_idx="$(_free_mem_index_vmstat $(echo "$vmstat_output" | tail -n2 | head -1))"; then
+        return 1
+    fi
+
+    _free_mem_with_unit_vmstat "$(echo "$vmstat_output" | tail -n1 | awk -v idx="$mem_free_idx" '{ print $idx }')"
+
+    return 0
+}
+
+section_openbsd_mem() {
+    if ! mem_free_with_unit=$(_free_mem_with_unit); then
+        return 1
+    fi
+    mem_total=$(sysctl hw.usermem | cut -d= -f2)
+    mem_total=$(echo "$mem_total/1024" | bc)
+
+    swapctl_output=$(swapctl -k -s)
+    swap_free=$(echo "$swapctl_output" | awk '{ print $7 }')
+    swap_total=$(echo "$swapctl_output" | awk '{ print $2 }')
+
+    # if there is no swap space swap values are 0
+    if [ -z "$swapctl_output" ]; then
+        swap_free=0
+        swap_total=0
+    fi
+
+    printf "<<<openbsd_mem>>>\n"
+    printf "MemTotal:\t %s kB\n" "$mem_total"
+    printf "MemFree:\t %s\n" "$mem_free_with_unit"
+    printf "SwapTotal:\t %s kB\n" "$swap_total"
+    printf "SwapFree:\t %s kB\n" "$swap_free"
+
+    return 0
+}
+
 # We're suppressing this, so we can enable the shellchecker.
 # TODO: Find out if this is working, and why. Are we implicitily assuming a specific shell?
 # shellcheck disable=SC2039 # In POSIX sh, set flag -A is undefined.
 section_misc_sections() {
     echo "<<<check_mk>>>"
-    echo "Version: 2.1.0b9"
+    echo "Version: 2.1.0p20"
     echo "AgentOS: openbsd"
     echo "Hostname: $(hostname)"
     echo "AgentDirectory: $MK_CONFDIR"
@@ -78,25 +148,7 @@ section_misc_sections() {
     echo '<<<uptime>>>'
     echo "$(get_epoch) - $(sysctl -n kern.boottime | cut -d' ' -f 4,7 | tr ',' '.' | tr -d ' ')" | bc
 
-    echo "<<<openbsd_mem>>>"
-    MEM_FREE=$(vmstat | tail -n1 | awk '{ print $5 }')
-    MEM_TOTAL=$(sysctl hw.usermem | cut -d= -f2)
-    MEM_TOTAL=$(echo "$MEM_TOTAL/1024" | bc)
-
-    SWAPCTL_OUTPUT=$(swapctl -k -s)
-    SWAP_FREE=$(echo "$SWAPCTL_OUTPUT" | awk '{ print $7 }')
-    SWAP_TOTAL=$(echo "$SWAPCTL_OUTPUT" | awk '{ print $2 }')
-
-    # if there is no swap space swap values are 0
-    if [ -z "$SWAPCTL_OUTPUT" ]; then
-        SWAP_FREE=0
-        SWAP_TOTAL=0
-    fi
-
-    printf "MemTotal:\t %s kB\n" "$MEM_TOTAL"
-    printf "MemFree:\t %s kB\n" "$MEM_FREE"
-    printf "SwapTotal:\t %s kB\n" "$SWAP_TOTAL"
-    printf "SwapFree:\t %s kB\n" "$SWAP_FREE"
+    section_openbsd_mem
 
     echo '<<<lnx_if:sep(58)>>>'
     # MC= MAC address
@@ -128,7 +180,7 @@ section_misc_sections() {
     # adjust internal field separator to get lines from netstat and backup it before
     OFS=$IFS
     IFS='
-    '
+'
     # collect netstat values and interface number
     for NS in $NETSTAT_OUTPUT; do
         NI=$((NI + 1))
@@ -237,9 +289,10 @@ run_mrpe_plugins() {
         # We suppress it here for compatibility (curretly backslashes e.g. before spaces are dropped).
         # Since escaping of field seperators is not relevant when reading into one variable, we probably
         # would have wanted "read -r".
-        # shellcheck disable=SC2162
+        # shellcheck disable=SC2162,SC2001
         grep -Ev '^[[:space:]]*($|#)' "$MK_CONFDIR/mrpe.cfg" |
-            while read descr cmdline; do
+            while read descr rest; do
+                cmdline=$(echo "$rest" | sed -e 's/^([a-zA-Z:=[0-9]*]*) //g')
                 PLUGIN=${cmdline%% *}
                 OUTPUT=$(eval "$cmdline")
                 printf "(%s) %s %s %s" "${PLUGIN##*/}" "$descr" "$?" "$OUTPUT" | tr \\n \\1

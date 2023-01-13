@@ -10,6 +10,7 @@ from typing import Any, Dict
 
 from cmk.utils import store
 from cmk.utils.encryption import raw_certificates_from_file
+from cmk.utils.log import VERBOSE
 from cmk.utils.paths import site_cert_file
 from cmk.utils.tags import sample_tag_config, TagConfig
 
@@ -34,6 +35,7 @@ def init_wato_datastructures(with_wato_lock: bool = False) -> None:
         os.path.exists(ConfigDomainCACertificates.trusted_cas_file)
         and not _need_to_create_sample_config()
     ):
+        logger.log(VERBOSE, "No need to create the sample config")
         return
 
     def init():
@@ -79,7 +81,7 @@ def _create_sample_config() -> None:
         except Exception:
             logger.exception("Exception in sample config generator [%s]", generator.ident())
 
-    logger.debug("Finished creating the sample config")
+    logger.log(VERBOSE, "Finished creating the sample config")
 
 
 @sample_config_generator_registry.register
@@ -156,9 +158,7 @@ class ConfigGeneratorBasicWATOConfig(SampleConfigGenerator):
                     "id": "59d84cde-ee3a-4f8d-8bec-fce35a2b0d15",
                     "condition": {},
                     "value": True,
-                    "options": {
-                        "description": "All management boards use SNMP v2 (incl. bulk walks) by default"
-                    },
+                    "options": {"description": "All management boards use SNMPv2 and bulk walk"},
                 },
             ],
             # Put all hosts and the contact group 'all'
@@ -246,6 +246,7 @@ class ConfigGeneratorBasicWATOConfig(SampleConfigGenerator):
                     "value": {
                         "severity_unmonitored": 1,
                         "severity_vanished": 0,
+                        "severity_new_host_label": 1,
                         "check_interval": 120.0,
                     },
                     "options": {"description": "Perform every two hours a service discovery"},

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from cmk.utils.exceptions import MKGeneralException
 from cmk.utils.i18n import _
@@ -55,8 +55,7 @@ class AuxTag:
         self.title = title
         self.topic = topic
 
-    # TODO: Rename to "to_config"
-    def get_dict_format(self) -> AuxTagSpec:
+    def to_config(self) -> AuxTagSpec:
         response = AuxTagSpec({"id": self.id, "title": self.title})
         if self.topic:
             response["topic"] = self.topic
@@ -89,6 +88,10 @@ class AuxTagList:
                 self.append(aux_tag)
         return self
 
+    def __iter__(self) -> Iterator:
+        for tag in self._tags:
+            yield tag
+
     def get_tags(self) -> Sequence[AuxTag]:
         return self._tags
 
@@ -119,19 +122,14 @@ class AuxTagList:
         for aux_tag in self._tags:
             aux_tag.validate()
 
-            # Tag groups were made builtin with ~1.4. Previously users could modify
-            # these groups.  These users now have the modified tag groups in their
-            # user configuration and should be able to cleanup this using the GUI
-            # for the moment.
-            # With 1.7 we use cmk-update-config to enforce the user to cleanup this.
-            # Then we can re-enable this consistency check.
-            # builtin_config = BuiltinTagConfig()
-            # if builtin_config.aux_tag_list.exists(aux_tag.id):
-            #    raise MKGeneralException(
-            #        _("You can not override the builtin auxiliary tag \"%s\".") % aux_tag.id)
+            builtin_config = BuiltinTagConfig()
+            if builtin_config.aux_tag_list.exists(aux_tag.id):
+                raise MKGeneralException(
+                    _('You can not override the builtin auxiliary tag "%s".') % aux_tag.id
+                )
 
             if aux_tag.id in seen:
-                raise MKGeneralException(_('Duplicate tag ID "%s" in auxilary tags') % aux_tag.id)
+                raise MKGeneralException(_('Duplicate tag ID "%s" in auxiliary tags') % aux_tag.id)
 
             seen.add(aux_tag.id)
 
@@ -154,7 +152,7 @@ class AuxTagList:
     def get_dict_format(self) -> List[AuxTagSpec]:
         response = []
         for tag in self._tags:
-            response.append(tag.get_dict_format())
+            response.append(tag.to_config())
         return response
 
     def get_choices(self) -> Sequence[Tuple[str, str]]:
@@ -355,8 +353,21 @@ class TagConfig:
                 aux_tag_map[grouped_tag.id] = grouped_tag.aux_tag_ids
         return aux_tag_map
 
-    def get_aux_tags_by_topic(self) -> Sequence[Tuple[str, Sequence[AuxTag]]]:
-        by_topic: Dict[str, List[AuxTag]] = {}
+    def get_aux_tag_by_id(self, tag_group_id: TagID) -> AuxTag:
+        return self.aux_tag_list.get_aux_tag(tag_group_id)
+
+    def insert_aux_tag(self, aux_tag: AuxTag) -> None:
+        self.aux_tag_list.append(aux_tag)
+        self.aux_tag_list.validate()
+
+    def update_aux_tag(self, aux_tag_id: TagID, aux_tag: AuxTag) -> None:
+        self.aux_tag_list.update(aux_tag_id, aux_tag)
+
+    def remove_aux_tag(self, tag_id: TagID) -> None:
+        self.aux_tag_list.remove(tag_id)
+
+    def get_aux_tags_by_topic(self) -> Sequence[tuple[str, Sequence[AuxTag]]]:
+        by_topic: dict[str, list[AuxTag]] = {}
         for aux_tag in self.aux_tag_list.get_tags():
             topic = aux_tag.topic or _("Tags")
             by_topic.setdefault(topic, []).append(aux_tag)
@@ -457,16 +468,11 @@ class TagConfig:
                 _('The tag group "%s" is reserved for internal use.') % tag_group.id
             )
 
-        # Tag groups were made builtin with ~1.4. Previously users could modify
-        # these groups.  These users now have the modified tag groups in their
-        # user configuration and should be able to cleanup this using the GUI
-        # for the moment.
-        # With 1.7 we use cmk-update-config to enforce the user to cleanup this.
-        # Then we can re-enable this consistency check.
-        # builtin_config = BuiltinTagConfig()
-        # if builtin_config.tag_group_exists(tag_group.id):
-        #    raise MKGeneralException(
-        #        _("You can not override the builtin tag group \"%s\".") % tag_group.id)
+        builtin_config = BuiltinTagConfig()
+        if builtin_config.tag_group_exists(tag_group.id):
+            raise MKGeneralException(
+                _('You can not override the builtin tag group "%s".') % tag_group.id
+            )
 
         if not tag_group.title:
             raise MKGeneralException(

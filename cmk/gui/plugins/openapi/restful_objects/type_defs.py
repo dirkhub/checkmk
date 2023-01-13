@@ -20,6 +20,8 @@ from typing import (
 
 from marshmallow import fields, Schema
 
+from cmk.utils.type_defs import HTTPMethod
+
 URL = str
 
 DomainType = Literal[
@@ -27,12 +29,15 @@ DomainType = Literal[
     "activation_run",
     "agent",
     "agent_binary",
+    "aux_tag",
     "bi_aggregation",
     "bi_pack",
     "bi_rule",
     "contact_group_config",
+    "dcd",
     "discovery_run",
     "downtime",
+    "event_console",
     "folder_config",
     "host",
     "host_config",
@@ -45,6 +50,7 @@ DomainType = Literal[
     "ruleset",
     "service",
     "service_discovery",
+    "service_discovery_run",
     "servicegroup",
     "service_group_config",
     "sign_key",
@@ -65,12 +71,14 @@ CmkEndpointName = Literal[
     "cmk/bulk_discovery",
     "cmk/bulk_update",
     "cmk/create",
+    "cmk/create_aux_tag",
     "cmk/create_host",
     "cmk/create_service",
     "cmk/create_cluster",
     "cmk/download",
     "cmk/download_by_hash",
     "cmk/download_by_host",
+    "cmk/fetch_phase_one",
     "cmk/list",
     "cmk/move",
     "cmk/permalink",
@@ -91,6 +99,7 @@ CmkEndpointName = Literal[
     "cmk/put_bi_packs",
     "cmk/get_bi_rule",
     "cmk/get_bi_aggregation",
+    "cmk/get_bi_aggregation_state",
     "cmk/get_bi_pack",
     "cmk/get_bi_packs",
     "cmk/put_bi_pack",
@@ -103,6 +112,9 @@ CmkEndpointName = Literal[
     "cmk/service.move-ignored",
     "cmk/service.bulk-acknowledge",
     "cmk/link_uuid",
+    "cmk/update_and_acknowledge",
+    "cmk/change_state",
+    "cmk/update",
 ]
 
 RestfulEndpointName = Literal[
@@ -120,6 +132,8 @@ RestfulEndpointName = Literal[
     ".../choice",  # takes params
     ".../clear",
     ".../collection",
+    ".../collection_update_and_acknowledge",
+    ".../collection_change_state",
     ".../default",
     ".../delete",
     ".../details",  # takes params
@@ -142,8 +156,6 @@ RestfulEndpointName = Literal[
 ]  # yapf: disable
 
 LinkRelation = Union[CmkEndpointName, RestfulEndpointName]
-
-HTTPMethod = Literal["get", "put", "post", "delete"]
 
 PropertyFormat = Literal[
     # String values
@@ -361,6 +373,7 @@ OperationSpecType = TypedDict(
         "parameters": Sequence[SchemaParameter],
         "requestBody": Dict[str, Any],
         "summary": str,
+        "deprecated": bool,
     },
     total=False,
 )

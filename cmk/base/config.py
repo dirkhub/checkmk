@@ -74,7 +74,6 @@ from cmk.utils.type_defs import RulesetName  # alias for str
 from cmk.utils.type_defs import (
     ActiveCheckPluginName,
     AgentTargetVersion,
-    BuiltinBakeryHostName,
     CheckPluginName,
     CheckPluginNameStr,
     CheckVariables,
@@ -895,7 +894,7 @@ def strip_tags(tagged_hostlist: List[str]) -> List[HostName]:
         return cache.setdefault(cache_id, [HostName(h.split("|", 1)[0]) for h in tagged_hostlist])
 
 
-def _get_shadow_hosts() -> ShadowHosts:
+def get_shadow_hosts() -> ShadowHosts:
     try:
         # Only available with CEE
         return shadow_hosts  # type: ignore[name-defined] # pylint: disable=undefined-variable
@@ -950,7 +949,7 @@ def duplicate_hosts() -> List[str]:
             # all_active_hosts() but with the difference that duplicates are not removed.
             _filter_active_hosts(
                 get_config_cache(),
-                strip_tags(list(all_hosts) + list(clusters) + list(_get_shadow_hosts())),
+                strip_tags(list(all_hosts) + list(clusters) + list(get_shadow_hosts())),
             )
         ).items()  #
         if count > 1
@@ -3190,11 +3189,11 @@ class HostConfig:
 
     @property
     def host_key(self) -> HostKey:
-        return HostKey(self.hostname, lookup_ip_address(self), SourceType.HOST)
+        return HostKey(self.hostname, SourceType.HOST)
 
     @property
     def host_key_mgmt(self) -> HostKey:
-        return HostKey(self.hostname, self.management_address, SourceType.MANAGEMENT)
+        return HostKey(self.hostname, SourceType.MANAGEMENT)
 
     @property
     def additional_ipaddresses(self) -> Tuple[List[HostAddress], List[HostAddress]]:
@@ -3545,7 +3544,7 @@ class ConfigCache:
                     tag_to_group_map, self._hosttags[hostname]
                 )
 
-        for shadow_host_name, shadow_host_spec in list(_get_shadow_hosts().items()):
+        for shadow_host_name, shadow_host_spec in list(get_shadow_hosts().items()):
             self._hosttags[shadow_host_name] = set(
                 shadow_host_spec.get("custom_variables", {}).get("TAGS", "").split()
             )
@@ -3774,7 +3773,7 @@ class ConfigCache:
             return {}
 
     def ruleset_match_object_of_service(
-        self, hostname: HostName, svc_desc: ServiceName
+        self, hostname: HostName, svc_desc: ServiceName, svc_labels: Optional[Labels] = None
     ) -> RulesetMatchObject:
         """Construct the object that is needed to match this service to rulesets
 
@@ -3791,17 +3790,20 @@ class ConfigCache:
         cache_id = (hostname, svc_desc)
         if cache_id in self._cache_match_object_service:
             return self._cache_match_object_service[cache_id]
-
+        if svc_labels is None:
+            svc_labels = self.labels.labels_of_service(self.ruleset_matcher, hostname, svc_desc)
         result = RulesetMatchObject(
-            host_name=hostname,
-            service_description=svc_desc,
-            service_labels=self.labels.labels_of_service(self.ruleset_matcher, hostname, svc_desc),
+            host_name=hostname, service_description=svc_desc, service_labels=svc_labels
         )
         self._cache_match_object_service[cache_id] = result
         return result
 
     def ruleset_match_object_for_checkgroup_parameters(
-        self, hostname: HostName, item: Item, svc_desc: ServiceName
+        self,
+        hostname: HostName,
+        item: Item,
+        svc_desc: ServiceName,
+        svc_labels: Optional[Labels] = None,
     ) -> RulesetMatchObject:
         """Construct the object that is needed to match checkgroup parameters rulesets
 
@@ -3818,7 +3820,9 @@ class ConfigCache:
         result = RulesetMatchObject(
             host_name=hostname,
             service_description=item,
-            service_labels=self.labels.labels_of_service(self.ruleset_matcher, hostname, svc_desc),
+            service_labels=svc_labels
+            if svc_labels is not None
+            else self.labels.labels_of_service(self.ruleset_matcher, hostname, svc_desc),
         )
         self._cache_match_object_service_checkgroup[cache_id] = result
         return result
@@ -3945,7 +3949,7 @@ class ConfigCache:
     def _get_all_configured_shadow_hosts(self) -> Set[HostName]:
         """Returns a set of all shadow host names, regardless if currently disabled or
         monitored on a remote site"""
-        return set(_get_shadow_hosts())
+        return set(get_shadow_hosts())
 
     def all_configured_hosts(self) -> Set[HostName]:
         return self._all_configured_hosts
@@ -4080,21 +4084,23 @@ class ConfigCache:
         service_descr: ServiceName,
     ) -> Sequence[HostKey]:
         """Returns the node keys if a service is clustered, otherwise an empty sequence"""
-        node_configs = [
-            self.get_host_config(nodename)
-            for nodename in (host_config.nodes or ())
-            if host_config.hostname == self.host_of_clustered_service(nodename, service_descr)
-        ]
+        used_nodes = (
+            [
+                nn
+                for nn in (host_config.nodes or ())
+                if host_config.hostname == self.host_of_clustered_service(nn, service_descr)
+            ]
+            or host_config.nodes
+            or ()
+        )
+
         return [
             HostKey(
                 nc.hostname,
-                # I am not sure about management interfaces on clusters, but let's be consistent.
-                nc.management_address
-                if source_type is SourceType.MANAGEMENT
-                else lookup_ip_address(nc),
                 source_type,
             )
-            for nc in node_configs
+            for nodename in used_nodes
+            if (nc := self.get_host_config(nodename))
         ]
 
     def get_piggybacked_hosts_time_settings(
@@ -4231,22 +4237,31 @@ class CEEConfigCache(ConfigCache):
             return default
         return value
 
-    def matched_agent_config_entries(
-        self, hostname: Union[HostName, Literal[BuiltinBakeryHostName.GENERIC]]
-    ) -> Dict[str, Any]:
-        matched = {}
-        for varname, ruleset in list(agent_config.items()) + [
+    def matched_agent_config_entries(self, hostname: HostName) -> Dict[str, Any]:
+        return {
+            varname: self.host_extra_conf(hostname, ruleset)
+            for varname, ruleset in self._agent_config_rulesets()
+        }
+
+    def generic_agent_config_entries(self) -> Iterable[tuple[str, Mapping[str, Any]]]:
+        yield from (
+            (
+                match_path,
+                {
+                    varname: self.ruleset_matcher.get_values_for_generic_agent(ruleset, match_path)
+                    for varname, ruleset in self._agent_config_rulesets()
+                },
+            )
+            for match_path, attributes in folder_attributes.items()
+            if attributes.get("bake_agent_package", False)
+        )
+
+    def _agent_config_rulesets(self) -> Iterable[tuple[str, Any]]:
+        return list(agent_config.items()) + [
             ("agent_port", agent_ports),
             ("agent_encryption", agent_encryption),
             ("agent_exclude_sections", agent_exclude_sections),
-        ]:
-
-            if hostname is BuiltinBakeryHostName.GENERIC:
-                matched[varname] = self.ruleset_matcher.get_values_for_generic_agent_host(ruleset)
-            else:
-                matched[varname] = self.host_extra_conf(hostname, ruleset)
-
-        return matched
+        ]
 
 
 # TODO: Find a clean way to move this to cmk.base.cee. This will be possible once the

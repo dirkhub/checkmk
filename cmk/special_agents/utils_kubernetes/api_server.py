@@ -4,23 +4,13 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-import ast
 import itertools
+import json
+import logging
+import re
+import types
 from dataclasses import dataclass
-from typing import (
-    Dict,
-    Generic,
-    Iterable,
-    List,
-    Literal,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
-    TypeVar,
-    Union,
-)
+from typing import Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 from kubernetes import client  # type: ignore[import]
 
@@ -35,6 +25,12 @@ from cmk.special_agents.utils_kubernetes.transform import (
     resource_quota_from_client,
     statefulset_from_client,
 )
+
+LOGGER = logging.getLogger()
+VERSION_MATCH_RE = re.compile(r"\s*v?([0-9]+(?:\.[0-9]+)*).*")
+SUPPORTED_VERSIONS = [(1, 21), (1, 22), (1, 23)]
+LOWEST_FUNCTIONING_VERSION = min(SUPPORTED_VERSIONS)
+SUPPORTED_VERSIONS_DISPLAY = ", ".join(f"v{major}.{minor}" for major, minor in SUPPORTED_VERSIONS)
 
 
 class BatchAPI:
@@ -60,18 +56,16 @@ class CoreAPI:
         self.connection = client.CoreV1Api(api_client)
         self.timeout = timeout
         self.raw_pods = self._query_raw_pods()
-        self.raw_nodes = self._query_raw_nodes()
         self.raw_namespaces = self._query_raw_namespaces()
         self.raw_resource_quotas = self._query_raw_resource_quotas()
-
-    def _query_raw_nodes(self) -> Sequence[client.V1Node]:
-        return self.connection.list_node(_request_timeout=self.timeout).items
 
     def _query_raw_pods(self) -> Sequence[client.V1Pod]:
         return self.connection.list_pod_for_all_namespaces(_request_timeout=self.timeout).items
 
     def _query_raw_resource_quotas(self) -> Sequence[client.V1ResourceQuota]:
-        return self.connection.list_resource_quota_for_all_namespaces().items
+        return self.connection.list_resource_quota_for_all_namespaces(
+            _request_timeout=self.timeout
+        ).items
 
     def _query_raw_namespaces(self):
         return self.connection.list_namespace(_request_timeout=self.timeout).items
@@ -111,12 +105,9 @@ class AppsAPI:
         ).items
 
 
-T = TypeVar("T")
-
-
 @dataclass
-class RawAPIResponse(Generic[T]):
-    response: T
+class RawAPIResponse:
+    response: str
     status_code: int
     headers: Dict[str, str]
 
@@ -134,27 +125,27 @@ class RawAPI:
         self,
         method: Literal["GET", "POST", "PUT", "OPTIONS", "DELETE"],
         resource_path: str,
-        *,
-        response_type: Type[T],
         query_params: Optional[Dict[str, str]] = None,
-    ) -> RawAPIResponse[T]:
+    ) -> RawAPIResponse:
         # Found the auth_settings here:
         # https://github.com/kubernetes-client/python/issues/528
         response, status_code, headers = self._api_client.call_api(
             resource_path,
             method,
-            response_type=str,
             query_params=query_params,
             auth_settings=["BearerToken"],
             _request_timeout=self.timeout,
+            _preload_content=False,
         )
-        return RawAPIResponse(response=response, status_code=status_code, headers=headers)
+        return RawAPIResponse(
+            response=response.data.decode("utf-8"), status_code=status_code, headers=headers
+        )
 
     def _get_healthz(self, url) -> api.HealthZ:
         def get_health(query_params=None) -> Tuple[int, str]:
             # https://kubernetes.io/docs/reference/using-api/health-checks/
             try:
-                response = self._request("GET", url, response_type=str, query_params=query_params)
+                response = self._request("GET", url, query_params=query_params)
             except client.rest.ApiException as e:
                 return e.status, e.body
             return response.status_code, response.response
@@ -172,19 +163,124 @@ class RawAPI:
             verbose_response=verbose_response,
         )
 
-    def query_version(self) -> api.GitVersion:
-        # We cannot use json instead of ast here, because the Kubernetes client converts the JSON
-        # to a string by replacing " by ' (hence it no longer is JSON). It may be possible to fix
-        # this by looking into the parameters for client.APIClient.call_api.
-        return ast.literal_eval(self._request("GET", "/version", response_type=str).response)[
-            "gitVersion"
-        ]
+    def query_raw_version(self) -> str:
+        return self._request("GET", "/version").response
 
     def query_api_health(self) -> api.APIHealth:
         return api.APIHealth(ready=self._get_healthz("/readyz"), live=self._get_healthz("/livez"))
 
     def query_kubelet_health(self, node_name) -> api.HealthZ:
         return self._get_healthz(f"/api/v1/nodes/{node_name}/proxy/healthz")
+
+    def query_raw_nodes(self) -> Sequence[client.V1Node]:
+        response_json = json.loads(self._request("GET", "/api/v1/nodes").response)
+        for node in response_json["items"]:
+            # The status.images field may contain data, which is rejected by the client (SUP-12139).
+            # We do not need the images of a node, so we simply remove them.
+            node["status"]["images"] = []
+        return self._api_client.deserialize(
+            types.SimpleNamespace(data=json.dumps(response_json)), "V1NodeList"
+        ).items
+
+
+def _extract_sequence_based_identifier(git_version: str) -> Optional[str]:
+    """
+
+    >>> _extract_sequence_based_identifier("v1.20.0")
+    '1.20.0'
+    >>> _extract_sequence_based_identifier("    v1.20.0")  # some white space is allowed
+    '1.20.0'
+    >>> _extract_sequence_based_identifier("v   1.20.0")  # but only in specific cases
+
+    >>> _extract_sequence_based_identifier("a1.20.0")  # v or whitespace are the only allowed letters at the start
+
+    >>> _extract_sequence_based_identifier("v1.21.9-eks-0d102a7")  # flavors are ok, but discarded
+    '1.21.9'
+    >>> _extract_sequence_based_identifier("v1")  # sequences without minor are allowed
+    '1'
+    >>> _extract_sequence_based_identifier("v1.")  # even with a dot
+    '1'
+    >>> _extract_sequence_based_identifier("10")  # the v is optional
+    '10'
+    >>> _extract_sequence_based_identifier("1.2.3.4")  # the whole sequence is extracted, even if incompatible with the Kubernetes versioning scheme
+    '1.2.3.4'
+    >>> _extract_sequence_based_identifier("v1.2v3.4")  # extraction always starts at beginning
+    '1.2'
+    >>> _extract_sequence_based_identifier("")  # empty strings are not allowed
+
+    >>> _extract_sequence_based_identifier("abc")  # nonesense is also not allowed
+
+    """
+    version_match = VERSION_MATCH_RE.fullmatch(git_version)
+    if version_match is None:
+        LOGGER.error(
+            msg=f"Could not parse version string '{git_version}', using regex from kubectl "
+            f"'{VERSION_MATCH_RE.pattern}'."
+        )
+        return None
+    return version_match.group(1)
+
+
+def decompose_git_version(
+    git_version: str,
+) -> Union[api.KubernetesVersion, api.UnknownKubernetesVersion]:
+    # One might think that version_json["major"] and version_json["minor"] would be more suitable
+    # than parsing major from GitVersion. Sadly, the minor version is not an integer, e.g. "21+".
+    # The approach taken here is based on the `kubectl version`.
+    # kubectl version uses `ParseSemantic` from
+    # https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/apimachinery/pkg/util/version/version.go
+    identifier = _extract_sequence_based_identifier(git_version)
+    if identifier is None:
+        return api.UnknownKubernetesVersion(git_version=git_version)
+    # Unlike kubectl, we do not explicitly handle cases where a component is non-numeric, since
+    # this is impossible based on the regex matching done by `_extract_sequence_based_identifier`
+    components = identifier.split(".")
+    if len(components) < 2:
+        LOGGER.error(
+            msg=f"Could not parse version string '{git_version}', version '{identifier}' has no "
+            "minor."
+        )
+        return api.UnknownKubernetesVersion(git_version=git_version)
+    for component in components:
+        if component.startswith("0") and component != "0":
+            LOGGER.error(
+                msg=f"Could not parse version string '{git_version}', a version component is "
+                "zero-prefixed."
+            )
+            return api.UnknownKubernetesVersion(git_version=git_version)
+
+    return api.KubernetesVersion(
+        git_version=git_version,
+        major=int(components[0]),
+        minor=int(components[1]),
+    )
+
+
+class UnsupportedEndpointData(Exception):
+    """Data retrieved from the endpoint cannot be parsed by Checkmk.
+
+    This exception indicates that the agent was able to receive data, but an issue occurred, which
+    makes it impossible to process the data.
+    """
+
+
+def version_from_json(
+    raw_version: str,
+) -> Union[api.UnknownKubernetesVersion, api.KubernetesVersion]:
+    try:
+        version_json = json.loads(raw_version)
+    except Exception as e:
+        raise UnsupportedEndpointData(
+            "Unknown endpoint information at endpoint /version, HTTP(S) response was "
+            f"'{raw_version}'."
+        ) from e
+    if "gitVersion" not in version_json:
+        raise UnsupportedEndpointData(
+            "Data from endpoint /version did not have mandatory field 'gitVersion', HTTP(S) "
+            f"response was '{raw_version}'."
+        )
+
+    return decompose_git_version(version_json["gitVersion"])
 
 
 WorkloadResource = Union[
@@ -223,6 +319,31 @@ def _match_controllers(
     return result
 
 
+def _verify_version_support(
+    version: Union[api.KubernetesVersion, api.UnknownKubernetesVersion]
+) -> None:
+    if (
+        isinstance(version, api.KubernetesVersion)
+        and (version.major, version.minor) in SUPPORTED_VERSIONS
+    ):
+        return
+    LOGGER.warning(
+        msg=f"Unsupported Kubernetes version '{version.git_version}'. "
+        f"Supported versions are {SUPPORTED_VERSIONS_DISPLAY}.",
+    )
+    if (
+        isinstance(version, api.KubernetesVersion)
+        and (version.major, version.minor) < LOWEST_FUNCTIONING_VERSION
+    ):
+        raise UnsupportedEndpointData(
+            f"Unsupported Kubernetes version '{version.git_version}'. API "
+            "Servers with version < v1.21 are known to return incompatible data. "
+            "Aborting processing API data. "
+            f"Supported versions are {SUPPORTED_VERSIONS_DISPLAY}.",
+        )
+    LOGGER.warning(msg="Processing data is done on a best effort basis.")
+
+
 class APIServer:
     """
     APIServer provides a stable interface that should not change between kubernetes versions
@@ -231,11 +352,17 @@ class APIServer:
 
     @classmethod
     def from_kubernetes(cls, api_client, timeout):
+        raw_api = RawAPI(api_client, timeout)
+
+        raw_version = raw_api.query_raw_version()
+        version = version_from_json(raw_version)
+        _verify_version_support(version)
         return cls(
             BatchAPI(api_client, timeout),
             CoreAPI(api_client, timeout),
-            RawAPI(api_client, timeout),
+            raw_api,
             AppsAPI(api_client, timeout),
+            version.git_version,
         )
 
     def __init__(
@@ -244,20 +371,22 @@ class APIServer:
         core_api: CoreAPI,
         raw_api: RawAPI,
         external_api: AppsAPI,
+        version: api.GitVersion,
     ) -> None:
         self._batch_api = batch_api
         self._core_api = core_api
         self._raw_api = raw_api
         self._external_api = external_api
+        self.version = version
 
+        self._raw_nodes = self._raw_api.query_raw_nodes()
         # It's best if queries to the api happen in a small time window, since then there will fewer
         # mismatches between the objects (which might change inbetween api calls).
         self.node_to_kubelet_health = {
             raw_node.metadata.name: raw_api.query_kubelet_health(raw_node.metadata.name)
-            for raw_node in self._core_api.raw_nodes
+            for raw_node in self._raw_nodes
         }
         self.api_health = raw_api.query_api_health()
-        self.version = raw_api.query_version()
 
         self._controller_to_pods = _match_controllers(
             pods=self._core_api.raw_pods,
@@ -309,7 +438,7 @@ class APIServer:
     def nodes(self) -> Sequence[api.Node]:
         return [
             node_from_client(raw_node, self.node_to_kubelet_health[raw_node.metadata.name])
-            for raw_node in self._core_api.raw_nodes
+            for raw_node in self._raw_nodes
         ]
 
     def pods(self) -> Sequence[api.Pod]:

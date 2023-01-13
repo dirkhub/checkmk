@@ -5,6 +5,7 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import abc
+import dataclasses
 import numbers
 import os
 import shutil
@@ -13,6 +14,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import (
+    Any,
     AnyStr,
     Callable,
     Dict,
@@ -20,6 +22,8 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -35,6 +39,8 @@ from cmk.utils.config_path import VersionedConfigPath
 from cmk.utils.exceptions import MKGeneralException
 from cmk.utils.log import console
 from cmk.utils.parameters import TimespecificParameters
+from cmk.utils.paths import core_helper_config_dir
+from cmk.utils.store import load_object_from_file, save_object_to_file
 from cmk.utils.type_defs import (
     CheckPluginName,
     ConfigurationWarnings,
@@ -64,6 +70,12 @@ ObjectMacros = Dict[str, AnyStr]
 CoreCommandName = str
 CoreCommand = str
 CheckCommandArguments = Iterable[Union[int, float, str, Tuple[str, str, str]]]
+
+
+@dataclasses.dataclass(frozen=True)
+class CollectedHostLabels:
+    host_labels: Labels
+    service_labels: dict[ServiceName, Labels]
 
 
 class MonitoringCore(abc.ABC):
@@ -431,10 +443,85 @@ def _verify_non_duplicate_hosts() -> None:
 #   '----------------------------------------------------------------------'
 
 
+class HostAddressConfiguration(NamedTuple):
+    """Host configuration for active checks
+
+    This class is exposed to the active checks that implement a service_generator.
+    However, it's NOT part of the official API and can change at any time.
+    """
+
+    hostname: str
+    host_address: str
+    alias: str
+    ipv4address: Optional[str]
+    ipv6address: Optional[str]
+    indexed_ipv4addresses: dict[str, str]
+    indexed_ipv6addresses: dict[str, str]
+
+
+def _get_indexed_addresses(
+    host_attrs: config.ObjectAttributes, address_family: Literal["4", "6"]
+) -> Iterator[Tuple[str, str]]:
+    for name, address in host_attrs.items():
+        address_template = f"_ADDRESSES_{address_family}_"
+        if address_template in name:
+            index = name.removeprefix(address_template)
+            yield f"$_HOSTADDRESSES_{address_family}_{index}$", address
+
+
+def _get_host_address_config(
+    hostname: str, host_attrs: config.ObjectAttributes
+) -> HostAddressConfiguration:
+    return HostAddressConfiguration(
+        hostname=hostname,
+        host_address=host_attrs["address"],
+        alias=host_attrs["alias"],
+        ipv4address=host_attrs.get("_ADDRESS_4"),
+        ipv6address=host_attrs.get("_ADDRESS_6"),
+        indexed_ipv4addresses=dict(_get_indexed_addresses(host_attrs, "4")),
+        indexed_ipv6addresses=dict(_get_indexed_addresses(host_attrs, "6")),
+    )
+
+
+def iter_active_check_services(
+    check_name: str,
+    active_info: Mapping[str, Any],
+    hostname: str,
+    host_attrs: config.ObjectAttributes,
+    params: Dict[Any, Any],
+    stored_passwords: Mapping[str, str],
+) -> Iterator[Tuple[str, str]]:
+    """Iterate active service descriptions and arguments
+
+    This function is used to allow multiple active services per one WATO rule.
+    This functionality is now used only in ICMP active check and it's NOT
+    part of an official API. This function can be changed at any time.
+    """
+    host_config = _get_host_address_config(hostname, host_attrs)
+
+    if "service_generator" in active_info:
+        for desc, args in active_info["service_generator"](host_config, params):
+            yield str(desc), str(args)
+        return
+
+    description = config.active_check_service_description(
+        host_config.hostname, host_config.alias, check_name, params
+    )
+    arguments = active_check_arguments(
+        host_config.hostname,
+        description,
+        active_info["argument_function"](params),
+        stored_passwords,
+    )
+
+    yield description, arguments
+
+
 def active_check_arguments(
     hostname: HostName,
     description: Optional[ServiceName],
     args: config.SpecialAgentInfoFunctionResult,
+    stored_passwords: Union[Mapping[str, str], None] = None,
 ) -> str:
     if isinstance(args, str):
         return args
@@ -452,11 +539,19 @@ def active_check_arguments(
             % (hostname, description)
         )
 
-    return _prepare_check_command(cmd_args, hostname, description)
+    return _prepare_check_command(
+        cmd_args,
+        hostname,
+        description,
+        cmk.utils.password_store.load() if stored_passwords is None else stored_passwords,
+    )
 
 
 def _prepare_check_command(
-    command_spec: CheckCommandArguments, hostname: HostName, description: Optional[ServiceName]
+    command_spec: CheckCommandArguments,
+    hostname: HostName,
+    description: Optional[ServiceName],
+    stored_passwords: Mapping[str, str],
 ) -> str:
     """Prepares a check command for execution by Checkmk
 
@@ -466,7 +561,6 @@ def _prepare_check_command(
     """
     passwords: List[Tuple[str, str, str]] = []
     formated: List[str] = []
-    stored_passwords = cmk.utils.password_store.load()
     for arg in command_spec:
         if isinstance(arg, (int, float)):
             formated.append("%s" % arg)
@@ -502,6 +596,24 @@ def _prepare_check_command(
         formated = ["--pwstore=%s" % ",".join(["@".join(p) for p in passwords])] + formated
 
     return " ".join(formated)
+
+
+def get_active_check_descriptions(
+    hostname: HostName,
+    hostalias: str,
+    host_attrs: ObjectAttributes,
+    check_name: str,
+    params: Dict,
+) -> Iterator[str]:
+    host_config = _get_host_address_config(hostname, host_attrs)
+    active_check_info = config.active_check_info[check_name]
+
+    if "service_generator" in active_check_info:
+        for description, _ in active_check_info["service_generator"](host_config, params):
+            yield str(description)
+        return
+
+    yield config.active_check_service_description(hostname, hostalias, check_name, params)
 
 
 # .
@@ -836,6 +948,16 @@ def get_host_macros_from_attributes(hostname: HostName, attrs: ObjectAttributes)
     return macros
 
 
+def get_service_macros_from_attributes(attrs: ObjectAttributes) -> ObjectMacros:
+    # We may want to implement a superset of Nagios' own macros, see
+    # https://assets.nagios.com/downloads/nagioscore/docs/nagioscore/3/en/macrolist.html
+    macros = {}
+    for macro_name, value in attrs.items():
+        if macro_name[0] == "_":
+            macros["$_SERVICE" + macro_name[1:] + "$"] = value
+    return macros
+
+
 def replace_macros(s: str, macros: ObjectMacros) -> str:
     for key, value in macros.items():
         if isinstance(value, (numbers.Integral, float)):
@@ -853,3 +975,47 @@ def replace_macros(s: str, macros: ObjectMacros) -> str:
                     raise
 
     return s
+
+
+def write_notify_host_file(
+    config_path: VersionedConfigPath,
+    labels_per_host: dict[HostName, CollectedHostLabels],
+) -> None:
+    notify_labels_path: Path = _get_host_file_path(config_path)
+    for host, labels in labels_per_host.items():
+        host_path = notify_labels_path / host
+        save_object_to_file(
+            host_path,
+            dataclasses.asdict(
+                CollectedHostLabels(
+                    host_labels=labels.host_labels,
+                    service_labels={k: v for k, v in labels.service_labels.items() if v.values()},
+                )
+            ),
+        )
+
+
+def read_notify_host_file(
+    host_name: HostName,
+) -> CollectedHostLabels:
+    host_file_path: Path = _get_host_file_path(host_name=host_name)
+    return CollectedHostLabels(
+        **load_object_from_file(
+            path=host_file_path,
+            default={"host_labels": {}, "service_labels": {}},
+        )
+    )
+
+
+def _get_host_file_path(
+    config_path: Optional[VersionedConfigPath] = None,
+    host_name: Optional[HostName] = None,
+) -> Path:
+    root_path = Path(config_path) if config_path else core_helper_config_dir / Path("latest")
+    if host_name:
+        return root_path / "notify" / "labels" / host_name
+    return root_path / "notify" / "labels"
+
+
+def get_labels_from_attributes(key_value_pairs: list[tuple[str, str]]) -> Labels:
+    return {key[8:]: value for key, value in key_value_pairs if key.startswith("__LABEL_")}

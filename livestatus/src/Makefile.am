@@ -65,6 +65,7 @@ test_neb_SOURCES = \
     test/test_Metric.cc \
     test/test_Queue.cc \
     test/test_RegExp.cc \
+    test/test_Renderer.cc \
     test/test_StringColumn.cc \
     test/test_StringUtil.cc \
     test/test_Table.cc \
@@ -141,7 +142,6 @@ liblivestatus_a_SOURCES = \
         RendererBrokenCSV.cc \
         RendererCSV.cc \
         RendererJSON.cc \
-        RendererPython.cc \
         RendererPython3.cc \
         RRDColumn.cc \
         ServiceGroupMembersColumn.cc \

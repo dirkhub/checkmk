@@ -24,7 +24,7 @@ from cmk.utils.type_defs import ContactgroupName, UserId
 import cmk.gui.watolib as watolib
 import cmk.gui.watolib.hosts_and_folders as hosts_and_folders
 from cmk.gui import userdb
-from cmk.gui.exceptions import MKUserError
+from cmk.gui.exceptions import MKGeneralException, MKUserError
 from cmk.gui.globals import config, g
 from cmk.gui.watolib.search import MatchItem
 from cmk.gui.watolib.utils import has_agent_bakery
@@ -1010,3 +1010,41 @@ def test_folder_exists(mocker: MagicMock, tmp_path: Path) -> None:
     assert not hosts_and_folders.Folder.folder_exists("foo/foobar")
     with pytest.raises(MKUserError):
         hosts_and_folders.Folder.folder_exists("../wato")
+
+
+def test_folder_access(mocker: MagicMock, tmp_path: Path) -> None:
+    mocker.patch.object(cmk.utils.paths, "check_mk_config_dir", str(tmp_path))
+    (tmp_path / "wato" / "foo" / "bar").mkdir(parents=True)
+    assert isinstance(hosts_and_folders.Folder.folder("foo/bar"), hosts_and_folders.CREFolder)
+    assert isinstance(hosts_and_folders.Folder.folder(""), hosts_and_folders.CREFolder)
+    with pytest.raises(MKGeneralException):
+        hosts_and_folders.Folder.folder("unknown_folder")
+
+
+@pytest.mark.parametrize("blacklisted_attribute", ["snmp_v3_credentials", "hostname"])
+def test_host_rewrite_removes_blacklisted_attributes(
+    blacklisted_attribute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host_name = "test-host"
+
+    monkeypatch.setattr(
+        "cmk.gui.watolib.hosts_and_folders.delete_hosts",
+        lambda *args, **kwargs: None,
+    )
+
+    hosts_and_folders.CREFolder.root_folder().create_hosts(
+        [
+            (
+                host_name,
+                {"ipaddress": "127.0.0.1", blacklisted_attribute: "fooooooooobar"},
+                [],
+            )
+        ],
+        bake_hosts=False,
+    )
+    hosts_and_folders.CREFolder.root_folder().rewrite_hosts_files()
+
+    host = hosts_and_folders.Host.host(host_name)
+    assert host is not None
+    assert blacklisted_attribute not in host.attributes()
+    hosts_and_folders.CREFolder.root_folder().delete_hosts([host_name])

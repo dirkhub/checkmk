@@ -12,6 +12,7 @@ RUN sed -i 's/^mirrorlist/#mirrorlist/' /etc/yum.repos.d/* \
 RUN yum -y --enablerepo=powertools --allowerasing install \
     epel-release \
     && yum -y --enablerepo=powertools --allowerasing install \
+    bison \
     curl \
     enchant \
     gcc \
@@ -145,6 +146,10 @@ RUN /opt/install-protobuf-cpp.sh
 RUN /opt/install-openssl.sh
 RUN /opt/install-python.sh
 RUN /opt/install-freetds.sh
+
+# Now shrink all the binaries and libraries we produced to build a small image
+# in the next step
+RUN /opt/strip_binaries /opt
 
 ### Actual Image ###
 FROM base

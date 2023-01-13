@@ -99,6 +99,7 @@ class QueryCallback(Protocol):
         query: str,
         only_sites: Optional[List[SiteId]] = None,
         output_format: LivestatusOutputFormat = LivestatusOutputFormat.PYTHON,
+        fetch_full_data: bool = False,
     ) -> LivestatusResponse:
         ...
 
@@ -405,6 +406,20 @@ class ABCBISearcher(abc.ABC):
         self,
         hosts: Iterable[BIHostData],
         tag_conditions: TaggroupIDToTagCondition,
+    ) -> Iterable[BIHostData]:
+        ...
+
+    @abc.abstractmethod
+    def filter_host_folder(
+        self,
+        hosts: Iterable[BIHostData],
+        folder_path: str,
+    ) -> Iterable[BIHostData]:
+        ...
+
+    @abc.abstractmethod
+    def filter_host_labels(
+        self, hosts: Iterable[BIHostData], required_labels
     ) -> Iterable[BIHostData]:
         ...
 

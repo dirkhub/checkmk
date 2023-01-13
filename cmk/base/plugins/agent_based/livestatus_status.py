@@ -178,8 +178,7 @@ def _generate_livestatus_results(
 
     if status["program_version"].startswith("Check_MK"):
         # We have a CMC here.
-
-        for factor, render_func, key, label in [
+        metrics = [
             (1, lambda x: "%.3fs" % x, "average_latency_generic", "Average check latency"),
             (1, lambda x: "%.3fs" % x, "average_latency_cmk", "Average Checkmk latency"),
             (1, lambda x: "%.3fs" % x, "average_latency_fetcher", "Average fetcher latency"),
@@ -188,9 +187,35 @@ def _generate_livestatus_results(
             (100, render.percent, "helper_usage_fetcher", "Fetcher helper usage"),
             (100, render.percent, "helper_usage_checker", "Checker helper usage"),
             (100, render.percent, "livestatus_usage", "Livestatus usage"),
-            (1, lambda x: "%.1f/s" % x, "livestatus_overflows_rate", "Livestatus overflow rate"),
-        ]:
-
+            (1, lambda x: "%.2f/s" % x, "livestatus_overflows_rate", "Livestatus overflow rate"),
+            (1, lambda x: "%d/s" % x, "perf_data_count_rate", "Rate of performance data received"),
+            (1, lambda x: "%d/s" % x, "metrics_count_rate", "Rate of metrics received"),
+        ]
+        for conn, name in (("carbon", "Carbon"), ("influxdb", "InfluxDB"), ("rrdcached", "RRD")):
+            metrics.extend(
+                (
+                    (100, render.percent, f"{conn}_queue_usage", f"{name} queue usage"),
+                    (
+                        100,
+                        lambda x: "%d/s" % x,
+                        f"{conn}_queue_usage_rate",
+                        f"{name} queue usage rate",
+                    ),
+                    (
+                        1,
+                        lambda x: "%d/s" % x,
+                        f"{conn}_overflows_rate",
+                        f"Rate of performance data loss for {name}",
+                    ),
+                    (
+                        1,
+                        render.iobandwidth,
+                        f"{conn}_bytes_sent_rate",
+                        f"Rate of bytes sent to the {name} connection",
+                    ),
+                )
+            )
+        for factor, render_func, key, label in metrics:
             try:
                 value = factor * float(status[key])
             except KeyError:
@@ -199,6 +224,20 @@ def _generate_livestatus_results(
                     "helper_usage_fetcher",
                     "helper_usage_checker",
                     "average_latency_fetcher",
+                    "carbon_overflows_rate",
+                    "carbon_queue_usage",
+                    "carbon_queue_usage_rate",
+                    "carbon_bytes_sent_rate",
+                    "influxdb_overflows_rate",
+                    "influxdb_queue_usage",
+                    "influxdb_queue_usage_rate",
+                    "influxdb_bytes_sent_rate",
+                    "rrdcached_overflows_rate",
+                    "rrdcached_queue_usage",
+                    "rrdcached_queue_usage_rate",
+                    "rrdcached_bytes_sent_rate",
+                    "perf_data_count_rate",
+                    "metrics_count_rate",
                 ]:
                     value = 0.0
                 else:
@@ -207,7 +246,7 @@ def _generate_livestatus_results(
             yield from check_levels(
                 value=value,
                 metric_name=key,
-                levels_upper=params[key],
+                levels_upper=params.get(key),
                 render_func=render_func,
                 label=label,
                 notice_only=True,

@@ -19,8 +19,14 @@ impl InteractiveTrust {
         let validity = x509.validity();
 
         eprintln!("PEM-encoded certificate:\n{}", pem_str);
-        eprintln!("Issued by:\n\t{}", certs::join_common_names(x509.issuer()));
-        eprintln!("Issued to:\n\t{}", certs::join_common_names(x509.subject()));
+        eprintln!(
+            "Issued by:\n\t{}",
+            certs::common_names(x509.issuer())?.join(", ")
+        );
+        eprintln!(
+            "Issued to:\n\t{}",
+            certs::common_names(x509.subject())?.join(", ")
+        );
         eprintln!(
             "Validity:\n\tFrom {}\n\tTo   {}",
             validity.not_before.to_rfc2822(),
@@ -343,7 +349,7 @@ mod tests {
             &self,
             base_url: &reqwest::Url,
             _connection: &config::Connection,
-        ) -> Result<agent_receiver_api::StatusResponse, agent_receiver_api::StatusError> {
+        ) -> AnyhowResult<agent_receiver_api::StatusResponse> {
             assert!(base_url.to_string() == SITE_URL);
             Ok(agent_receiver_api::StatusResponse {
                 hostname: Some(String::from(HOST_NAME)),
@@ -391,7 +397,10 @@ mod tests {
             root_certificate,
             host_reg_data,
             trust_server_cert,
-            client_config: config::ClientConfig { use_proxy: false },
+            client_config: config::ClientConfig {
+                use_proxy: false,
+                validate_api_cert: false,
+            },
         }
     }
 

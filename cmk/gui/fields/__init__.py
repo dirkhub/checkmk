@@ -25,12 +25,12 @@ from cmk.gui.fields.attributes import (
     NetworkScanResult,
     SNMPCredentials,
 )
+from cmk.gui.fields.custom_fields import AuxTagIDField
 from cmk.gui.fields.definitions import (
     attributes_field,
     column_field,
+    CustomAttributes,
     customer_field,
-    CustomFolderAttributes,
-    CustomHostAttributes,
     ExprSchema,
     FOLDER_PATTERN,
     FolderField,
@@ -43,9 +43,10 @@ from cmk.gui.fields.definitions import (
     query_field,
     SiteField,
     Timestamp,
-    X509ReqPEMField,
+    X509ReqPEMFieldUUID,
 )
 from cmk.gui.fields.validators import (
+    validate_hostname,
     ValidateAnyOfValidators,
     ValidateIPv4,
     ValidateIPv4Network,
@@ -54,10 +55,10 @@ from cmk.gui.fields.validators import (
 
 __all__ = [
     "attributes_field",
+    "AuxTagIDField",
     "column_field",
     "customer_field",
-    "CustomFolderAttributes",
-    "CustomHostAttributes",
+    "CustomAttributes",
     "ExprSchema",
     "Field",
     "FolderField",
@@ -80,9 +81,10 @@ __all__ = [
     "SiteField",
     "SNMPCredentials",
     "Timestamp",
+    "validate_hostname",
     "ValidateAnyOfValidators",
     "ValidateIPv4",
     "ValidateIPv4Network",
     "ValidateIPv6",
-    "X509ReqPEMField",
+    "X509ReqPEMFieldUUID",
 ]

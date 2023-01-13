@@ -6,6 +6,7 @@
 
 import os
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Iterator
@@ -17,6 +18,7 @@ from tests.testlib import is_managed_repo, on_time
 
 import cmk.utils.paths
 import cmk.utils.version
+from cmk.utils.crypto import Password, password_hashing
 from cmk.utils.type_defs import UserId
 
 import cmk.gui.plugins.userdb.htpasswd as htpasswd
@@ -38,6 +40,11 @@ def fixture_time() -> Iterator[None]:
 @pytest.fixture(name="user_id")
 def fixture_user_id(with_user: tuple[UserId, str]) -> UserId:
     return with_user[0]
+
+
+@pytest.fixture(name="zero_uuid")
+def zero_uuid_fixture(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(uuid, "uuid4", lambda: "00000000-0000-0000-0000-000000000000")
 
 
 # user_id needs to be used here because it executes a reload of the config and the monkeypatch of
@@ -122,7 +129,7 @@ def test_load_pre_20_session(user_id: UserId, session_pre_20: str) -> None:
     assert old_session["sess2"].last_activity == int(time.time()) - 5
 
 
-def test_on_succeeded_login(user_id: UserId) -> None:
+def test_on_succeeded_login(user_id: UserId, zero_uuid: None) -> None:
     assert config.single_user_session is None
 
     # Never logged in before
@@ -140,6 +147,7 @@ def test_on_succeeded_login(user_id: UserId) -> None:
             started_at=int(time.time()),
             last_activity=int(time.time()),
             flashes=[],
+            csrf_token="00000000-0000-0000-0000-000000000000",
         )
     }
 
@@ -348,7 +356,7 @@ def test_ensure_user_can_not_init_with_previous_session(
         assert userdb._ensure_user_can_init_session(user_id) is False
 
 
-def test_initialize_session_single_user_session(user_id: UserId) -> None:
+def test_initialize_session_single_user_session(user_id: UserId, zero_uuid: None) -> None:
     session_id = userdb._initialize_session(user_id)
     assert session_id != ""
     session_infos = userdb._load_session_infos(user_id)
@@ -357,6 +365,7 @@ def test_initialize_session_single_user_session(user_id: UserId) -> None:
         started_at=int(time.time()),
         last_activity=int(time.time()),
         flashes=[],
+        csrf_token="00000000-0000-0000-0000-000000000000",
     )
 
 
@@ -531,7 +540,7 @@ def test_user_attribute_sync_plugins(request_context: None, monkeypatch: MonkeyP
 
 def test_check_credentials_local_user(with_user: tuple[UserId, str]) -> None:
     username, password = with_user
-    assert userdb.check_credentials(username, password) == username
+    assert userdb.check_credentials(username, Password(password)) == username
 
 
 @pytest.mark.usefixtures("request_context")
@@ -541,8 +550,8 @@ def test_check_credentials_local_user_create_htpasswd_user_ad_hoc() -> None:
     assert userdb._user_exists_according_to_profile(user_id) is False
     assert user_id not in _load_users_uncached(lock=False)
 
-    htpasswd.Htpasswd(Path(cmk.utils.paths.htpasswd_file)).save(
-        {user_id: htpasswd.hash_password("cmk")}
+    htpasswd.Htpasswd(Path(cmk.utils.paths.htpasswd_file)).save_all(
+        {user_id: htpasswd.hash_password(Password("cmk"))}
     )
     # Once a user exists in the htpasswd, the GUI treats the user as existing user and will
     # automatically initialize the missing data structures
@@ -550,7 +559,7 @@ def test_check_credentials_local_user_create_htpasswd_user_ad_hoc() -> None:
     assert userdb._user_exists_according_to_profile(user_id) is False
     assert str(user_id) in _load_users_uncached(lock=False)
 
-    assert userdb.check_credentials(user_id, "cmk") == user_id
+    assert userdb.check_credentials(user_id, Password("cmk")) == user_id
 
     # Nothing changes during regular access
     assert userdb.user_exists(user_id) is True
@@ -560,14 +569,14 @@ def test_check_credentials_local_user_create_htpasswd_user_ad_hoc() -> None:
 
 def test_check_credentials_local_user_disallow_locked(with_user: tuple[UserId, str]) -> None:
     user_id, password = with_user
-    assert userdb.check_credentials(user_id, password) == user_id
+    assert userdb.check_credentials(user_id, Password(password)) == user_id
 
     users = _load_users_uncached(lock=True)
 
     users[user_id]["locked"] = True
     userdb.save_users(users)
 
-    assert userdb.check_credentials(user_id, password) is False
+    assert userdb.check_credentials(user_id, Password(password)) is False
 
 
 # user_id needs to be used here because it executes a reload of the config and the monkeypatch of
@@ -626,7 +635,7 @@ def test_check_credentials_managed_global_user_is_allowed(with_user: tuple[UserI
         pytest.skip("not relevant")
 
     user_id, password = with_user
-    assert userdb.check_credentials(user_id, password) == user_id
+    assert userdb.check_credentials(user_id, Password(password)) == user_id
 
 
 @pytest.mark.usefixtures("make_cme", "make_cme_customer_user")
@@ -635,7 +644,7 @@ def test_check_credentials_managed_customer_user_is_allowed(with_user: tuple[Use
         pytest.skip("not relevant")
 
     user_id, password = with_user
-    assert userdb.check_credentials(user_id, password) == user_id
+    assert userdb.check_credentials(user_id, Password(password)) == user_id
 
 
 @pytest.mark.usefixtures("make_cme", "make_cme_wrong_customer_user")
@@ -646,7 +655,7 @@ def test_check_credentials_managed_wrong_customer_user_is_denied(
         pytest.skip("not relevant")
 
     user_id, password = with_user
-    assert userdb.check_credentials(user_id, password) is False
+    assert userdb.check_credentials(user_id, Password(password)) is False
 
 
 def test_load_custom_attr_not_existing(user_id: UserId) -> None:
@@ -763,19 +772,19 @@ def test_disable_two_factor_authentication(user_id: UserId) -> None:
     assert userdb.is_two_factor_login_enabled(user_id) is False
 
 
-def test_make_two_factor_backup_codes(user_id) -> None:
+def test_make_two_factor_backup_codes(user_id: UserId) -> None:
     display_codes, store_codes = userdb.make_two_factor_backup_codes()
     assert len(display_codes) == 10
     assert len(store_codes) == 10
     for index in range(10):
-        assert htpasswd.check_password(display_codes[index], store_codes[index]) is True
+        password_hashing.verify(Password(display_codes[index]), store_codes[index])
 
 
 def test_is_two_factor_backup_code_valid_no_codes(user_id) -> None:
     assert userdb.is_two_factor_backup_code_valid(user_id, "yxz") is False
 
 
-def test_is_two_factor_backup_code_valid_matches(user_id) -> None:
+def test_is_two_factor_backup_code_valid_matches(user_id: UserId) -> None:
     display_codes, store_codes = userdb.make_two_factor_backup_codes()
     credentials = userdb.load_two_factor_credentials(user_id)
     credentials["backup_codes"] = store_codes

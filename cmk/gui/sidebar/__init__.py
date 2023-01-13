@@ -27,6 +27,7 @@ from cmk.gui.i18n import _
 from cmk.gui.log import logger
 from cmk.gui.main_menu import mega_menu_registry
 from cmk.gui.page_menu import PageMenu, PageMenuDropdown, PageMenuTopic
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.logged_in import LoggedInUser
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.valuespec import CascadingDropdown, Dictionary
@@ -577,16 +578,15 @@ class SidebarRenderer:
 
 
 def _render_header_icon() -> None:
-    if user.get_attribute("nav_hide_icons_title"):
-        if theme.has_custom_logo():
-            html.img(theme.detect_icon_path(icon_name="logo", prefix="mk-"), class_="custom")
-        else:
-            html.img(theme.detect_icon_path(icon_name="icon_min", prefix="tribe29_"))
+    if theme.has_custom_logo("navbar_logo"):
+        html.img(theme.detect_icon_path(icon_name="navbar_logo", prefix=""), class_="custom")
     else:
-        if theme.has_custom_logo():
-            html.img(theme.detect_icon_path(icon_name="logo", prefix="mk-"))
-        else:
-            html.img(theme.detect_icon_path(icon_name="icon", prefix="tribe29_"))
+        html.img(
+            theme.detect_icon_path(
+                icon_name="icon" + ("_min" if user.get_attribute("nav_hide_icons_title") else ""),
+                prefix="tribe29_",
+            )
+        )
 
 
 @cmk.gui.pages.register("side")
@@ -648,6 +648,7 @@ def ajax_snapin():
 
 @cmk.gui.pages.register("sidebar_fold")
 def ajax_fold():
+    check_csrf_token()
     response.set_content_type("application/json")
     user_config = UserSidebarConfig(user, config.sidebar)
     user_config.folded = request.var("fold") == "yes"
@@ -656,6 +657,7 @@ def ajax_fold():
 
 @cmk.gui.pages.register("sidebar_openclose")
 def ajax_openclose() -> None:
+    check_csrf_token()
     response.set_content_type("application/json")
     if not user.may("general.configure_sidebar"):
         return None
@@ -787,6 +789,10 @@ class CustomSnapins(pagetypes.Overridable):
                 )
             )
         return choices
+
+    @classmethod
+    def reserved_unique_ids(cls) -> List[str]:
+        return [k for k, v in snapin_registry.items() if not v.is_custom_snapin()]
 
 
 pagetypes.declare(CustomSnapins)

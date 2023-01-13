@@ -5,27 +5,32 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 """Users"""
 import datetime as dt
-import json
 import time
-from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Any, Dict, Literal, Optional, Tuple, TypedDict, Union
 
+from cmk.utils.crypto import Password
 from cmk.utils.type_defs import UserId
 
 import cmk.gui.plugins.userdb.htpasswd as htpasswd
 from cmk.gui import userdb
 from cmk.gui.exceptions import MKUserError
+from cmk.gui.globals import user
 from cmk.gui.http import Response
 from cmk.gui.plugins.openapi.endpoints.utils import complement_customer, update_customer_info
 from cmk.gui.plugins.openapi.restful_objects import (
     constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
 from cmk.gui.plugins.openapi.restful_objects.parameters import USERNAME
-from cmk.gui.plugins.openapi.utils import problem, ProblemException
+from cmk.gui.plugins.openapi.utils import problem, ProblemException, serve_json
 from cmk.gui.type_defs import UserSpec
+from cmk.gui.watolib.custom_attributes import load_custom_attrs_from_mk_file
 from cmk.gui.watolib.users import delete_users, edit_users
+
+from .host_config import _except_keys
 
 TIMESTAMP_RANGE = Tuple[float, float]
 
@@ -46,6 +51,16 @@ class InternalInterfaceAttributes(TypedDict, total=False):
     show_mode: Optional[Literal["default_show_less", "default_show_more", "enforce_show_more"]]
 
 
+PERMISSIONS = permissions.Perm("wato.users")
+
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        PERMISSIONS,
+    ]
+)
+
+
 @Endpoint(
     constructors.object_href("user_config", "{username}"),
     "cmk/show",
@@ -53,9 +68,11 @@ class InternalInterfaceAttributes(TypedDict, total=False):
     path_params=[USERNAME],
     etag="output",
     response_schema=response_schemas.UserObject,
+    permissions_required=PERMISSIONS,
 )
 def show_user(params):
     """Show an user"""
+    user.need_permission("wato.users")
     username = params["username"]
     try:
         return serve_user(username)
@@ -72,17 +89,17 @@ def show_user(params):
     ".../collection",
     method="get",
     response_schema=response_schemas.UserCollection,
+    permissions_required=PERMISSIONS,
 )
 def list_users(params):
     """Show all users"""
+    user.need_permission("wato.users")
     users = []
     for user_id, attrs in userdb.load_users(False).items():
         user_attributes = _internal_to_api_format(attrs)
         users.append(serialize_user(user_id, complement_customer(user_attributes)))
 
-    return constructors.serve_json(
-        constructors.collection_object(domain_type="user_config", value=users)
-    )
+    return serve_json(constructors.collection_object(domain_type="user_config", value=users))
 
 
 @Endpoint(
@@ -92,9 +109,17 @@ def list_users(params):
     etag="output",
     request_schema=request_schemas.CreateUser,
     response_schema=response_schemas.UserObject,
+    permissions_required=permissions.AllPerm(
+        [
+            *RW_PERMISSIONS.perms,
+            permissions.Optional(permissions.Perm("wato.groups")),
+        ]
+    ),
 )
-def create_user(params):
-    """Create a user"""
+def create_user(params) -> Response:
+    """Create a user
+
+    You can pass custom attributes you defined directly in the top level JSON object of the request."""
     api_attrs = params["body"]
     username = api_attrs["username"]
 
@@ -122,6 +147,7 @@ def create_user(params):
     method="delete",
     path_params=[USERNAME],
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
 )
 def delete_user(params):
     """Delete a user"""
@@ -130,9 +156,9 @@ def delete_user(params):
         delete_users([username])
     except MKUserError:
         return problem(
-            404,
-            f'User "{username}" is not known.',
-            "The user to delete does not exist. Please check for eventual misspellings.",
+            status=404,
+            title=f'User "{username}" is not known.',
+            detail="The user to delete does not exist. Please check for eventual misspellings.",
         )
     return Response(status=204)
 
@@ -145,6 +171,7 @@ def delete_user(params):
     etag="both",
     request_schema=request_schemas.UpdateUser,
     response_schema=response_schemas.UserObject,
+    permissions_required=RW_PERMISSIONS,
 )
 def edit_user(params):
     """Edit an user"""
@@ -170,11 +197,9 @@ def edit_user(params):
 
 
 def serve_user(user_id):
-    response = Response()
     user_attributes_internal = _load_user(user_id)
     user_attributes = _internal_to_api_format(user_attributes_internal)
-    response.set_data(json.dumps(serialize_user(user_id, complement_customer(user_attributes))))
-    response.set_content_type("application/json")
+    response = serve_json(serialize_user(user_id, complement_customer(user_attributes)))
     response.headers.add("ETag", constructors.etag_of_dict(user_attributes).to_header())
     return response
 
@@ -184,7 +209,7 @@ def serialize_user(user_id, attributes):
         domain_type="user_config",
         identifier=user_id,
         title=attributes["fullname"],
-        extensions=_filter_keys(attributes, response_schemas.UserAttributes._declared_fields),
+        extensions=_except_keys(attributes, ["auth_option"]),
     )
 
 
@@ -275,6 +300,11 @@ def _internal_to_api_format(internal_attrs: UserSpec) -> dict[str, Any]:
             )
         }
     )
+    custom_attrs = load_custom_attrs_from_mk_file(lock=False)["user"]
+    for attr in custom_attrs:
+        if (name := attr["name"]) in internal_attrs:
+            # monkeypatch a typed dict, what can go wrong
+            api_attrs[name] = internal_attrs[name]  # type:ignore[misc]
     return api_attrs
 
 
@@ -397,6 +427,8 @@ def _update_auth_options(internal_attrs, auth_options: AuthOptions, new_user=Fal
 
             if internal_auth_attrs.get("enforce_password_change"):
                 internal_attrs["serial"] = 1
+
+        internal_attrs["connector"] = "htpasswd"
     return internal_attrs
 
 
@@ -423,13 +455,17 @@ def _auth_options_to_internal_format(
     if not auth_details:
         return internal_options
 
+    # Note: Use the htpasswd wrapper for hash_password below, so we get MKUserError if anything
+    #       goes wrong.
     if auth_details["auth_type"] == "automation":
         secret = auth_details["secret"]
         internal_options["automation_secret"] = secret
-        internal_options["password"] = htpasswd.hash_password(secret)
+        internal_options["password"] = htpasswd.hash_password(Password(secret))
     else:  # password
         if new_user or "password" in auth_details:
-            internal_options["password"] = htpasswd.hash_password(auth_details["password"])
+            internal_options["password"] = htpasswd.hash_password(
+                Password(auth_details["password"])
+            )
             internal_options["last_pw_change"] = int(time.time())
 
         if "enforce_password_change" in auth_details:
@@ -567,11 +603,11 @@ def _notification_options_to_internal_format(
     notification_internal: Dict[str, Union[bool, TIMESTAMP_RANGE]],
     notification_api_details: NotificationDetails,
 ) -> Dict[str, Union[bool, TIMESTAMP_RANGE]]:
-    """Format the disable notifications information to be Checkmk compatible
+    """Format disable notifications information to be Checkmk compatible
 
     Args:
-        disable_notification_details:
-            user provided disable notifications details
+        notification_api_details:
+            user provided notifications details
 
     Returns:
         formatted disable notifications details for Checkmk user_attrs
@@ -607,9 +643,3 @@ def _time_stamp_range(datetime_range: TimeRange) -> TIMESTAMP_RANGE:
         return dt.datetime.timestamp(date_time.replace(tzinfo=dt.timezone.utc))
 
     return timestamp(datetime_range["start_time"]), timestamp(datetime_range["end_time"])
-
-
-def _filter_keys(
-    dict_: Dict[str, Any], included_keys: Union[Sequence[str], Mapping[str, Any]]
-) -> Dict[str, Any]:
-    return {key: value for key, value in dict_.items() if key in included_keys}

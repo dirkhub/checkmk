@@ -4,10 +4,11 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 """
-Special agent for monitoring Kubernetes clusters. The fully supported API version of Kubernetes
-depends on the corresponding python module. E.g. v11 of the python module will support mainly
-Kubernetes API v1.15. Please take a look on the official website to see, if you API version
-is supported: https://github.com/kubernetes-client/python
+Special agent for monitoring Kubernetes clusters. This agent is required for
+monitoring data provided by the Kubernetes API and the Checkmk collectors,
+which can optionally be deployed within a cluster. The agent requires
+Kubernetes version v1.21 or higher. Moreover, read access to the Kubernetes API
+endpoints monitored by Checkmk must be provided.
 """
 
 from __future__ import annotations
@@ -894,6 +895,32 @@ class Node(PodOwner):
         )
 
 
+def any_match_from_list_of_infix_patterns(infix_patterns: Sequence[str], string: str) -> bool:
+    """Matching consistent with RegExp.infix.
+
+    The inline help for the RegExp.infix option reads:
+        The pattern is applied as infix search. Add a leading <tt>^</tt>
+        to make it match from the beginning and/or a tailing <tt>$</tt>
+        to match till the end of the text.
+    any_match_from_list_of_infix_patterns is consistent with this help text, if
+    used with a list infix patterns.
+
+    >>> any_match_from_list_of_infix_patterns(["start"], "start_middle_end")
+    True
+    >>> any_match_from_list_of_infix_patterns(["middle"], "start_middle_end")
+    True
+    >>> any_match_from_list_of_infix_patterns(["end"], "start_middle_end")
+    True
+    >>> any_match_from_list_of_infix_patterns(["middle", "no_match"], "start_middle_end")
+    True
+    >>> any_match_from_list_of_infix_patterns([], "start_middle_end")
+    False
+    >>> any_match_from_list_of_infix_patterns(["^middle"], "start_middle_end")
+    False
+    """
+    return any(re.search(pattern, string) for pattern in infix_patterns)
+
+
 class Cluster:
     @classmethod
     def from_api_resources(
@@ -1016,9 +1043,8 @@ class Cluster:
 
     def add_node(self, node: Node) -> None:
         if not any(
-            re.match(excluded_node_role, role)
+            any_match_from_list_of_infix_patterns(self._excluded_node_roles, role)
             for role in node.roles
-            for excluded_node_role in self._excluded_node_roles
         ):
             self._cluster_aggregation_node_names.append(node.name)
         self._nodes[node.name] = node
@@ -2211,11 +2237,6 @@ def filter_monitored_namespaces(
         ['bar', 'foo']
 
     """
-    if (
-        namespace_include_patterns and namespace_exclude_patterns
-    ):  # this should be handled by argparse
-        raise ValueError("It is not possible to define patterns for both filter mechanisms")
-
     if namespace_include_patterns:
         LOGGER.debug("Filtering for included namespaces")
         return _filter_namespaces(cluster_namespaces, namespace_include_patterns)
@@ -2239,12 +2260,11 @@ def _filter_namespaces(
          ... api.NamespaceName("man")}, ["foo", "man"]))
          ['foo', 'man']
     """
-    filtered_namespaces = set()
-    compiled_re = re.compile(f"({'|'.join(re_patterns)})")
-    for namespace in kubernetes_namespaces:
-        if compiled_re.match(namespace):
-            filtered_namespaces.add(namespace)
-    return filtered_namespaces
+    return {
+        namespace
+        for namespace in kubernetes_namespaces
+        if any_match_from_list_of_infix_patterns(re_patterns, namespace)
+    }
 
 
 def cluster_piggyback_formatter(cluster_name: str, object_type: str, namespaced_name: str) -> str:

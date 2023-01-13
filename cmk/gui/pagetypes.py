@@ -37,20 +37,24 @@ from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem, make_main_menu_breadc
 from cmk.gui.default_permissions import PermissionSectionGeneral
 from cmk.gui.exceptions import MKAuthException, MKGeneralException, MKUserError
 from cmk.gui.globals import html, request, transactions, user, user_errors
+from cmk.gui.hooks import request_memoize
 from cmk.gui.i18n import _, _l, _u
 from cmk.gui.main_menu import mega_menu_registry
 from cmk.gui.page_menu import (
     make_confirmed_form_submit_link,
+    make_external_link,
     make_form_submit_link,
     make_javascript_link,
     make_simple_link,
     PageMenu,
     PageMenuDropdown,
     PageMenuEntry,
+    PageMenuLink,
     PageMenuSearch,
     PageMenuTopic,
 )
 from cmk.gui.permissions import (
+    declare_dynamic_permissions,
     declare_permission_section,
     Permission,
     permission_registry,
@@ -314,6 +318,7 @@ class Base:
     # Stub function for finding a page by name. Overriden by
     # Overridable.
     @classmethod
+    @request_memoize()
     def find_page(cls, name):
         for instance in cls.__instances.values():
             if instance.name() == name:
@@ -972,7 +977,7 @@ class Overridable(Base):
                     if not userdb.user_exists(user_id):
                         continue
 
-                    user_pages = store.load_object_from_file(path, default={})
+                    user_pages = store.load_pickled_object_file(path, default={})
                     for name, page_dict in user_pages.items():
                         page_dict["owner"] = user_id
                         page_dict["name"] = name
@@ -1325,7 +1330,9 @@ class Overridable(Base):
             elements=parameters,
             headers=keys_by_topic,
             validate=validate_id(
-                mode, {p.name(): p for p in cls.permitted_instances_sorted() if p.is_mine()}
+                mode,
+                {p.name(): p for p in cls.permitted_instances_sorted() if p.is_mine()},
+                cls.reserved_unique_ids(),
             ),
         )
 
@@ -1381,6 +1388,12 @@ class Overridable(Base):
         html.hidden_fields()
         html.end_form()
         html.footer()
+
+    @classmethod
+    def reserved_unique_ids(cls) -> List:
+        """Used to exclude names from choosing as unique ID, e.g. builtin names
+        in sidebar snapins"""
+        return []
 
 
 def customize_page_menu(
@@ -1614,17 +1627,15 @@ def _page_menu_entries_sub_pages(
         return
 
     for title, pagename, icon in sub_pages:
-        yield PageMenuEntry(
-            title=title,
-            icon_name=icon,
-            item=make_simple_link(
-                makeuri_contextless(
-                    request,
-                    [(ident_attr_name, visualname)],
-                    filename=pagename + ".py",
-                )
-            ),
+        uri: str = makeuri_contextless(
+            request,
+            [(ident_attr_name, visualname)],
+            filename=pagename + ".py",
         )
+        link: PageMenuLink = (
+            make_external_link(uri) if pagename == "report" else make_simple_link(uri)
+        )
+        yield PageMenuEntry(title=title, icon_name=icon, item=link)
 
 
 class ContactGroupChoice(DualListChoice):
@@ -2131,3 +2142,22 @@ mega_menu_registry.register(
         topics=_customize_menu_topics,
     )
 )
+
+#   .--Permissions---------------------------------------------------------.
+#   |        ____                     _         _                          |
+#   |       |  _ \ ___ _ __ _ __ ___ (_)___ ___(_) ___  _ __  ___          |
+#   |       | |_) / _ \ '__| '_ ` _ \| / __/ __| |/ _ \| '_ \/ __|         |
+#   |       |  __/  __/ |  | | | | | | \__ \__ \ | (_) | | | \__ \         |
+#   |       |_|   \___|_|  |_| |_| |_|_|___/___/_|\___/|_| |_|___/         |
+#   |                                                                      |
+#   +----------------------------------------------------------------------+
+#   | Declare all pagetype permissions as dynamic permissions              |
+#   '----------------------------------------------------------------------'
+
+
+def _load_pagetype_permissions() -> None:
+    for pagetype in all_page_types().values():
+        pagetype.load()
+
+
+declare_dynamic_permissions(_load_pagetype_permissions)

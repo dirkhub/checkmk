@@ -20,9 +20,11 @@ import cmk.utils.paths
 import cmk.utils.regex
 
 from cmk.gui.exceptions import MKUserError
+from cmk.gui.hooks import request_memoize
 from cmk.gui.log import logger
 
 
+@request_memoize(maxsize=100000)
 def num_split(s: str) -> Tuple[Union[int, str], ...]:
     """Splits a word into sequences of numbers and non-numbers.
 
@@ -39,6 +41,7 @@ def num_split(s: str) -> Tuple[Union[int, str], ...]:
     return tuple(parts)
 
 
+@request_memoize(maxsize=100000)
 def cmp_num_split(a: str, b: str) -> int:
     """Compare two strings, separate numbers and non-numbers from before."""
     return (num_split(a) > num_split(b)) - (num_split(a) < num_split(b))
@@ -214,16 +217,23 @@ def unique_default_name_suggestion(template: str, used_names: Iterable[str]) -> 
 def validate_id(
     mode: str,
     existing_entries: Dict[str, Any],
+    reserved_unique_ids: Optional[List[str]] = None,
 ) -> Callable[[Dict[str, Any], str], None,]:
     """Validate ID of newly created or cloned pagetype or visual"""
     from cmk.gui.i18n import _
 
     def _validate(properties: Dict[str, Any], varprefix: str) -> None:
         name = properties["name"]
-        if existing_entries.get(name) and mode in ["create", "clone"]:
-            raise MKUserError(
-                varprefix + "_p_name",
-                _("You already have an element with the ID <b>%s</b>") % name,
-            )
+        if mode in ["create", "clone"]:
+            if existing_entries.get(name):
+                raise MKUserError(
+                    varprefix + "_p_name",
+                    _("You already have an element with the ID <b>%s</b>") % name,
+                )
+            if reserved_unique_ids is not None and name in reserved_unique_ids:
+                raise MKUserError(
+                    varprefix + "_p_name",
+                    _("ID <b>%s</b> is reserved for internal use.") % name,
+                )
 
     return _validate

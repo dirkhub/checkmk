@@ -23,7 +23,7 @@ You should find an example configuration file at
 
 from __future__ import with_statement
 
-__version__ = "2.1.0b9"
+__version__ = "2.1.0p20"
 
 import sys
 
@@ -35,6 +35,7 @@ import ast
 import binascii
 import glob
 import io
+import itertools
 import locale
 import logging
 import os
@@ -44,6 +45,13 @@ import shlex
 import shutil
 import socket
 import time
+
+try:
+    from typing import Any, Collection, Dict, Iterable, Iterator, Sequence
+except ImportError:
+    # We need typing only for testing
+    pass
+
 
 # For Python 3 sys.stdout creates \r\n as newline for Windows.
 # Checkmk can't handle this therefore we rewrite sys.stdout to a new_stdout function.
@@ -61,6 +69,12 @@ DUPLICATE_LINE_MESSAGE_FMT = "[the above message was repeated %d times]"
 MK_VARDIR = os.getenv("LOGWATCH_DIR") or os.getenv("MK_VARDIR") or os.getenv("MK_STATEDIR") or "."
 
 MK_CONFDIR = os.getenv("LOGWATCH_DIR") or os.getenv("MK_CONFDIR") or "."
+
+REMOTE = (
+    os.getenv("REMOTE")
+    or os.getenv("REMOTE_ADDR")
+    or ("local" if sys.stdout.isatty() else "remote-unknown")
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -97,6 +111,7 @@ else:
 
 # Borrowed from six
 def ensure_str(s, encoding="utf-8", errors="strict"):
+    # type: (text_type | binary_type, str, str) -> str
     """Coerce *s* to `str`.
 
     For Python 2:
@@ -113,7 +128,22 @@ def ensure_str(s, encoding="utf-8", errors="strict"):
         s = s.encode(encoding, errors)
     elif PY3 and isinstance(s, binary_type):
         s = s.decode(encoding, errors)
-    return s
+    return str(s)
+
+
+def ensure_text_type(s, encoding="utf-8", errors="strict"):
+    # type: (text_type | binary_type, str, str) -> text_type
+    """Coerce *s* to `text_type`.
+
+    For Python 2:
+      - `unicode` -> `unicode`
+      - `str` -> decoded to `unicode`
+
+    For Python 3:
+      - `str` -> `str`
+      - `bytes` -> decoded to `str`
+    """
+    return s if isinstance(s, text_type) else s.decode(encoding, errors)
 
 
 def init_logging(verbosity):
@@ -134,6 +164,7 @@ class ArgsParser(object):  # pylint: disable=too-few-public-methods, useless-obj
     """
 
     def __init__(self, argv):
+        # type: (Sequence[str]) -> None
         super(ArgsParser, self).__init__()
 
         if "-h" in argv:
@@ -146,10 +177,10 @@ class ArgsParser(object):  # pylint: disable=too-few-public-methods, useless-obj
         self.no_state = "--no_state" in argv
 
 
-def get_status_filename(cluster_config):
+def get_status_filename(cluster_config, remote):
+    # type: (Sequence[ClusterConfigBlock], str) -> str
     """
     Side effect:
-    - Depend on ENV var.
     - In case agent plugin is called with debug option set -> depends on global
       LOGGER and stdout.
 
@@ -171,12 +202,7 @@ def get_status_filename(cluster_config):
     underscores (_) for IPv4 address or is plain $REMOTE in case it does not match
     an IPv4 or IPv6 address.
     """
-    remote = os.getenv("REMOTE", os.getenv("REMOTE_ADDR"))
-    if not remote:
-        status_filename = "logwatch.state" + (".local" if sys.stdout.isatty() else "")
-        return os.path.join(MK_VARDIR, status_filename)
     remote_hostname = remote.replace(":", "_")
-
     match = IPV4_REGEX.match(remote) or IPV6_REGEX.match(remote)
     if not match:
         LOGGER.debug("REMOTE %r neither IPv4 nor IPv6 address.", remote)
@@ -204,18 +230,22 @@ def get_status_filename(cluster_config):
 
 
 def is_comment(line):
+    # type: (text_type) -> bool
     return line.lstrip().startswith("#")
 
 
 def is_empty(line):
+    # type: (text_type) -> bool
     return line.strip() == ""
 
 
 def is_indented(line):
+    # type: (text_type) -> bool
     return line.startswith(" ")
 
 
 def parse_filenames(line):
+    # type: (text_type) -> list[text_type]
     if platform.system() == "Windows":
         # we can't use pathlib: Python 2.5 has no pathlib
         # to garantie that backslash is escaped
@@ -231,6 +261,7 @@ def parse_filenames(line):
 
 
 def get_config_files(directory, config_file_arg=None):
+    # type: (str, str | None) -> list[str]
     if config_file_arg is not None:
         return [config_file_arg]
 
@@ -243,45 +274,54 @@ def get_config_files(directory, config_file_arg=None):
     return config_file_paths
 
 
-def iter_config_lines(files, debug=False):
-    no_cfg_content_yielded = True
+def iter_config_lines(files):
+    # type: (Iterable[str]) -> Iterator[text_type]
+    LOGGER.debug("Config files: %r", files)
+
     for file_ in files:
         try:
             with open(file_, "rb") as fid:
                 try:
-                    decoded = (line.decode("utf-8") for line in fid)
-                    for line in decoded:
-                        if not is_comment(line) and not is_empty(line):
-                            yield line.rstrip()
-                            no_cfg_content_yielded = False
+                    for line in fid:
+                        yield line.decode("utf-8")
                 except UnicodeDecodeError:
                     msg = "Error reading file %r (please use utf-8 encoding!)\n" % file_
                     sys.stdout.write(CONFIG_ERROR_PREFIX + msg)
         except IOError:
             pass
 
-    if debug and no_cfg_content_yielded:
-        # We need at least one config file *with* content in one of the places:
-        # logwatch.d or MK_CONFDIR
-        raise IOError("Did not find any content in config files: %s" % ", ".join(files))
+
+def consume_global_options_block(config_lines):
+    # type (list[text_type]) -> GlobalOptions
+    config_lines.pop(0)
+    options = GlobalOptions()
+
+    while config_lines and is_indented(config_lines[0]):
+        attr, value = config_lines.pop(0).split(None, 1)
+        if attr == "retention_period":
+            options.retention_period = int(value)
+
+    return options
 
 
 def consume_cluster_definition(config_lines):
+    # type: (list[text_type]) -> ClusterConfigBlock
     cluster_name = config_lines.pop(0)[8:].strip()  # e.g.: CLUSTER duck
-    cluster = ClusterConfigBlock(cluster_name, [])
+    ips_or_subnets = []
     LOGGER.debug("new ClusterConfigBlock: %s", cluster_name)
 
     while config_lines and is_indented(config_lines[0]):
-        cluster.ips_or_subnets.append(config_lines.pop(0).strip())
+        ips_or_subnets.append(config_lines.pop(0).strip())
 
-    return cluster
+    return ClusterConfigBlock(cluster_name, ips_or_subnets)
 
 
 def consume_logfile_definition(config_lines):
+    # type: (list[text_type]) -> PatternConfigBlock
     cont_list = []
     rewrite_list = []
     filenames = parse_filenames(config_lines.pop(0))
-    logfiles = PatternConfigBlock(filenames, [])
+    patterns = []
     LOGGER.debug("new PatternConfigBlock: %s", filenames)
 
     while config_lines and is_indented(config_lines[0]):
@@ -299,34 +339,38 @@ def consume_logfile_definition(config_lines):
             cont_list = []
             rewrite_list = []
             pattern = (level, raw_pattern, cont_list, rewrite_list)
-            logfiles.patterns.append(pattern)
+            patterns.append(pattern)
             LOGGER.debug("pattern %s", pattern)
 
         else:
             raise ValueError("Invalid level in pattern line %r" % line)
 
-    return logfiles
+    return PatternConfigBlock(filenames, patterns)
 
 
-def read_config(files, debug=False):
+def read_config(config_lines, files, debug=False):
+    # type: (Iterable[text_type], Iterable[str], bool) -> tuple[GlobalOptions, list[PatternConfigBlock], list[ClusterConfigBlock]]
     """
     Read logwatch.cfg (patterns, cluster mapping, etc.).
-
-    Side effect: Reads filesystem files logwatch.cfg and /logwatch.d/*.cfg
 
     Returns configuration as list. List elements are namedtuples.
     Namedtuple either describes logile patterns and is PatternConfigBlock(files, patterns).
     Or tuple describes optional cluster mapping and is ClusterConfigBlock(name, ips_or_subnets)
     with ips as list of strings.
     """
-    LOGGER.debug("Config files: %r", files)
+    config_lines = [l.rstrip() for l in config_lines if not is_comment(l) and not is_empty(l)]
+    if debug and not config_lines:
+        # We need at least one config file *with* content in one of the places:
+        # logwatch.d or MK_CONFDIR
+        raise IOError("Did not find any content in config files: %s" % ", ".join(files))
 
     logfiles_configs = []
     cluster_configs = []
-    config_lines = list(iter_config_lines(files, debug=debug))
+    global_options = GlobalOptions()
 
     # parsing has to consider the following possible lines:
     # - comment lines (begin with #)
+    # - global options (block begins with "GLOBAL OPTIONS")
     # - logfiles line (begin not with #, are not empty and do not contain CLUSTER)
     # - cluster lines (begin with CLUSTER)
     # - logfiles patterns (follow logfiles lines, begin with whitespace)
@@ -338,6 +382,9 @@ def read_config(files, debug=False):
         if is_indented(first_line):
             raise ValueError("Missing block definition for line %r" % first_line)
 
+        if first_line.startswith("GLOBAL OPTIONS"):
+            global_options = consume_global_options_block(config_lines)
+
         if first_line.startswith("CLUSTER "):
             cluster_configs.append(consume_cluster_definition(config_lines))
         else:
@@ -345,17 +392,19 @@ def read_config(files, debug=False):
 
     LOGGER.info("Logfiles configurations: %r", logfiles_configs)
     LOGGER.info("Optional cluster configurations: %r", cluster_configs)
-    return logfiles_configs, cluster_configs
+    return global_options, logfiles_configs, cluster_configs
 
 
 class State(object):  # pylint: disable=useless-object-inheritance
-    def __init__(self, filename, data=None):
+    def __init__(self, filename):
+        # type: (str) -> None
         super(State, self).__init__()
         self.filename = filename
-        self._data = data or {}
+        self._data = {}  # type: dict[text_type | binary_type, dict[str, Any]]
 
     @staticmethod
     def _load_line(line):
+        # type: (str) -> dict[str, Any]
         try:
             return ast.literal_eval(line)
         except (NameError, SyntaxError, ValueError):
@@ -364,10 +413,11 @@ class State(object):  # pylint: disable=useless-object-inheritance
             # These were used prior to to 1.7.0i1
             parts = line.split("|")
             filename, offset = parts[0], int(parts[1])
-            inode = int(parts[2]) if len(parts) >= 3 else -1
-            return {"file": filename, "offset": offset, "inode": inode}
+            file_id = int(parts[2]) if len(parts) >= 3 else -1
+            return {"file": filename, "offset": offset, "inode": file_id}
 
     def read(self):
+        # type: () -> State
         """Read state from file
         Support state files with the following structure:
         {'file': b'/var/log/messages', 'offset': 7767698, 'inode': 32455445}
@@ -386,6 +436,7 @@ class State(object):  # pylint: disable=useless-object-inheritance
         return self
 
     def write(self):
+        # type: () -> None
         LOGGER.debug("Writing state: %r", self._data)
         LOGGER.debug("State filename: %r", self.filename)
 
@@ -394,6 +445,7 @@ class State(object):  # pylint: disable=useless-object-inheritance
                 stat_fh.write(repr(data).encode("ascii") + b"\n")
 
     def get(self, key):
+        # type: (text_type | binary_type) -> dict[str, Any]
         return self._data.setdefault(key, {"file": key})
 
 
@@ -417,7 +469,7 @@ class LogLinesIter(object):  # pylint: disable=useless-object-inheritance
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, *exc_info):
         self.close()
         return False  # Do not swallow exceptions
 
@@ -490,6 +542,7 @@ class LogLinesIter(object):  # pylint: disable=useless-object-inheritance
         self._lines.insert(0, line)
 
     def next_line(self):
+        # type: () -> text_type | None
         if self._reached_end:  # optimization only
             return None
 
@@ -503,19 +556,19 @@ class LogLinesIter(object):  # pylint: disable=useless-object-inheritance
         return None
 
 
-def is_inode_capable(path):
-    system = platform.system()
-    if system == "Windows":
-        volume_name = "%s:\\\\" % path.split(":", 1)[0]
-        import win32api  # type: ignore[import] # pylint: disable=import-error
+def get_file_info(path):
+    stat = os.stat(path)
+    system = platform.system().lower()
+    if system == "windows":
+        return (stat.st_ctime_ns, stat.st_size)
+    if system in ("linux", "aix", "sunos"):
+        return (stat.st_ino, stat.st_size)
 
-        volume_info = win32api.GetVolumeInformation(volume_name)
-        volume_type = volume_info[-1]
-        return "ntfs" in volume_type.lower()
-    return system == "Linux"
+    return (1, stat.st_size)
 
 
 def get_formatted_line(line, level):
+    # type: (text_type, str) -> text_type
     formatted_line = "%s %s" % (level, line)
     if sys.stdout.isatty():
         formatted_line = "%s%s%s" % (
@@ -527,10 +580,12 @@ def get_formatted_line(line, level):
 
 
 def should_log_line_with_level(level, nocontext):
+    # type: (str, bool | None) -> bool
     return not (nocontext and level == ".")
 
 
-def process_logfile(section, filestate, debug):
+def process_logfile(section, filestate, debug):  # pylint: disable=too-many-branches
+    # type: (LogfileSection, dict[str, Any], object) -> tuple[text_type, list[text_type]]
     """
     Returns tuple of (
         logfile lines,
@@ -551,16 +606,14 @@ def process_logfile(section, filestate, debug):
     try:
         header = "[[[%s]]]\n" % section.name_write
 
-        stat = os.stat(section.name_fs)
-        inode = stat.st_ino if is_inode_capable(section.name_fs) else 1
-        # If we have never seen this file before, we set the inode to -1
-        prev_inode = filestate.get("inode", -1)
-        filestate["inode"] = inode
+        file_id, size = get_file_info(section.name_fs)
+        prev_file_id = filestate.get("inode", -1)
+        filestate["inode"] = file_id
 
         # Look at which file offset we have finished scanning the logfile last time.
         offset = filestate.get("offset")
         # Set the current pointer to the file end
-        filestate["offset"] = stat.st_size
+        filestate["offset"] = size
 
         # If we have never seen this file before, we do not want
         # to make a fuss about ancient log messages... (unless configured to)
@@ -571,19 +624,19 @@ def process_logfile(section, filestate, debug):
         # been started from new (logfile rotation). At least we must
         # assume that. In some rare cases (restore of a backup, etc)
         # we are wrong and resend old log messages
-        if prev_inode >= 0 and inode != prev_inode:
+        if prev_file_id >= 0 and file_id != prev_file_id:
             offset = None
 
         # Our previously stored offset is the current end ->
         # no new lines in this file
-        if offset == stat.st_size:
+        if offset == size:
             return header, []
 
         # If our offset is beyond the current end, the logfile has been
-        # truncated or wrapped while keeping the same inode. We assume
+        # truncated or wrapped while keeping the same file_id. We assume
         # that it contains all new data in that case and restart from
         # beginning.
-        if offset is not None and offset > stat.st_size:
+        if offset is not None and offset > size:
             offset = None
 
         # now seek to offset where interesting data begins
@@ -731,7 +784,8 @@ class Options(object):  # pylint: disable=useless-object-inheritance
     }
 
     def __init__(self):
-        self.values = {}
+        # type: () -> None
+        self.values = {}  # type: Dict
 
     @property
     def encoding(self):
@@ -763,6 +817,7 @@ class Options(object):  # pylint: disable=useless-object-inheritance
 
     @property
     def nocontext(self):
+        # type: () -> bool | None
         return self._attr_or_default("nocontext")
 
     @property
@@ -837,8 +892,15 @@ class Options(object):  # pylint: disable=useless-object-inheritance
             raise
 
 
+class GlobalOptions(object):  # pylint: disable=useless-object-inheritance
+    def __init__(self):
+        super(GlobalOptions, self).__init__()
+        self.retention_period = 60
+
+
 class PatternConfigBlock(object):  # pylint: disable=useless-object-inheritance
     def __init__(self, files, patterns):
+        # type: (Sequence[text_type], Sequence[tuple[text_type, text_type, Sequence[text_type], Sequence[text_type]]]) -> None
         super(PatternConfigBlock, self).__init__()
         self.files = files
         self.patterns = patterns
@@ -846,28 +908,14 @@ class PatternConfigBlock(object):  # pylint: disable=useless-object-inheritance
 
 class ClusterConfigBlock(object):  # pylint: disable=useless-object-inheritance
     def __init__(self, name, ips_or_subnets):
+        # type: (text_type, Sequence[text_type]) -> None
         super(ClusterConfigBlock, self).__init__()
         self.name = name
         self.ips_or_subnets = ips_or_subnets
 
 
-def _decode_to_unicode(match):
-    # (Union[bytes, unicode, str]) -> unicode
-    # we can't use 'surrogatereplace' because that a) is py3 only b) would fail upon re-encoding
-    # we can't use 'six': this code may be executed using Python 2.5/2.6
-    if sys.version_info[0] == 2:
-        # Python 2: str @Windows && @Linux
-        return (
-            match
-            if isinstance(match, unicode)  # pylint: disable=undefined-variable
-            else match.decode("utf8", "replace")
-        )
-
-    # Python 3: bytes @Linux and unicode @Windows
-    return match.decode("utf-8", "replace") if isinstance(match, bytes) else match
-
-
 def find_matching_logfiles(glob_pattern):
+    # type: (text_type) -> list[tuple[text_type | binary_type, text_type]]
     """
     Evaluate globbing pattern to a list of logfile IDs
 
@@ -889,7 +937,7 @@ def find_matching_logfiles(glob_pattern):
         # windows is the easy case:
         # provide unicode, and let python deal with the rest
         # (see https://www.python.org/dev/peps/pep-0277)
-        matches = list(glob.glob(glob_pattern))
+        matches = list(glob.glob(glob_pattern))  # type: Iterable[text_type | binary_type]
     else:
         # we can't use glob on unicode, as it would try to re-decode matches with ascii
         matches = glob.glob(glob_pattern.encode("utf8"))
@@ -901,7 +949,7 @@ def find_matching_logfiles(glob_pattern):
             continue
 
         # match is bytes in Linux and unicode/str in Windows
-        match_readable = _decode_to_unicode(match)
+        match_readable = ensure_text_type(match, errors="replace")
 
         file_refs.append((match, match_readable))
 
@@ -909,6 +957,7 @@ def find_matching_logfiles(glob_pattern):
 
 
 def _search_optimize_raw_pattern(raw_pattern):
+    # type: (text_type) -> text_type
     """return potentially stripped pattern for use with *search*
 
     Stripping leading and trailing '.*' avoids catastrophic backtracking
@@ -920,6 +969,7 @@ def _search_optimize_raw_pattern(raw_pattern):
 
 
 def _compile_continuation_pattern(raw_pattern):
+    # type: (text_type) -> int | re.Pattern
     try:
         return int(raw_pattern)
     except (ValueError, TypeError):
@@ -928,36 +978,45 @@ def _compile_continuation_pattern(raw_pattern):
 
 class LogfileSection(object):  # pylint: disable=useless-object-inheritance
     def __init__(self, logfile_ref):
+        # type: (tuple[text_type | binary_type, text_type]) -> None
         super(LogfileSection, self).__init__()
         self.name_fs = logfile_ref[0]
         self.name_write = logfile_ref[1]
         self.options = Options()
-        self.patterns = []
-        self._compiled_patterns = None
+        self.patterns = (
+            []
+        )  # type: list[tuple[text_type, text_type, Sequence[text_type], Sequence[text_type]]]
+        self._compiled_patterns = (
+            None
+        )  # type: list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]] | None
 
     @property
     def compiled_patterns(self):
+        # type: () -> list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]]
         if self._compiled_patterns is not None:
             return self._compiled_patterns
 
-        compiled_patterns = []
+        compiled_patterns = (
+            []
+        )  # type: list[tuple[text_type, re.Pattern, Sequence[re.Pattern | int], Sequence[text_type]]]
         for level, raw_pattern, cont_list, rewrite_list in self.patterns:
             if not rewrite_list:
                 # it does not matter what the matched group is in this case
                 raw_pattern = _search_optimize_raw_pattern(raw_pattern)
             compiled = re.compile(raw_pattern, re.UNICODE)
-            cont_list = [_compile_continuation_pattern(cp) for cp in cont_list]
-            compiled_patterns.append((level, compiled, cont_list, rewrite_list))
+            cont_list_comp = [_compile_continuation_pattern(cp) for cp in cont_list]
+            compiled_patterns.append((level, compiled, cont_list_comp, rewrite_list))
 
         self._compiled_patterns = compiled_patterns
         return self._compiled_patterns
 
 
 def parse_sections(logfiles_config):
+    # type: (Iterable[PatternConfigBlock]) -> tuple[list[LogfileSection], list[text_type]]
     """
     Returns a list of LogfileSections and and a list of non-matching patterns.
     """
-    found_sections = {}  # type: dict
+    found_sections = {}  # type: dict[text_type | binary_type, LogfileSection]
     non_matching_patterns = []
 
     for cfg in logfiles_config:
@@ -1043,6 +1102,7 @@ def _subnetwork_to_ip_range(subnetwork):
 
 
 def _filter_maxoutputsize(lines, maxoutputsize):
+    # type: (Iterable[text_type], int) -> Iterable[text_type]
     """Produce lines right *before* maxoutputsize is exceeded"""
     bytecount = 0
     for line in lines:
@@ -1053,6 +1113,7 @@ def _filter_maxoutputsize(lines, maxoutputsize):
 
 
 def _filter_maxcontextlines(lines_list, before, after):
+    # type: (Sequence[text_type], int, int) -> Iterable[text_type]
     """Only produce lines from a limited context
 
     Think of grep's -A and -B options
@@ -1073,6 +1134,7 @@ def _filter_maxcontextlines(lines_list, before, after):
 
 
 def _filter_consecutive_duplicates(lines, nocontext):
+    # type: (Iterable[text_type], bool | None) -> Iterable[text_type]
     """
     Filters out consecutive duplicated lines and adds a context line (if nocontext=False) with the
     number of removed lines for every chunk of removed lines
@@ -1106,51 +1168,103 @@ def _filter_consecutive_duplicates(lines, nocontext):
         current_line = next_line
 
 
-def write_output(header, lines, options):
+def filter_output(lines, options):
+    # type: (Sequence[text_type], Options) -> Iterable[text_type]
+    lines_filtered = (
+        _filter_maxcontextlines(lines, *options.maxcontextlines)
+        if options.maxcontextlines
+        else lines
+    )
 
-    if options.maxcontextlines:
-        lines = _filter_maxcontextlines(lines, *options.maxcontextlines)
-
-    lines = _filter_maxoutputsize(lines, options.maxoutputsize)
+    lines_filtered = _filter_maxoutputsize(lines_filtered, options.maxoutputsize)
 
     if options.skipconsecutiveduplicated:
-        lines = _filter_consecutive_duplicates(lines, options.nocontext)
+        lines_filtered = _filter_consecutive_duplicates(lines_filtered, options.nocontext)
 
-    sys.stdout.write(header)
-    sys.stdout.writelines(map(ensure_str, lines))
+    return lines_filtered
 
 
-def main(argv=None):
+def _is_outdated_batch(batch_file, retention_period, now):
+    # type: (str, float, float) -> bool
+    return now - os.stat(batch_file).st_mtime > retention_period
+
+
+def write_batch_file(lines, batch_id, batch_dir):
+    # type: (Iterable[str], str, str) -> None
+    with open(os.path.join(batch_dir, "logwatch-batch-file-%s" % batch_id), "w") as handle:
+        handle.writelines([ensure_text_type(l, errors="replace") for l in lines])
+
+
+def _ip_to_dir(ip_addr):
+    return ip_addr.replace(":", "_") if os.name == "nt" else ip_addr
+
+
+def process_batches(current_batch, current_batch_id, remote, retention_period, now):
+    # type: (Collection[str], str, str, float, float) -> None
+    batch_dir = os.path.join(MK_VARDIR, "logwatch-batches", _ip_to_dir(remote))
+
+    try:
+        os.makedirs(batch_dir)
+    except OSError as os_err:
+        if os_err.errno != 17:  # 17 means exists
+            raise
+
+    pre_existing_batch_files = os.listdir(batch_dir)
+
+    write_batch_file(current_batch, current_batch_id, batch_dir)
+
+    sys.stdout.write("<<<logwatch>>>\n")
+    sys.stdout.writelines(current_batch)
+
+    for base_name in pre_existing_batch_files:
+        batch_file = os.path.join(batch_dir, base_name)
+        try:
+            if _is_outdated_batch(batch_file, retention_period, now):
+                os.unlink(batch_file)
+            else:
+                with open(batch_file) as fh:
+                    sys.stdout.writelines([ensure_str(l) for l in fh])
+                continue
+        except EnvironmentError:
+            pass
+
+
+def main(argv=None):  # pylint: disable=too-many-branches
     if argv is None:
         argv = sys.argv
 
     args = ArgsParser(argv)
     init_logging(args.verbosity)
-
-    sys.stdout.write("<<<logwatch>>>\n")
+    now = int(time.time())
+    batch_id = "%s-%s" % (now, "".join("%03d" % int(b) for b in bytearray(os.urandom(16))))
 
     try:
         files = get_config_files(MK_CONFDIR, config_file_arg=args.config)
-        logfiles_config, cluster_config = read_config(files, args.debug)
+        global_options, logfiles_config, cluster_config = read_config(
+            iter_config_lines(files), files, args.debug
+        )
     except Exception as exc:
         if args.debug:
             raise
-        sys.stdout.write(CONFIG_ERROR_PREFIX + "%s\n" % exc)
+        sys.stdout.write("<<<logwatch>>>\n%s%s\n" % (CONFIG_ERROR_PREFIX, exc))
         sys.exit(1)
 
-    status_filename = get_status_filename(cluster_config)
+    status_filename = get_status_filename(cluster_config, REMOTE)
     # Copy the last known state from the logwatch.state when there is no status_filename yet.
     if not os.path.exists(status_filename) and os.path.exists("%s/logwatch.state" % MK_VARDIR):
         shutil.copy("%s/logwatch.state" % MK_VARDIR, status_filename)
 
     found_sections, non_matching_patterns = parse_sections(logfiles_config)
 
-    for pattern in non_matching_patterns:
-        # Python 2.5/2.6 compatible solution
-        if sys.version_info[0] == 3:
-            sys.stdout.write("[[[%s:missing]]]\n" % pattern)
-        else:
-            sys.stdout.write(("[[[%s:missing]]]\n" % pattern).encode("utf-8"))
+    output = (
+        str(
+            "[[[%s:missing]]]\n" % pattern
+            if sys.version_info[0] == 3
+            # Python 2.5/2.6 compatible solution
+            else ("[[[%s:missing]]]\n" % pattern).encode("utf-8")
+        )
+        for pattern in non_matching_patterns
+    )  # type: Iterable[str | text_type]
 
     state = State(status_filename)
     try:
@@ -1166,12 +1280,29 @@ def main(argv=None):
     for section in found_sections:
         filestate = state.get(section.name_fs)
         try:
-            header, output = process_logfile(section, filestate, args.debug)
-            write_output(header, output, section.options)
+            header, log_lines = process_logfile(section, filestate, args.debug)
+            filtered_log_lines = filter_output(log_lines, section.options)
         except Exception as exc:
             if args.debug:
                 raise
             LOGGER.debug("Exception when processing %r: %s", section.name_fs, exc)
+
+        output = itertools.chain(
+            output,
+            [
+                header,
+                "BATCH: %s\n" % batch_id,
+            ],
+            filtered_log_lines,
+        )
+
+    process_batches(
+        [ensure_str(l) for l in output],
+        batch_id,
+        REMOTE,
+        global_options.retention_period,
+        now,
+    )
 
     if args.debug:
         LOGGER.debug("State file not written (debug mode)")

@@ -19,6 +19,7 @@ import requests.exceptions
 import tests.testlib as testlib
 from tests.testlib.utils import (
     cmk_path,
+    current_base_branch_name,
     get_cmk_download_credentials,
     get_cmk_download_credentials_file,
 )
@@ -27,7 +28,8 @@ import docker  # type: ignore[import]
 
 build_path = os.path.join(testlib.repo_path(), "docker")
 image_prefix = "docker-tests"
-branch_name = os.environ.get("BRANCH", "master")
+branch_name = os.environ.get("BRANCH", current_base_branch_name())
+distro_codename = "jammy"
 
 logger = logging.getLogger()
 
@@ -51,11 +53,11 @@ def client():
 
 
 def _image_name(version):
-    return "docker-tests/check-mk-%s-%s-%s" % (version.edition(), branch_name, version.version)
+    return "docker-tests/check-mk-%s-%s" % (version.edition(), version.version)
 
 
 def _package_name(version: testlib.CMKVersion) -> str:
-    return f"check-mk-{version.edition()}-{version.version}_0.buster_amd64.deb"
+    return f"check-mk-{version.edition()}-{version.version}_0.{distro_codename}_amd64.deb"
 
 
 def _prepare_build():
@@ -186,6 +188,7 @@ def _build(request, client, version, prepare_package=True):
         "CMK_LIVESTATUS_TCP=",
         "CMK_PASSWORD=",
         "MAIL_RELAY_HOST=",
+        "CMK_CONTAINERIZED=TRUE",
     ]
 
     assert "Healthcheck" in config
@@ -416,7 +419,8 @@ def test_start_enable_mail(request, client):
     cmds = [p[-1] for p in c.top()["Processes"]]
 
     assert "syslogd" in cmds
-    assert "/usr/lib/postfix/sbin/master" in cmds
+    # Might have a param like `-w`
+    assert "/usr/lib/postfix/sbin/master" in " ".join(cmds)
 
     assert _exec_run(c, ["which", "mail"], user="cmk")[0] == 0
 

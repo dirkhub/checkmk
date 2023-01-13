@@ -211,15 +211,22 @@ def _parse_all(
 
 
 def _is_service_entry(entry: Sequence[Sequence[str]]) -> bool:
-    unit = entry[0][1]
+    try:
+        unit = entry[0][1]
+    except IndexError:
+        return False
     return unit.endswith(".service")
+
+
+def _is_new_entry(line: Sequence[str]) -> bool:
+    return (line[0] in _STATUS_SYMBOLS) and (len(line) > 3) and ("." in str(line[1]))
 
 
 def _parse_status(source: Iterator[Sequence[str]]) -> Mapping[str, UnitStatus]:
     unit_status = {}
     entry: list[Sequence[str]] = []
     for line in source:
-        if line[0] in _STATUS_SYMBOLS:
+        if _is_new_entry(line):
             if entry != [] and _is_service_entry(entry):
                 status = UnitStatus.from_entry(entry)
                 unit_status[status.name] = status
@@ -230,7 +237,7 @@ def _parse_status(source: Iterator[Sequence[str]]) -> Mapping[str, UnitStatus]:
         if line[0].startswith("[all]"):
             break
         entry.append(line)
-    if len(entry) > 1:
+    if len(entry) > 1 and _is_service_entry(entry):
         status = UnitStatus.from_entry(entry)
         unit_status[status.name] = status
 

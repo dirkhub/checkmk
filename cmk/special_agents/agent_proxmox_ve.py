@@ -22,6 +22,7 @@ information about VMs and nodes:
 # - https://pypi.org/project/proxmoxer/
 """
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -238,9 +239,15 @@ class BackupTask:
                 return match[0]
             return None
 
-        def duration_from_string(string: str) -> int:
-            duration_dt = datetime.strptime(string, "%H:%M:%S")
-            return duration_dt.hour * 3600 + duration_dt.minute * 60 + duration_dt.second
+        def duration_from_string(string: str) -> float:
+            """Return number of seconds from a string like HH:MM:SS
+            >>> duration_from_string("21:43:44")
+            78224.0
+            >>> duration_from_string("44:00:44")
+            158444.0
+            """
+            h, m, s = (int(x) for x in string.split(":"))
+            return timedelta(hours=h, minutes=m, seconds=s).total_seconds()
 
         for linenr, line in enumerate(logs):
             try:
@@ -586,15 +593,17 @@ def agent_proxmox_ve_main(args: Args) -> None:
                         },
                     }
                 )
-            with SectionWriter("proxmox_ve_mem_usage") as writer:
-                writer.append_json(
-                    {
-                        "mem": node["mem"],
-                        "max_mem": node["maxmem"],
-                    }
-                )
-            with SectionWriter("uptime", separator=None) as writer:
-                writer.append(node["uptime"])
+            if "mem" in node and "maxmem" in node:
+                with SectionWriter("proxmox_ve_mem_usage") as writer:
+                    writer.append_json(
+                        {
+                            "mem": node["mem"],
+                            "max_mem": node["maxmem"],
+                        }
+                    )
+            if "uptime" in node:
+                with SectionWriter("uptime", separator=None) as writer:
+                    writer.append(node["uptime"])
 
     for vmid, vm in all_vms.items():
         with ConditionalPiggybackSection(vm["name"]):
@@ -722,7 +731,13 @@ class ProxmoxVeSession:
 
     def get_api_element(self, path: str) -> Any:
         """do an API GET request"""
-        response_json = self.get_raw("api2/json/" + path).json()
+        response = self.get_raw("api2/json/" + path)
+        if response.status_code != requests.codes.ok:
+            return []
+        try:
+            response_json = response.json()
+        except json.JSONDecodeError as e:
+            raise RuntimeError("Couldn't parse API element %r" % path) from e
         if "errors" in response_json:
             raise RuntimeError("Could not fetch %r (%r)" % (path, response_json["errors"]))
         return response_json.get("data")

@@ -7,6 +7,8 @@
 # pylint: disable=redefined-outer-name
 import pytest
 
+from cmk.utils.version import is_plus_edition, is_raw_edition
+
 # Triggers plugin loading of plugins.wato which registers all the plugins
 import cmk.gui.wato
 import cmk.gui.watolib.host_attributes as attrs
@@ -270,18 +272,42 @@ expected_attributes = {
         "show_inherited_value": True,
         "topic": "Monitoring agents",
     },
-    "cmk_agent_connection": {
-        "depends_on_roles": [],
-        "depends_on_tags": ["checkmk-agent"],
-        "editable": True,
-        "from_config": False,
-        "show_in_folder": True,
-        "show_in_form": True,
-        "show_in_host_search": True,
-        "show_in_table": False,
-        "show_inherited_value": True,
-        "topic": "Monitoring agents",
-    },
+    **(
+        {
+            "cmk_agent_connection": {
+                "depends_on_roles": [],
+                "depends_on_tags": ["checkmk-agent"],
+                "editable": True,
+                "from_config": False,
+                "show_in_folder": True,
+                "show_in_form": True,
+                "show_in_host_search": True,
+                "show_in_table": False,
+                "show_inherited_value": True,
+                "topic": "Monitoring agents",
+            },
+        }
+        if is_plus_edition()
+        else {}
+    ),
+    **(
+        {
+            "bake_agent_package": {
+                "depends_on_roles": [],
+                "depends_on_tags": [],
+                "editable": True,
+                "from_config": False,
+                "show_in_folder": True,
+                "show_in_form": False,
+                "show_in_host_search": False,
+                "show_in_table": False,
+                "show_inherited_value": False,
+                "topic": "Monitoring agents",
+            },
+        }
+        if not is_raw_edition()
+        else {}
+    ),
     "tag_snmp_ds": {
         "depends_on_roles": [],
         "depends_on_tags": [],
@@ -520,7 +546,8 @@ def test_host_attributes(for_what, new):
         ],
         "monitoring_agents": [
             "tag_agent",
-            "cmk_agent_connection",
+            *(("cmk_agent_connection",) if is_plus_edition() else ()),
+            *(("bake_agent_package",) if not is_raw_edition() else ()),
             "tag_snmp_ds",
             "snmp_community",
             "tag_piggyback",

@@ -6,13 +6,16 @@
 """A few upgraded Fields which handle some OpenAPI validation internally."""
 import ast
 import json
+import logging
 import typing
+import uuid
 import warnings
 from datetime import datetime
 from typing import Any, Optional
 
 import pytz
-from cryptography.x509 import load_pem_x509_csr
+from cryptography.x509 import CertificateSigningRequest, load_pem_x509_csr
+from cryptography.x509.oid import NameOID
 from marshmallow import fields as _fields
 from marshmallow import post_load, pre_dump, utils, ValidationError
 from marshmallow_oneofschema import OneOfSchema  # type: ignore[import]
@@ -34,13 +37,16 @@ from cmk.gui.fields.base import BaseSchema, MultiNested, ValueTypedDictSchema
 from cmk.gui.fields.utils import attr_openapi_schema, collect_attributes, ObjectContext, ObjectType
 from cmk.gui.globals import user
 from cmk.gui.groups import GroupName, GroupType, load_group_information
-from cmk.gui.sites import allsites
+from cmk.gui.sites import configured_sites
 from cmk.gui.watolib.passwords import contact_group_choices, password_exists
 
 from cmk.fields import base, DateTime
 
 if version.is_managed_edition():
     import cmk.gui.cme.managed as managed  # pylint: disable=no-name-in-module
+
+
+_logger = logging.getLogger(__name__)
 
 
 class PythonString(base.String):
@@ -102,7 +108,7 @@ class PythonString(base.String):
 
 # NOTE
 # All these non-capturing match groups are there to properly distinguish the alternatives.
-FOLDER_PATTERN = r"(?:(?:[~\\\/]|(?:[~\\\/][-_ a-zA-Z0-9.]+)+)|[0-9a-fA-F]{32})"
+FOLDER_PATTERN = r"(?:(?:[~\\\/]|(?:[~\\\/][-_ a-zA-Z0-9.]+)+[~\\\/]?)|[0-9a-fA-F]{32})"
 
 
 class FolderField(base.String):
@@ -153,6 +159,9 @@ class FolderField(base.String):
             >>> FolderField._normalize_folder("~foo~bar")
             '/foo/bar'
 
+            >>> FolderField._normalize_folder("/foo/bar/")
+            '/foo/bar'
+
         Returns:
             The normalized representation.
 
@@ -165,6 +174,8 @@ class FolderField(base.String):
             if prev == folder_id:
                 break
             prev = folder_id
+        if len(folder_id) > 1 and folder_id.endswith("/"):
+            folder_id = folder_id[:-1]
         return folder_id
 
     @classmethod
@@ -196,6 +207,10 @@ class FolderField(base.String):
 
     def _serialize(self, value, attr, obj, **kwargs) -> typing.Optional[str]:
         if isinstance(value, str):
+            if not value.startswith("/"):
+                value = f"/{value}"
+            if len(value) > 1 and value.endswith("/"):
+                value = value[:-1]
             return value
 
         if isinstance(value, watolib.CREFolder):
@@ -388,6 +403,7 @@ ColumnTypes = typing.Union[Column, str]
 
 def column_field(
     table: typing.Type[Table],
+    example: typing.List[str],
     required: bool = False,
     mandatory: Optional[typing.List[ColumnTypes]] = None,
 ) -> "_ListOfColumns":
@@ -407,6 +423,7 @@ def column_field(
         load_default=[getattr(table, col) for col in column_names],
         description=f"The desired columns of the `{table.__tablename__}` table. If left empty, a "
         "default set of columns is used.",
+        example=example,
     )
 
 
@@ -595,42 +612,74 @@ def host_is_monitored(host_name: str) -> bool:
     return bool(Query([Hosts.name], Hosts.name == host_name).first_value(sites.live()))
 
 
-def validate_custom_host_attributes(data: dict[str, str]) -> dict[str, str]:
-    for name, value in data.items():
+def validate_custom_host_attributes(
+    host_attributes: dict[str, str],
+    errors: typing.Literal["warn", "raise"],
+) -> dict[str, str]:
+    """Validate only custom host attributes
+
+    Args:
+        host_attributes:
+            The host attributes a dictionary with the attributes as keys (without any prefixes)
+            and the values as values.
+
+        errors:
+            Either `warn` or `raise`. When set to `warn`, errors will just be logged, when set to
+            `raise`, errors will lead to a ValidationError being raised.
+
+    Returns:
+        The data unchanged.
+
+    Raises:
+        ValidationError: when `errors` is set to `raise`
+
+    """
+    for name, value in host_attributes.items():
         try:
             attribute = watolib.host_attribute(name)
-        except KeyError:
-            raise ValidationError({name: f"No such attribute, {name!r}"}, field_name=name)
+        except KeyError as exc:
+            if errors == "raise":
+                raise ValidationError(
+                    {name: f"No such attribute, {name!r}"}, field_name=name
+                ) from exc
 
-        if attribute.topic() != watolib.host_attributes.HostAttributeTopicCustomAttributes:
-            raise ValidationError({name: f"{name} is not a custom host attribute."})
+            _logger.error("No such attribute: %s", name)
+            return host_attributes
 
         try:
             attribute.validate_input(value, "")
         except MKUserError as exc:
-            raise ValidationError(str(exc))
+            if errors == "raise":
+                raise ValidationError({name: str(exc)}) from exc
 
-    return data
+            _logger.error("Error validating %s: %s", name, str(exc))
+
+    return host_attributes
 
 
-class CustomHostAttributes(ValueTypedDictSchema):
+def ensure_string(value):
+    if not isinstance(value, str):
+        raise ValidationError(f"Not a string, but a {type(value).__name__}")
+
+
+class CustomAttributes(ValueTypedDictSchema):
     value_type = ValueTypedDictSchema.field(
-        base.String(description="Each tag is a mapping of string to string")
+        base.String(
+            description="Each tag is a mapping of string to string",
+            validate=ensure_string,
+        )
     )
 
     @post_load
-    def _valid(self, data, **kwargs):
-        return validate_custom_host_attributes(data)
-
-
-class CustomFolderAttributes(ValueTypedDictSchema):
-    value_type = ValueTypedDictSchema.field(
-        base.String(description="Each tag is a mapping of string to string")
-    )
-
-    @post_load
-    def _valid(self, data, **kwargs):
-        return validate_custom_host_attributes(data)
+    def _valid(self, data: dict[str, Any], **kwargs) -> dict[str, Any]:
+        # NOTE
+        # If an attribute gets deleted AFTER it has already been set to a host or a folder,
+        # then this would break here. We therefore can't validate outbound data as thoroughly
+        # because our own data can be inherently inconsistent.
+        if self.context["direction"] == "outbound":  # pylint: disable=no-else-return
+            return validate_custom_host_attributes(data, "warn")
+        else:
+            return validate_custom_host_attributes(data, "raise")
 
 
 class TagGroupAttributes(ValueTypedDictSchema):
@@ -731,6 +780,7 @@ class TagGroupAttributes(ValueTypedDictSchema):
 def attributes_field(
     object_type: ObjectType,
     object_context: ObjectContext,
+    direction: typing.Literal["inbound", "outbound"],
     description: Optional[str] = None,
     example: Optional[Any] = None,
     required: bool = False,
@@ -746,6 +796,9 @@ def attributes_field(
 
         object_context:
             May be 'create' or 'update'. Deletion is considered as 'update'.
+
+        direction:
+            If the data is *coming from* the user (inbound) or *going to* the user (outbound).
 
         description:
             A descriptive text of this field. Required.
@@ -770,19 +823,14 @@ def attributes_field(
         # clarify this here by force.
         raise ValueError("description is necessary.")
 
-    custom_schema = {
-        "host": CustomHostAttributes,
-        "cluster": CustomHostAttributes,
-        "folder": CustomFolderAttributes,
-    }
     if not names_only:
         return MultiNested(
             [
                 attr_openapi_schema(object_type, object_context),
-                custom_schema[object_type],
+                CustomAttributes,
                 TagGroupAttributes,
             ],
-            metadata={"context": {"object_context": object_context}},
+            metadata={"context": {"object_context": object_context, "direction": direction}},
             merged=True,  # to unify both models
             description=description,
             example=example,
@@ -809,11 +857,37 @@ def attributes_field(
 class SiteField(base.String):
     """A field representing a site name."""
 
-    default_error_messages = {"unknown_site": "Unknown site {site!r}"}
+    default_error_messages = {
+        "should_exist": "The site {site!r} should exist but it doesn't.",
+        "should_not_exist": "The site {site!r} should not exist but it does.",
+    }
+
+    def __init__(
+        self,
+        presence: typing.Literal[
+            "should_exist", "should_not_exist", "might_not_exist", "ignore"
+        ] = "should_exist",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.presence = presence
 
     def _validate(self, value):
-        if value not in allsites().keys():
-            raise self.make_error("unknown_site", site=value)
+        if self.presence == "might_not_exist":
+            return
+
+        if self.presence == "should_exist":
+            if value not in configured_sites().keys():
+                raise self.make_error("should_exist", site=value)
+
+        if self.presence == "should_not_exist":
+            if value in configured_sites().keys():
+                raise self.make_error("should_not_exist", site=value)
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if self.presence == "might_not_exist" and value not in configured_sites().keys():
+            return "Unknown Site: " + value
+        return super()._serialize(value, attr, obj, **kwargs)
 
 
 def customer_field(**kw):
@@ -954,8 +1028,11 @@ class PasswordIdent(base.String):
             **kwargs,
         )
 
-    def _validate(self, value):
+    def _validate(self, value: str):
         super()._validate(value)
+
+        if ":" in value:
+            raise self.make_error("contains_colon", name=value)
 
         exists = password_exists(value)
         if self._should_exist and not exists:
@@ -1088,17 +1165,30 @@ class Timestamp(DateTime):
         return datetime.timestamp(val)
 
 
-class X509ReqPEMField(base.String):
+class X509ReqPEMFieldUUID(base.String):
     default_error_messages = {
         "malformed": "Malformed CSR",
         "invalid": "Invalid CSR (signature and public key do not match)",
+        "no_cn": "CN is missing",
+        "cn_no_uuid": "CN {cn} is no valid version-4 UUID",
     }
 
-    def _validate(self, value):
+    def _validate(self, value: CertificateSigningRequest) -> None:
         if not value.is_signature_valid:
             raise self.make_error("invalid")
+        try:
+            cn = value.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        except IndexError:
+            raise self.make_error("no_cn")
+        try:
+            uuid.UUID(
+                cn,
+                version=4,
+            )
+        except ValueError:
+            raise self.make_error("cn_no_uuid", cn=cn)
 
-    def _deserialize(self, value, attr, data, **kwargs):
+    def _deserialize(self, value, attr, data, **kwargs) -> CertificateSigningRequest:
         try:
             return load_pem_x509_csr(
                 super()
@@ -1132,5 +1222,5 @@ __all__ = [
     "query_field",
     "SiteField",
     "Timestamp",
-    "X509ReqPEMField",
+    "X509ReqPEMFieldUUID",
 ]

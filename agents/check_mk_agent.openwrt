@@ -258,7 +258,7 @@ section_cpu() {
 
 section_checkmk() {
     echo "<<<check_mk>>>"
-    echo "Version: 2.1.0b9"
+    echo "Version: 2.1.0p20"
     echo "AgentOS: openwrt"
     echo "Hostname: $(hostname)"
     echo "AgentDirectory: ${MK_CONFDIR}"
@@ -293,15 +293,23 @@ section_cmk_agent_ctl_status() {
     cmk-agent-ctl --version 2>/dev/null >&2 || return
 
     printf "<<<cmk_agent_ctl_status:sep(0)>>>\n"
-    cmk-agent-ctl status --json
+    cmk-agent-ctl status --json --no-query-remote
 }
 
 section_checkmk_agent_plugins() {
     printf "<<<checkmk_agent_plugins_lnx:sep(0)>>>\n"
     printf "pluginsdir %s\n" "${PLUGINSDIR}"
     printf "localdir %s\n" "${LOCALDIR}"
-    grep -r '^__version__' "${LOCALDIR}" "${PLUGINSDIR}"
-    grep -r '^CMK_VERSION' "${LOCALDIR}" "${PLUGINSDIR}"
+    for script in \
+        "${PLUGINSDIR}"/* \
+        "${PLUGINSDIR}"/[1-9]*/* \
+        "${LOCALDIR}"/* \
+        "${LOCALDIR}"/[1-9]*/*; do
+        if is_valid_plugin "${script}"; then
+            script_version=$(grep -e '^__version__' -e '^CMK_VERSION' "${script}" || echo 'CMK_VERSION="unversioned"')
+            printf "%s:%s\n" "${script}" "${script_version}"
+        fi
+    done
 }
 
 section_checkmk_failed_plugin() {
@@ -842,6 +850,32 @@ section_veritas_vcs() {
 # BEGIN COMMON AGENT CODE
 #
 
+section_job() {
+    # Get statistics about monitored jobs.
+
+    _cat_files() {
+        # read file names from stdin and write like `head -n -0 -v file`
+        while read -r file; do
+            printf "==> %s <==\n" "${file##./}"
+            cat "${file}"
+        done
+    }
+
+    (
+        cd "${MK_VARDIR}/job" 2>/dev/null || return
+        printf "<<<job>>>\n"
+        for user in *; do
+            (
+                cd "${user}" 2>/dev/null || return # return from subshell only
+                # This folder is owned (and thus writable) by the user that ran the jobs.
+                # The agent (root) must not read files that are not owned by the user.
+                # This prevents symlink or hardlink attacks.
+                find -L . -type f -user "${user}" | _cat_files
+            )
+        done
+    )
+}
+
 section_fileinfo() {
     # fileinfo check: put patterns for files into /etc/check_mk/fileinfo.cfg
     perl -e '
@@ -861,19 +895,20 @@ section_fileinfo() {
     }
     exit if ! @patterns;
 
-    print "<<<fileinfo:sep(124)>>>\n", time, "\n[[[header]]]\nname|status|size|time\n[[[content]]]\n";
-
+    my $file_stats = "";
     foreach (@patterns) {
         foreach (bsd_glob("$_")) {
             if (! -f) {
-                print "$_|missing\n" if ! -d;
+                $file_stats .= "$_|missing\n" if ! -d;
             } elsif (my @infos = stat) {
-                print "$_|ok|$infos[7]|$infos[9]\n";
+                $file_stats .= "$_|ok|$infos[7]|$infos[9]\n";
             } else {
-                print "$_|stat failed: $!\n";
+                $file_stats .= "$_|stat failed: $!\n";
             }
         }
     }
+
+    print "<<<fileinfo:sep(124)>>>\n", time, "\n[[[header]]]\nname|status|size|time\n[[[content]]]\n$file_stats";
     ' -- "${MK_CONFDIR}"
 }
 
@@ -894,29 +929,6 @@ section_livestatus_status() {
             fi
         done
     fi
-}
-
-# Get statistics about monitored jobs. Below the job directory there
-# is a sub directory per user that ran a job. That directory must be
-# owned by the user so that a symlink or hardlink attack for reading
-# arbitrary files can be avoided.
-section_job() {
-    (
-        cd ${MK_VARDIR}/job 2>/dev/null || return
-        echo '<<<job>>>'
-        for username in *; do
-            (
-                # the return below only terminates the subshell, not the entire function
-                cd "${username}" 2>/dev/null || return
-                if [ "$(id -u)" -eq 0 ]; then
-                    su -s "${SHELL}" "${username}" -c "head -n -0 -v *"
-                else
-                    head -n -0 -v ./*
-                fi
-                cd ..
-            )
-        done
-    )
 }
 
 section_lnx_thermal() {
@@ -1044,66 +1056,75 @@ run_real_time_checks() {
 #   NAME is the cache file name
 #   MAXAGE is the maximum cache livetime in seconds
 run_cached() {
-    local NAME MAXAGE NOW MTIME AGE
     NAME="${1}"
     MAXAGE="${2}"
+    shift 2
 
     if ${DISABLE_CACHING:-false}; then
         # We need the re-splitting to be compatible with the caching case, so:
-        # shellcheck disable=SC2068
-        $@
+        # shellcheck disable=SC2048
+        $*
         return
     fi
 
-    if [ ! -d ${MK_VARDIR}/cache ]; then mkdir -p ${MK_VARDIR}/cache; fi
+    # ideally, these should be independent parameters:
+    TIMEOUT=$((MAXAGE * 2))
+    REFRESH_INTERVAL="${MAXAGE}"
+
+    [ -d "${MK_VARDIR}/cache" ] || mkdir -p "${MK_VARDIR}/cache"
     CACHEFILE="${MK_VARDIR}/cache/${NAME}.cache"
 
-    NOW=$(get_epoch)
+    NOW="$(get_epoch)"
+    MTIME="$(get_file_mtime "${CACHEFILE}" 2>/dev/null)" || MTIME=0
 
-    # Check if the creation of the cache takes suspiciously long and return
-    # nothing if the age (access time) of ${CACHEFILE}.new is twice the MAXAGE
-    if [ -e "${CACHEFILE}.new" ]; then
-        if [ $((NOW - $(get_file_atime "${CACHEFILE}.new"))) -ge $((MAXAGE * 2)) ]; then
-            # Kill the process still accessing that file in case
-            # it is still running. This avoids overlapping processes!
-            fuser -k -9 "${CACHEFILE}.new" >/dev/null 2>&1
-            rm -f "${CACHEFILE}.new"
-            return
+    if ${MK_RUN_SYNC_PARTS} && [ -s "${CACHEFILE}" ]; then
+
+        # Output the file (even if it is outdated)
+        CACHE_INFO="cached(${MTIME},${MAXAGE})"
+        # prefix or insert cache info, unless already present.
+        # WATCH OUT: AIX does not allow us to pass this as a single '-e' option!
+        if [ "${NAME%%_*}" = "local" ] || [ "${NAME%%_*}" = "mrpe" ]; then
+            sed -e '/^<<<.*>>>/{p;d;}' -e "/^cached([0-9]*,[0-9]*) /{p;d;}; s/^/${CACHE_INFO} /" "${CACHEFILE}"
+        else
+            sed -e '/^<<<.*\(:cached(\).*>>>/{p;d;}' -e 's/^<<<\([^>]*\)>>>$/<<<\1:'"${CACHE_INFO}"'>>>/' "${CACHEFILE}"
         fi
+
     fi
 
-    # Check if cache file exists and is recent enough
-    if [ -s "${CACHEFILE}" ]; then
-        MTIME=$(get_file_mtime "${CACHEFILE}")
-        AGE=$((NOW - MTIME))
-        if [ ${AGE} -le "${MAXAGE}" ]; then local USE_CACHEFILE=1; fi
+    if ${MK_RUN_ASYNC_PARTS}; then
 
-        if ${MK_RUN_SYNC_PARTS}; then
-            # Output the file even if it is outdated.
-            CACHE_INFO="cached(${MTIME},${MAXAGE})"
-            if [ "${NAME%%_*}" = "local" ]; then
-                # prefix CACHE_INFO, but skip any headers and lines with existing CACHE_INFO
-                sed -e "/^<<<.*>>>/{p;d;}; /^cached([0-9]*,[0-9]*) /{p;d;}; s/^/${CACHE_INFO} /" "${CACHEFILE}"
-            else
-                # insert CACHE_INFO in the header, but skip headers with existing CACHE_INFO
-                sed -e '/^<<<.*\(:cached(\).*>>>/{p;d;}; s/^<<<\([^>]*\)>>>$/<<<\1:'"${CACHE_INFO}"'>>>/' "${CACHEFILE}"
+        # Check if the process is running too long (cache file not accessed for more than TIMEOUT seconds).
+        # If so, kill the process and remove the cache files (both)
+        for cfile in "${CACHEFILE}.new."*; do
+            [ -e "${cfile}" ] || break # no match
+            if [ $((NOW - $(get_file_atime "${cfile}"))) -ge "${TIMEOUT}" ]; then
+                kill -9 "${cfile##*.new.}" # TODO: what about child processes?
+                rm -f "${cfile}" "${CACHEFILE}"
             fi
-        fi
-    fi
+        done
 
-    ${MK_RUN_ASYNC_PARTS} || return
+        # This does the right thing, regardless whether the pattern matches!
+        _cfile_in_use() {
+            for cfile in "${CACHEFILE}.new."*; do
+                printf "%s\n" "${cfile}"
+                break
+            done
+        }
 
-    # Cache file outdated and new job not yet running? Start it
-    if [ -z "${USE_CACHEFILE}" ] && [ ! -e "${CACHEFILE}.new" ]; then
-        # When the command fails, the output is thrown away
-        # TODO: This won't work: do we even have bash?
-        cat <<HERE | nohup bash >/dev/null 2>&1 &
-set -o noclobber
+        # Time to refresh cache file and new job not yet running?
+        if [ $((NOW - MTIME)) -gt "${REFRESH_INTERVAL}" ] && [ ! -e "$(_cfile_in_use)" ]; then
+            THIS_SHELL="$(ps -o args= -p $$ | cut -d' ' -f1)"
+            # Start it. If the command fails the output is thrown away
+            cat <<HERE | nohup "${THIS_SHELL}" >/dev/null 2>&1 &
 eval '${MK_DEFINE_LOG_SECTION_TIME}'
-exec > "${CACHEFILE}.new" || exit 1
-$* && mv "${CACHEFILE}.new" "${CACHEFILE}" || rm -f "${CACHEFILE}" "${CACHEFILE}.new"
+exec > "${CACHEFILE}.new.\$\$" || exit 1
+$* && mv -f "${CACHEFILE}.new.\$\$" "${CACHEFILE}" || rm -f "${CACHEFILE}" "${CACHEFILE}.new.\$\$"
 HERE
+        fi
+
     fi
+
+    unset NAME MAXAGE TIMEOUT REFRESH_INTERVAL CACHEFILE NOW MTIME CACHE_INFO
 }
 
 #
@@ -1338,6 +1359,8 @@ main_setup() {
     set_up_get_epoch
 
     set_variable_defaults
+
+    set_up_profiling
 
     unset_locale
 

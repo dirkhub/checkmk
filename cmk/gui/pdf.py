@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright (C) 2019 tribe29 GmbH - License: Checkmk Enterprise License
+# Copyright (C) 2019 tribe29 GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
@@ -1286,7 +1286,7 @@ class TableRenderer:
 # Note: all dimensions this objects handles with are in mm! This is due
 # to the fact that this API is also available externally
 class TextCell:
-    def __init__(self, csses, text):
+    def __init__(self, csses: Optional[str], text):
         self._text = text
         self._bold = False
         self._color = black
@@ -1296,26 +1296,43 @@ class TextCell:
         if csses is None:
             csses = ""
 
+        # Currently it's nearly impossible to make sure that csses is always a
+        # list so we keep the old behaviour here and create a list for further
+        # processing.
+        # TODO improve this in master, typing is already way better there but
+        # did not recognized the error yet
+        csses_list: List[str] = csses.split()
+        state_in_css: bool = any(
+            css.startswith("hstate")
+            or css.startswith("state")
+            or css.startswith("svcstate")
+            or css.startswith("if_state")
+            for css in csses_list
+        )
+
         # TODO: Sollte das nicht lieber raus aus dem allgemeinen pdf.py? Ist eigentlich
         # Spezifisch für Views, etc.
-        if "heading" in csses or "state" in csses:
+        if "heading" in csses_list or state_in_css:
             self._bold = True
 
-        if "number" in csses:
+        if "number" in csses_list:
             self._alignment = "right"
 
-        if "unused" in csses:
+        if "count" in csses_list:
+            self._alignment = "center"
+
+        if "unused" in csses_list:
             self._color = (0.6, 0.6, 0.6)
 
-        elif "leftheading" in csses:
+        elif "leftheading" in csses_list:
             self._bg_color = lightgray
 
         for css, color in css_class_colors.items():
-            if css in csses:
+            if css in csses_list:
                 self._bg_color = color
                 self._alignment = "center"
 
-        self._narrow = "narrow" in csses or "state" in csses
+        self._narrow = "narrow" in csses_list or state_in_css
 
     def minimal_width(self, pdfdoc):  # without padding
         # TODO: consider bold here!

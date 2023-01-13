@@ -50,6 +50,7 @@ from cmk.gui import hooks
 from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem, make_main_menu_breadcrumb
 from cmk.gui.exceptions import HTTPRedirect, MKAuthException, MKGeneralException, MKUserError
 from cmk.gui.globals import config, g, html, output_funnel, request, transactions, user
+from cmk.gui.hooks import request_memoize
 from cmk.gui.i18n import _, _u
 from cmk.gui.log import logger
 from cmk.gui.main_menu import mega_menu_registry
@@ -93,6 +94,7 @@ from cmk.gui.type_defs import (
     VisualTypeName,
 )
 from cmk.gui.utils import unique_default_name_suggestion, validate_id
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.flashed_messages import flash, get_flashed_messages
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.logged_in import save_user_file
@@ -369,16 +371,21 @@ def transform_pre_2_1_single_infos(
     return unsingle
 
 
-def transform_pre_2_1_range_filters() -> Callable[
-    [FilterName, FilterHTTPVariables], Tuple[FilterName, FilterHTTPVariables]
-]:
-    # Update Visual Range Filters
-    range_filters = [
+@request_memoize()
+def _get_range_filters():
+    return [
         filter_ident
         for filter_ident, filter_object in filter_registry.items()
         if hasattr(filter_object, "query_filter")
         and isinstance(filter_object.query_filter, query_filters.NumberRangeQuery)  # type: ignore[attr-defined]
     ]
+
+
+def transform_pre_2_1_range_filters() -> Callable[
+    [FilterName, FilterHTTPVariables], Tuple[FilterName, FilterHTTPVariables]
+]:
+    # Update Visual Range Filters
+    range_filters = _get_range_filters()
 
     def transform_range_vars(
         fident: FilterName, vals: FilterHTTPVariables
@@ -474,6 +481,7 @@ class _CombinedVisualsCache:
 
 
 hooks.register_builtin("snapshot-pushed", _CombinedVisualsCache.invalidate_all_caches)
+hooks.register_builtin("snapshot-pushed", store.clear_pickled_object_files)
 hooks.register_builtin("users-saved", lambda x: _CombinedVisualsCache.invalidate_all_caches())
 
 
@@ -508,7 +516,9 @@ def _load_custom_user_visuals(
                 continue
 
             visuals.update(
-                load_visuals_of_a_user(what, builtin_visuals, skip_func, visual_path, user_id)
+                load_visuals_of_a_user(
+                    what, builtin_visuals, skip_func, Path(visual_path), UserId(user_id)
+                )
             )
 
         except SyntaxError as e:
@@ -517,9 +527,11 @@ def _load_custom_user_visuals(
     return visuals
 
 
-def load_visuals_of_a_user(what, builtin_visuals, skip_func, path, user_id) -> CustomUserVisuals:
+def load_visuals_of_a_user(
+    what, builtin_visuals, skip_func, path: Path, user_id: UserId
+) -> CustomUserVisuals:
     user_visuals: CustomUserVisuals = {}
-    for name, visual in store.load_object_from_file(path, default={}).items():
+    for name, visual in store.load_pickled_object_file(path, default={}).items():
         visual["owner"] = user_id
         visual["name"] = name
 
@@ -558,11 +570,12 @@ def declare_visual_permission(what, name, visual):
 
 
 # Load all users visuals just in order to declare permissions of custom visuals
+# TODO: Use regular load logic here, e.g. _load_custom_user_visuals()
 def declare_custom_permissions(what):
     for dirpath in cmk.utils.paths.profile_dir.iterdir():
         try:
             if dirpath.is_dir():
-                path = dirpath.joinpath("%s.mk" % what)
+                path = dirpath.joinpath("user_%s.mk" % what)
                 if not path.exists():
                     continue
                 visuals = store.load_object_from_file(path, default={})
@@ -822,7 +835,11 @@ def page_list(
                         [(visual_type_registry[what]().ident_attr, visual_name), ("owner", owner)],
                         filename="%s.py" % what_s,
                     )
-                    html.a(title2, href=show_url)
+                    html.a(
+                        title2,
+                        href=show_url,
+                        target="_blank" if what_s == "report" else None,
+                    )
                 else:
                     html.write_text(title2)
                 html.help(_u(visual["description"]))
@@ -1989,6 +2006,9 @@ class VisualFilter(ValueSpec):
     def validate_value(self, value, varprefix):
         self._filter.validate_value(value)
 
+    def mask(self, value: FilterHTTPVariables) -> FilterHTTPVariables:
+        return value
+
     def value_to_html(self, value):
         raise NotImplementedError()
 
@@ -2213,6 +2233,7 @@ def _add_context_title(context: VisualContext, single_infos: List[str], title: s
 # Example: the info "history" (Event Console History) needs
 # the variables "event_id" and "history_line" to be set in order
 # to exactly specify one history entry.
+@request_memoize()
 def info_params(info_key: InfoName) -> List[FilterName]:
     return [key for key, _vs in visual_info_registry[info_key]().single_spec]
 
@@ -2243,11 +2264,12 @@ def get_singlecontext_vars(context: VisualContext, single_infos: SingleInfos) ->
     }
 
 
+@request_memoize()
 def may_add_site_hint(
     visual_name: str,
     info_keys: List[InfoName],
     single_info_keys: SingleInfos,
-    filter_names: List[FilterName],
+    filter_names: Tuple[FilterName, ...],
 ) -> bool:
     """Whether or not the site hint may be set when linking to a visual with the given details"""
     # When there is one non single site info used don't add the site hint
@@ -2263,7 +2285,7 @@ def may_add_site_hint(
 
     # Hack for servicedesc view which is meant to show all services with the given
     # description: Don't add the site filter for this view.
-    if visual_name in ["servicedesc", "servicedescpnp"]:
+    if visual_name == "servicedesc":
         return False
 
     return True
@@ -2387,8 +2409,12 @@ def set_page_context(page_context: VisualContext) -> None:
 
 @cmk.gui.pages.register("ajax_add_visual")
 def ajax_add_visual() -> None:
+    check_csrf_token()
     visual_type_name = request.get_str_input_mandatory("visual_type")  # dashboards / views / ...
-    visual_type = visual_type_registry[visual_type_name]()
+    try:
+        visual_type = visual_type_registry[visual_type_name]()
+    except KeyError:
+        raise MKUserError("visual_type", _("Invalid visual type"))
 
     visual_name = request.get_str_input_mandatory("visual_name")  # add to this visual
 

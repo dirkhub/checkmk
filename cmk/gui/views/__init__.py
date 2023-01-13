@@ -83,6 +83,7 @@ from cmk.gui.page_menu import (
     PageMenu,
     PageMenuDropdown,
     PageMenuEntry,
+    PageMenuLink,
     PageMenuPopup,
     PageMenuSidePopup,
     PageMenuTopic,
@@ -186,6 +187,7 @@ from cmk.gui.plugins.visuals.utils import (
     VisualInfo,
     VisualType,
 )
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.valuespec import (
     Alternative,
     CascadingDropdown,
@@ -211,6 +213,7 @@ from cmk.gui.watolib.activate_changes import get_pending_changes_info, get_pendi
 if not cmk_version.is_raw_edition():
     from cmk.gui.cee.ntop.connector import get_cache  # pylint: disable=no-name-in-module
 
+from cmk.gui.exceptions import MKMissingDataError
 from cmk.gui.type_defs import (
     ColumnName,
     FilterName,
@@ -400,6 +403,7 @@ class View:
         self._only_sites: Optional[List[SiteId]] = None
         self._user_sorters: Optional[List[SorterSpec]] = None
         self._want_checkboxes: bool = False
+        self._warning_messages: list[str] = []
         self.process_tracking = ViewProcessTracking()
 
     @property
@@ -691,6 +695,13 @@ class View:
 
         return missing_single_infos
 
+    def add_warning_message(self, message: str) -> None:
+        self._warning_messages.append(message)
+
+    @property
+    def warning_messages(self) -> list[str]:
+        return self._warning_messages
+
 
 class DummyView(View):
     """Represents an empty view hull, not intended to be displayed
@@ -841,6 +852,9 @@ class GUIViewRenderer(ABCViewRenderer):
                 )
                 % ", ".join(sorted(missing_single_infos))
             )
+
+        for message in self.view.warning_messages:
+            html.show_warning(message)
 
         if not has_done_actions and not missing_single_infos:
             html.div("", id_="row_info")
@@ -1080,7 +1094,7 @@ class GUIViewRenderer(ABCViewRenderer):
         yield PageMenuEntry(
             title=_("This view as PDF"),
             icon_name="report",
-            item=make_simple_link(
+            item=make_external_link(
                 makeuri(
                     request,
                     [],
@@ -1170,20 +1184,43 @@ class GUIViewRenderer(ABCViewRenderer):
                 ("load_name", self.view.name),
             ]
 
-            clone_mode: bool = False
-            if self.view.spec["owner"] != user.id:
-                url_vars.append(("owner", self.view.spec["owner"]))
-                if not user.may("general.edit_foreign_views"):
-                    clone_mode = True
+            is_builtin_view: bool = not (view_owner := self.view.spec["owner"])
+            is_foreign_view: bool = view_owner != user.id
+            is_own_view: bool = not is_builtin_view and not is_foreign_view
 
-            url_vars.append(("mode", "clone" if clone_mode else "edit"))
-            url = makeuri_contextless(request, url_vars, filename="edit_view.py")
+            if not is_builtin_view and (
+                is_own_view or (is_foreign_view and user.may("general.edit_foreign_views"))
+            ):
+                if is_own_view:
+                    title = _("Edit my view")
+                else:
+                    title = _("Edit view of user %s") % view_owner
+                    url_vars += [("owner", view_owner)]
 
-            yield PageMenuEntry(
-                title=_("Clone view") if clone_mode else _("Customize view"),
-                icon_name="clone" if clone_mode else "edit",
-                item=make_simple_link(url),
-            )
+                yield PageMenuEntry(
+                    title=title,
+                    icon_name="edit",
+                    item=make_simple_link(
+                        makeuri_contextless(
+                            request,
+                            url_vars + [("mode", "edit")],
+                            filename="edit_view.py",
+                        )
+                    ),
+                )
+
+            if is_builtin_view or not is_own_view:
+                yield PageMenuEntry(
+                    title=_("Clone builtin view") if is_builtin_view else _("Clone view"),
+                    icon_name="clone",
+                    item=make_simple_link(
+                        makeuri_contextless(
+                            request,
+                            url_vars + [("owner", view_owner), ("mode", "clone")],
+                            filename="edit_view.py",
+                        )
+                    ),
+                )
 
     def _page_menu_dropdown_add_to(self) -> List[PageMenuDropdown]:
         return visuals.page_menu_dropdown_add_to_visual(add_type="view", name=self.view.name)
@@ -1233,6 +1270,8 @@ def load_plugins() -> None:
     """Plugin initialization hook (Called by cmk.gui.main_modules.load_plugins())"""
     _register_pre_21_plugin_api()
     utils.load_web_plugins("views", globals())
+    cmk.gui.plugins.views.inventory.update_paint_functions(globals())
+
     utils.load_web_plugins("icons", globals())
     utils.load_web_plugins("perfometer", globals())
 
@@ -1458,7 +1497,7 @@ def _register_host_tag_painters():
                 "render": lambda self, row, cell: _paint_host_tag(row, self._tag_group_id),
                 # Use title of the tag value for grouping, not the complete
                 # dictionary of custom variables!
-                "group_by": lambda self, row: _paint_host_tag(row, self._tag_group_id)[1],
+                "group_by": lambda self, row, _cell: _paint_host_tag(row, self._tag_group_id)[1],
             },
         )
         painter_registry.register(cls)
@@ -1875,8 +1914,12 @@ def view_editor_sorter_specs(view: ViewSpec) -> _Tuple[str, Dictionary]:
         view: ViewSpec,
     ) -> Iterator[Union[DropdownChoiceEntry, CascadingDropdownChoice]]:
         ds_name = view["datasource"]
+        datasource: ABCDataSource = data_source_registry[ds_name]()
+        unsupported_columns: List[ColumnName] = datasource.unsupported_columns
 
         for name, p in sorters_of_datasource(ds_name).items():
+            if any(column in p.columns for column in unsupported_columns):
+                continue
             # add all regular sortes. they may provide a third element: this
             # ValueSpec will be displayed after the sorter was choosen in the
             # CascadingDropdown.
@@ -2345,7 +2388,10 @@ def _get_view_rows(
     with CPUTracker() as filter_rows_tracker:
         # Apply non-Livestatus filters
         for filter_ in all_active_filters:
-            rows = filter_.filter_table(view.context, rows)
+            try:
+                rows = filter_.filter_table(view.context, rows)
+            except MKMissingDataError as e:
+                view.add_warning_message(str(e))
 
     view.process_tracking.amount_unfiltered_rows = unfiltered_amount_of_rows
     view.process_tracking.amount_filtered_rows = len(rows)
@@ -3013,7 +3059,11 @@ def collect_context_links(
         view, rows, singlecontext_request_vars, mobile, visual_types
     ):
         yield _make_page_menu_entry_for_visual(
-            visual_type, visual, singlecontext_request_vars, mobile
+            visual_type,
+            visual,
+            singlecontext_request_vars,
+            mobile,
+            external_link=True,
         )
 
 
@@ -3079,13 +3129,14 @@ def _make_page_menu_entry_for_visual(
     visual: Visual,
     singlecontext_request_vars: Dict[str, str],
     mobile: bool,
+    external_link: bool = False,
 ) -> PageMenuEntry:
+    url: str = make_linked_visual_url(visual_type, visual, singlecontext_request_vars, mobile)
+    link: PageMenuLink = make_external_link(url) if external_link else make_simple_link(url)
     return PageMenuEntry(
         title=visual["title"],
         icon_name=visual.get("icon") or "trans",
-        item=make_simple_link(
-            make_linked_visual_url(visual_type, visual, singlecontext_request_vars, mobile)
-        ),
+        item=link,
         name="cb_" + visual["name"],
         is_show_more=visual.get("is_show_more", False),
     )
@@ -3170,6 +3221,9 @@ def _get_combined_graphs_entry(
 
 def _show_combined_graphs_context_button(view: View) -> bool:
     if cmk_version.is_raw_edition():
+        return False
+
+    if view.name == "service":
         return False
 
     return view.datasource.ident in ["hosts", "services", "hostsbygroup", "servicesbygroup"]
@@ -3378,16 +3432,20 @@ def _allowed_for_datasource(
     collection: Union[PainterRegistry, SorterRegistry],
     ds_name: str,
 ) -> Mapping[str, Union[Sorter, Painter]]:
-    datasource = data_source_registry[ds_name]()
-    infos_available = set(datasource.infos)
-    add_columns = datasource.add_columns
+    datasource: ABCDataSource = data_source_registry[ds_name]()
+    infos_available: Set[str] = set(datasource.infos)
+    add_columns: List[ColumnName] = datasource.add_columns
+    unsupported_columns: List[ColumnName] = datasource.unsupported_columns
 
     allowed: Dict[str, Union[Sorter, Painter]] = {}
     for name, plugin_class in collection.items():
         plugin = plugin_class()
+        if any(column in plugin.columns for column in unsupported_columns):
+            continue
         infos_needed = infos_needed_by_plugin(plugin, add_columns)
         if len(infos_needed.difference(infos_available)) == 0:
             allowed[name] = plugin
+
     return allowed
 
 
@@ -3506,7 +3564,7 @@ def _get_command_groups(info_name: InfoName) -> Dict[Type[CommandGroup], List[Co
 
 
 def core_command(
-    what: str, row: Row, row_nr: int, total_rows: int
+    what: str, row: Row, row_nr: int, action_rows: Rows
 ) -> _Tuple[Sequence[CommandSpec], List[_Tuple[str, str]], str, CommandExecutor]:
     """Examine the current HTML variables in order determine, which command the user has selected.
     The fetch ids from a data row (host name, service description, downtime/commands id) and
@@ -3542,8 +3600,8 @@ def core_command(
     for cmd_class in command_registry.values():
         cmd = cmd_class()
         if user.may(cmd.permission.name):
-            result = cmd.action(cmdtag, spec, row, row_nr, total_rows)
-            confirm_options = cmd.user_confirm_options(total_rows, cmdtag)
+            result = cmd.action(cmdtag, spec, row, row_nr, action_rows)
+            confirm_options = cmd.user_confirm_options(len(action_rows), cmdtag)
             if result:
                 executor = cmd.executor
                 commands, title = result
@@ -3581,7 +3639,7 @@ def do_actions(view: ViewSpec, what: InfoName, action_rows: Rows, backurl: str) 
         return False  # no actions done
 
     command = None
-    confirm_options, cmd_title, executor = core_command(what, action_rows[0], 0, len(action_rows),)[
+    confirm_options, cmd_title, executor = core_command(what, action_rows[0], 0, action_rows)[
         1:4
     ]  # just get confirm_options, title and executor
 
@@ -3599,7 +3657,7 @@ def do_actions(view: ViewSpec, what: InfoName, action_rows: Rows, backurl: str) 
             what,
             row,
             nr,
-            len(action_rows),
+            action_rows,
         )
         for command_entry in core_commands:
             site: Optional[str] = row.get(
@@ -3812,6 +3870,8 @@ class PageRescheduleCheck(AjaxPage):
     def _do_reschedule(self, api_request: Dict[str, Any]) -> AjaxPageResult:
         if not user.may("action.reschedule"):
             raise MKGeneralException("You are not allowed to reschedule checks.")
+
+        check_csrf_token()
 
         site = api_request.get("site")
         host = api_request.get("host")

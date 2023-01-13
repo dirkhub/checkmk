@@ -788,7 +788,7 @@ class ModeBIRules(ABCBIMode):
         for rule_id in selection:
             bi_rule = self.bi_pack.get_rule_mandatory(rule_id)
             target_pack.add_rule(bi_rule)
-            self._bi_packs.delete_rule(bi_rule.id)
+            self.bi_pack.delete_rule(bi_rule.id)
             self._add_change(
                 "bi-move-rule",
                 _("Moved BI rule with ID %s to BI pack %s") % (rule_id, target_pack_id),
@@ -843,7 +843,6 @@ class ModeBIRules(ABCBIMode):
             html.dropdown(
                 "bulk_moveto",
                 move_choices,
-                "@",
                 onchange="cmk.selection.update_bulk_moveto(this.value)",
                 class_="bulk_moveto",
                 label=_("Move to pack: "),
@@ -1084,7 +1083,7 @@ class ModeBIEditRule(ABCBIMode):
         vs_rule = self.valuespec(rule_id=self._rule_id)
         vs_rule_config = vs_rule.from_html_vars("rule")
         vs_rule.validate_value(copy.deepcopy(vs_rule_config), "rule")
-        schema_validated_config = BIRuleSchema().load(vs_rule_config)
+        schema_validated_config = BIRuleSchema().dump(vs_rule_config)
         new_bi_rule = BIRule(schema_validated_config)
         self._action_modify_rule(new_bi_rule)
         return redirect(mode_url("bi_rules", pack=self.bi_pack.id))
@@ -1455,7 +1454,7 @@ class AjaxBIRulePreview(AjaxPage):
                 response.append([{"Error": _("Can not evaluate search")}])
 
         return {
-            "title": _("Search result(s) preview"),
+            "title": _("Available macros and search result(s)"),
             "data": response,
             "params": preview_bi_rule.params.arguments,
         }
@@ -1485,7 +1484,7 @@ class AjaxBIAggregationPreview(AjaxPage):
             response.append([{_("Error"): _("Can not evaluate search")}])
 
         return {
-            "title": _("Search result(s) preview"),
+            "title": _("Available macros and search result(s)"),
             "data": response,
         }
 
@@ -1509,6 +1508,9 @@ class NodeVisualizationLayoutStyle(ValueSpec):
             "let example = new cmk.node_visualization_layout_styles.LayoutStyleExampleGenerator(%s);"
             "example.create_example(%s)" % (json.dumps(varprefix), json.dumps(value))
         )
+
+    def mask(self, value: dict[str, Any]) -> dict[str, Any]:
+        return value
 
     def value_to_html(self, value) -> str:
         return ""
@@ -1623,7 +1625,8 @@ class BIModeEditAggregation(ABCBIMode):
         vs_aggregation_config = vs_aggregation.from_html_vars("aggr")
         vs_aggregation.validate_value(vs_aggregation_config, "aggr")
 
-        new_bi_aggregation = BIAggregation(vs_aggregation_config)
+        schema_validated_config = BIAggregationSchema().dump(vs_aggregation_config)
+        new_bi_aggregation = BIAggregation(schema_validated_config)
 
         aggregation_ids = self._get_aggregations_by_id()
         if (
@@ -1643,8 +1646,13 @@ class BIModeEditAggregation(ABCBIMode):
                 % aggregation_ids[new_bi_aggregation.id][0].id,
             )
 
+        had_previous_aggregations = self._bi_packs.get_num_enabled_aggregations() > 0
         self.bi_pack.add_aggregation(new_bi_aggregation)
         self._bi_packs.save_config()
+        redirect_kwargs = {"pack": self.bi_pack.id}
+        if had_previous_aggregations != (self._bi_packs.get_num_enabled_aggregations() > 0):
+            redirect_kwargs["reload_page"] = 1
+
         if self._new:
             self._add_change(
                 "bi-new-aggregation", _("Add new BI aggregation %s") % new_bi_aggregation.id
@@ -1653,7 +1661,8 @@ class BIModeEditAggregation(ABCBIMode):
             self._add_change(
                 "bi-edit-aggregation", _("Modified BI aggregation %s") % (new_bi_aggregation.id)
             )
-        return redirect(mode_url("bi_aggregations", pack=self.bi_pack.id))
+
+        return redirect(mode_url("bi_aggregations", **redirect_kwargs))
 
     def page(self):
         html.begin_form("biaggr", method="POST")
@@ -2042,6 +2051,10 @@ class BIModeAggregations(ABCBIMode):
         )
 
     def page(self):
+        if html.request.has_var("reload_page"):
+            url = mode_url(self.name(), pack=self.bi_pack.id)
+            html.reload_whole_page(url)
+
         html.begin_form("bulk_action_form", method="POST")
         self._render_aggregations()
         html.hidden_field("selection_id", weblib.selection_id())
@@ -2067,7 +2080,6 @@ class BIModeAggregations(ABCBIMode):
             html.dropdown(
                 "bulk_moveto",
                 move_choices,
-                "@",
                 onchange="cmk.selection.update_bulk_moveto(this.value)",
                 class_="bulk_moveto",
                 label=_("Move to pack: "),

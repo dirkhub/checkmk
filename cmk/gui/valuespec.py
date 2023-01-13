@@ -19,6 +19,7 @@ import abc
 import base64
 import datetime
 import hashlib
+import hmac
 import io
 import ipaddress
 import itertools
@@ -26,6 +27,7 @@ import json
 import logging
 import math
 import numbers
+import os
 import re
 import socket
 import time
@@ -34,6 +36,7 @@ import uuid
 from collections.abc import MutableMapping
 from collections.abc import Sequence as ABCSequence
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Collection, Final, Generic, Iterable, Literal, Mapping, NamedTuple
 from typing import Optional as _Optional
@@ -69,6 +72,7 @@ from cmk.gui.i18n import _
 from cmk.gui.pages import AjaxPage, AjaxPageResult, page_registry
 from cmk.gui.type_defs import ChoiceGroup, ChoiceId, Choices, ChoiceText, GroupedChoices
 from cmk.gui.utils.autocompleter_config import AutocompleterConfig, ContextAutocompleterConfig
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.html import HTML
 from cmk.gui.utils.labels import (
     encode_labels_for_http,
@@ -222,6 +226,15 @@ class ValueSpec(abc.ABC, Generic[_VT]):
         return repr(value)
 
     @abc.abstractmethod
+    def mask(self, value: _VT) -> _VT:
+        """Obscure any sensitive information in the provided value
+
+        Container-like ValueSpecs must recurse over their items, allow these to mask their
+        values. Other ValueSpecs that don't have a need for masking sensitive information
+        can simply return the input value."""
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def value_to_json(self, value: _VT) -> JSONValue:
         raise NotImplementedError()
 
@@ -312,6 +325,9 @@ class FixedValue(ValueSpec[_VT]):
             return value
         return str(value)
 
+    def mask(self, value: _VT) -> _VT:
+        return value
+
     def value_to_json(self, value: _VT) -> JSONValue:
         return value
 
@@ -387,6 +403,9 @@ class Age(ValueSpec[Seconds]):
             + request.get_integer_input_mandatory(varprefix + "_minutes", 0) * 60
             + request.get_integer_input_mandatory(varprefix + "_seconds", 0)
         )
+
+    def mask(self, value: Seconds) -> Seconds:
+        return value
 
     def value_to_html(self, value: Seconds) -> ValueSpecText:
         if value == 0:
@@ -508,6 +527,9 @@ class Integer(ValueSpec[int]):
 
     def from_html_vars(self, varprefix: str) -> int:
         return request.get_integer_input_mandatory(varprefix)
+
+    def mask(self, value: int) -> int:
+        return value
 
     def value_to_html(self, value: int) -> ValueSpecText:
         return self._renderer.format_text(self._render_value(value))
@@ -649,6 +671,9 @@ class TextInput(ValueSpec[str]):
             onkeyup=self._onkeyup if self._onkeyup else None,
             placeholder=self._placeholder,
         )
+
+    def mask(self, value: str) -> str:
+        return value
 
     def value_to_html(self, value: str) -> ValueSpecText:
         if not value:
@@ -1084,9 +1109,11 @@ def Hostname(  # pylint: disable=redefined-builtin
     title: _Optional[str] = None,
     help: _Optional[ValueSpecHelp] = None,
     default_value: Union[Sentinel, str] = DEF_VALUE,
+    size: int = 38,
 ):
     """A host name with or without domain part. Also allow IP addresses"""
     return TextInput(
+        size=size,
         regex=cmk.utils.regex.regex(cmk.utils.regex.REGEX_HOST_NAME),
         regex_error=_(
             "Please enter a valid hostname or IPv4 address. "
@@ -1729,6 +1756,9 @@ class ListOfStrings(ValueSpec):
     def has_show_more(self) -> bool:
         return self._valuespec.has_show_more()
 
+    def mask(self, value: Any) -> Any:
+        return value
+
     def value_to_json(self, value: Any) -> list[Any]:
         return [self._valuespec.value_to_json(e) for e in value]
 
@@ -2040,6 +2070,9 @@ class ListOf(ValueSpec):
     def has_show_more(self) -> bool:
         return self._valuespec.has_show_more()
 
+    def mask(self, value: Any) -> Any:
+        return [self._valuespec.mask(e) for e in value]
+
     def value_to_json(self, value: Any) -> list[Any]:
         return [self._valuespec.value_to_json(e) for e in value]
 
@@ -2207,6 +2240,9 @@ class ListOfMultiple(ValueSpec):
     def canonical_value(self) -> dict[str, Any]:
         return {}
 
+    def mask(self, value: dict[str, Any]) -> dict[str, Any]:
+        return {ident: self._choice_dict[ident].mask(val) for ident, val in value.items()}
+
     def value_to_html(self, value: dict[str, Any]) -> HTML:
         table_content = HTML()
         for ident, val in value.items():
@@ -2320,6 +2356,9 @@ class Float(ValueSpec[float]):
     def from_html_vars(self, varprefix: str) -> float:
         return request.get_float_input_mandatory(varprefix)
 
+    def mask(self, value: float) -> float:
+        return value
+
     def value_to_html(self, value: float) -> ValueSpecText:
         txt = self._renderer.format_text(self._render_value(value))
         return txt.replace(".", self._decimal_separator)
@@ -2421,6 +2460,9 @@ class Checkbox(ValueSpec[bool]):
 
     def render_input(self, varprefix: str, value: bool) -> None:
         html.checkbox(varprefix, value, label=self._label, onclick=self._onclick)
+
+    def mask(self, value: bool) -> bool:
+        return value
 
     def value_to_html(self, value: bool) -> ValueSpecText:
         return self._true_label if value else self._false_label
@@ -2611,6 +2653,9 @@ class DropdownChoice(ValueSpec):
         if "%s" in tmpl or "%r" in tmpl:
             return tmpl % (value,)
         return tmpl
+
+    def mask(self, value: Any) -> Any:
+        return value
 
     def value_to_html(self, value: DropdownChoiceValue) -> ValueSpecText:
         for val, title in self.choices():
@@ -3279,6 +3324,25 @@ class CascadingDropdown(ValueSpec[CascadingDropdownChoiceValue]):
         except Exception:  # TODO: fix exc
             return None
 
+    def mask(self, value: CascadingDropdownChoiceValue) -> CascadingDropdownChoiceValue:
+        choice = self._choice_from_value(value)
+        if not choice:
+            return value  # TODO: this should not be allowed; see above
+        ident, _title, vs = choice
+
+        if vs is None and ident == value:
+            # Presumably, value was just the plain CascadingDropdownChoiceIdent,
+            # nothing to do here.
+            return value
+
+        assert isinstance(value, tuple) and vs is not None
+
+        try:
+            vs.validate_datatype(value[1], "")
+            return ident, vs.mask(value[1])
+        except Exception:
+            return value  # TODO: this should not be allowed; see above
+
     def from_html_vars(self, varprefix: str) -> CascadingDropdownChoiceValue:
         choices = self.choices()
 
@@ -3452,6 +3516,9 @@ class ListChoice(ValueSpec):
 
         # Make sure that at least one variable with the prefix is present
         html.hidden_field(varprefix, "1", add_var=True)
+
+    def mask(self, value: Any) -> Any:
+        return value
 
     def value_to_html(self, value) -> ValueSpecText:
         if not value:
@@ -4027,6 +4094,9 @@ class AbsoluteDate(ValueSpec):
     def set_focus(self, varprefix):
         html.set_focus(varprefix + "_year")
 
+    def mask(self, value: _Optional[float]) -> _Optional[float]:
+        return value
+
     def value_to_html(self, value: float) -> ValueSpecText:
         return time.strftime(self._format, time.localtime(value))
 
@@ -4157,6 +4227,9 @@ class Timeofday(ValueSpec):
         text = ("%02d:%02d" % value) if value else ""
         html.text_input(varprefix, text, size=5)
 
+    def mask(self, value: _Optional[TimeofdayValue]) -> _Optional[TimeofdayValue]:
+        return value
+
     def value_to_html(self, value: _Optional[TimeofdayValue]) -> ValueSpecText:
         if value is None:
             return ""
@@ -4265,6 +4338,9 @@ class TimeofdayRange(ValueSpec):
         html.write_text("-")
         html.nbsp()
         self._bounds[1].render_input(varprefix + "_until", value[1] if value is not None else None)
+
+    def mask(self, value: _Optional[TimeofdayRangeValue]) -> _Optional[TimeofdayRangeValue]:
+        return value
 
     def value_to_html(self, value: _Optional[TimeofdayRangeValue]) -> ValueSpecText:
         if value is None:
@@ -4802,6 +4878,9 @@ class Optional(ValueSpec):
         if value != self._none_value:
             self._valuespec.validate_value(value, varprefix + "_value")
 
+    def mask(self, value: Any) -> Any:
+        return value if value is None else self._valuespec.mask(value)
+
     def transform_value(self, value):
         return value if value == self._none_value else self._valuespec.transform_value(value)
 
@@ -4940,6 +5019,15 @@ class Alternative(ValueSpec):
         if isinstance(value, Sentinel):
             return self._elements[0].default_value()
         return value
+
+    def mask(self, value: Any) -> Any:
+        vs, match_value = self.matching_alternative(value)
+        if vs is None:
+            # Note: mask() is backported from a future branch where a ValueError
+            #       would be raised here. However, we cannot rely on that error being
+            #       handled properly in this backport. Do nothing instead.
+            return value
+        return vs.mask(match_value)
 
     def value_to_html(self, value) -> ValueSpecText:
         vs, value = self.matching_alternative(value)
@@ -5085,6 +5173,9 @@ class Tuple(ValueSpec):
     def _iter_value(self, value: Sequence[Any]) -> Iterable[tuple[int, ValueSpec, Any]]:
         for idx, element in enumerate(self._elements):
             yield idx, element, value[idx]
+
+    def mask(self, value: tuple[Any, ...]) -> tuple[Any, ...]:
+        return tuple(el.mask(val) for _, el, val in self._iter_value(value))
 
     def value_to_html(self, value) -> ValueSpecText:
         return HTML(", ").join(el.value_to_html(val) for _, el, val in self._iter_value(value))
@@ -5385,6 +5476,11 @@ class Dictionary(ValueSpec[dict[str, Any]]):
             if name in self._required_keys or not self._optional_keys or name in self._default_keys
         }
 
+    def mask(self, value: Any) -> Any:
+        return {
+            param: vs.mask(value[param]) for param, vs in self._get_elements() if param in value
+        }
+
     def value_to_html(self, value) -> ValueSpecText:
         value = self.migrate(value)
         if not value:
@@ -5543,6 +5639,9 @@ class ElementSelection(ValueSpec):
                 html.span(self._label, class_="vs_floating_text")
             html.dropdown(varprefix, self._elements.items(), deflt=value, ordered=True)
 
+    def mask(self, value: Any) -> Any:
+        return value
+
     def value_to_html(self, value) -> ValueSpecText:
         self.load_elements()
         return self._elements.get(value, value)
@@ -5642,6 +5741,9 @@ class Foldable(ValueSpec):
     def default_value(self) -> Any:
         return self._valuespec.default_value()
 
+    def mask(self, value: Any) -> Any:
+        return self._valuespec.mask(value)
+
     def value_to_html(self, value: Any) -> ValueSpecText:
         return self._valuespec.value_to_html(value)
 
@@ -5674,10 +5776,15 @@ class Transform(ValueSpec):
     """Transforms the value from one representation to another while being
     completely transparent to the user
 
-    forth: function that converts a value into the representation
-           needed by the encapsulated vs
-    back:  function that converts a value created by the encapsulated
-           vs back to the outer representation"""
+    The transformation is implemented by two functions: forth and back:
+
+    forth: Converts a value from any "outer world" representation (e.g. as
+           it was read from a .mk file) to the form that is processable by
+           the encapsulated ValueSpec (e.g. for rendering).
+
+    back:  Converts a value created by the encapsulated ValueSpec back to
+           the outer representation.
+    """
 
     def __init__(  # pylint: disable=redefined-builtin
         self,
@@ -5734,6 +5841,9 @@ class Transform(ValueSpec):
 
     def default_value(self) -> Any:
         return self.back(self._valuespec.default_value())
+
+    def mask(self, value: Any) -> Any:
+        return self.back(self._valuespec.mask(self.forth(value)))
 
     def value_to_html(self, value: Any) -> ValueSpecText:
         return self._valuespec.value_to_html(self.forth(value))
@@ -5857,15 +5967,31 @@ class Password(TextInput):
                 )
             )
 
+    def mask(self, value: _Optional[str]) -> str:
+        # Note: This intentionally returns the same output if value is None,
+        #       in order to not reveal any information about the (empty) password.
+        return "******"
+
     def value_to_html(self, value: _Optional[str]) -> str:
         if value is None:
             return _("none")
         return "******"
 
+    @staticmethod
+    @lru_cache
+    def _cached_key() -> bytes:
+        return os.urandom(32)
+
     def value_to_json_safe(self, value: _Optional[str]) -> str:
         if value is None:
             return "none"
-        password_hash = hashlib.sha256(value.encode()).hexdigest()
+
+        # This is a band-aid for CMK-10745.
+        # It is only here because object_diff.make_text_diff, which is used when logging rule
+        # changes to the audit log, needs different passwords to be masked to different values.
+        # Otherwise the diff will be empty. It would be better if the diffing or the diff result
+        # was aware of password types so we could just mask after diffing.
+        password_hash = hmac.new(Password._cached_key(), value.encode(), hashlib.sha256).hexdigest()
         return f"hash:{password_hash[:10]}"
 
     def from_html_vars(self, varprefix: str) -> str:
@@ -5950,6 +6076,9 @@ class FileUpload(ValueSpec):
 
     def render_input(self, varprefix: str, value: _Optional[bytes]) -> None:
         html.upload_file(varprefix)
+
+    def mask(self, value: Any) -> Any:
+        return value
 
     def from_html_vars(self, varprefix: str) -> UploadedFile:
         return request.uploaded_file(varprefix)
@@ -6161,6 +6290,9 @@ class Labels(ValueSpec):
                     varprefix,
                     _("The label value %r is of type %s, but should be %s") % (k, type(v), str),
                 )
+
+    def mask(self, value: Any) -> Any:
+        return value
 
     def value_to_html(self, value) -> ValueSpecText:
         label_sources = {k: self._label_source.value for k in value} if self._label_source else {}
@@ -6495,6 +6627,9 @@ class IconSelector(ValueSpec):
             return None
         return icon
 
+    def mask(self, value: Any) -> Any:
+        return value
+
     def value_to_html(self, value) -> ValueSpecText:
         return self._render_icon(value["icon"] if isinstance(value, dict) else value)
 
@@ -6592,6 +6727,9 @@ class Color(ValueSpec):
             onclose=self._on_change,
         )
 
+    def mask(self, value: _Optional[str]) -> _Optional[str]:
+        return value
+
     def from_html_vars(self, varprefix):
         color = request.var(varprefix + "_value")
         if color == "":
@@ -6661,12 +6799,17 @@ SSHKeyPairValue = tuple[str, str]
 
 
 class SSHKeyPair(ValueSpec):
+    """An SSH key pair consisting of (private key, public key)"""
+
     def render_input(self, varprefix: str, value: _Optional[SSHKeyPairValue]):
         if value:
             html.write_text(_("Fingerprint: %s") % self.value_to_html(value))
             html.hidden_field(varprefix, self._encode_key_for_url(value), add_var=True)
         else:
             html.write_text(_("Key pair will be generated when you save."))
+
+    def mask(self, value: _Optional[SSHKeyPairValue]) -> _Optional[SSHKeyPairValue]:
+        return ("******", value[1]) if value is not None else None
 
     def value_to_html(self, value: SSHKeyPairValue) -> ValueSpecText:
         return self._get_key_fingerprint(value)
@@ -6765,6 +6908,9 @@ class _CAInput(ValueSpec[tuple[str, int, bytes]]):
     def value_to_json(self, value: tuple[str, int, bytes]) -> JSONValue:
         return [value[0], value[1], value[2].decode("ascii")]
 
+    def mask(self, value: tuple[str, int, bytes]) -> tuple[str, int, bytes]:
+        return value
+
     def value_from_json(self, json_value: JSONValue) -> tuple[str, int, bytes]:
         return (json_value[0], json_value[1], json_value[2].encode("ascii"))
 
@@ -6778,6 +6924,7 @@ class _CAInput(ValueSpec[tuple[str, int, bytes]]):
 @page_registry.register_page("ajax_fetch_ca")
 class AjaxFetchCA(AjaxPage):
     def page(self) -> AjaxPageResult:
+        check_csrf_token()
         user.need_permission("general.server_side_requests")
 
         try:

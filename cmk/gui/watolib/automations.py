@@ -24,7 +24,7 @@ from livestatus import SiteConfiguration, SiteId
 import cmk.utils.store as store
 import cmk.utils.version as cmk_version
 from cmk.utils.log import VERBOSE
-from cmk.utils.type_defs import UserId
+from cmk.utils.type_defs import PhaseOneResult, UserId
 from cmk.utils.version import base_version_parts, is_daily_build_of_master, parse_check_mk_version
 
 from cmk.automations.results import result_type_registry, SerializedResult
@@ -318,6 +318,20 @@ def _do_remote_automation_serialized(
         raise MKAutomationException(_("Empty output from remote site."))
 
     return response
+
+
+def execute_phase1_result(site_id: SiteId, connection_id: str) -> PhaseOneResult:
+    command_args = {
+        "request_format": "python",
+        "request": repr(
+            {"action": "get_phase1_result", "kwargs": {"connection_id": connection_id}}
+        ),
+    }
+    return ast.literal_eval(
+        do_remote_automation(
+            site=get_site_config(site_id), command="execute-dcd-command", vars_=command_args
+        )
+    )
 
 
 def do_remote_automation(site, command, vars_, files=None, timeout=None) -> Any:

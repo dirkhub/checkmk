@@ -581,3 +581,55 @@ def test_canonical_value_in_cascading_dropdown(
     expected_canonical,
 ):
     assert vs.CascadingDropdown(choices=choices).canonical_value() == expected_canonical
+
+
+@pytest.mark.parametrize(
+    "valuespec,value,expected",
+    [
+        (vs.Integer(), 42, 42),
+        (
+            vs.Dictionary(elements=[("the answer", vs.Password())]),
+            {"the answer": "42"},
+            {"the answer": "******"},
+        ),
+        (
+            vs.SSHKeyPair(),
+            ("-----BEGIN PRIVATE KEY and so on", "ssh-ed25519 AAAA..."),
+            ["******", "ssh-ed25519 AAAA..."],
+        ),
+        (
+            vs.Tuple(
+                elements=[
+                    vs.TextInput(),
+                    vs.Password(),
+                    vs.CascadingDropdown(choices=[("password", "_", vs.Password())]),
+                ]
+            ),
+            ("credentials", "hunter2", ("password", "stars")),
+            ["credentials", "******", ["password", "******"]],
+        ),
+    ],
+)
+def test_mask_to_json(valuespec, value, expected):
+    masked = valuespec.mask(value)
+    assert valuespec.value_to_json(masked) == expected
+
+
+def _hash_pw(v):
+    return vs.Password().value_to_json_safe(v)
+
+
+@pytest.mark.parametrize(
+    "pw1,pw2",
+    [
+        ("", ""),
+        ("", "non-empty"),
+        ("the-same", "the-same"),
+        ("some pass", "other pass"),
+        ("🔥🔥🔥", "🔥🔥🔥"),
+    ],
+)
+def test_hash_password(pw1, pw2):
+    hash1, hash2 = _hash_pw(pw1), _hash_pw(pw2)
+    assert hash1.startswith("hash:") and hash2.startswith("hash:"), "hash is not empty"
+    assert (pw1 == pw2) == (hash1 == hash2), "same password produces same hash"

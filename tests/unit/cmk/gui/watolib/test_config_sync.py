@@ -16,6 +16,7 @@ import responses  # type: ignore[import]
 
 from tests.testlib.utils import is_enterprise_repo
 
+import cmk.utils.packaging
 import cmk.utils.paths
 import cmk.utils.version as cmk_version
 
@@ -58,7 +59,7 @@ def fixture_disable_ec_rule_stats_loading(monkeypatch):
     # During CME config computation the EC rule packs are loaded which currently also load the
     # rule usage information from the running EC. Since we do not have a EC running this fails
     # and causes timeouts. Disable this for these tests.
-    monkeypatch.setattr(cmk.gui.wato.mkeventd, "_get_rule_stats_from_ec", lambda: {})
+    monkeypatch.setattr(cmk.gui.watolib.mkeventd, "_get_rule_stats_from_ec", lambda: {})
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +69,14 @@ def fixture_disable_cmk_update_config(monkeypatch):
     # and causes timeouts. Disable this for these tests.
     monkeypatch.setattr(
         cmk.gui.watolib.activate_changes, "_execute_cmk_update_config", lambda: None
+    )
+
+
+@pytest.fixture(autouse=True)
+def fixture_disable_build_setup_search_index_background(monkeypatch):
+    # init-redis is not availabe...
+    monkeypatch.setattr(
+        cmk.utils.packaging, "_execute_post_package_change_actions", lambda _pkg: None
     )
 
 
@@ -278,12 +287,6 @@ def _get_expected_paths(user_id, is_pre_17_site, with_local):
         "var/check_mk/stored_passwords",
     ]
 
-    if with_local:
-        expected_paths += [
-            "local",
-            "var/check_mk/packages",
-        ]
-
     # The new sync directories create all needed files on the central site now
     if not is_pre_17_site:
         expected_paths += [
@@ -311,9 +314,6 @@ def _get_expected_paths(user_id, is_pre_17_site, with_local):
         if not cmk_version.is_raw_edition():
             expected_paths += ["etc/check_mk/dcd.d/wato/distributed.mk"]
 
-        if not cmk_version.is_managed_edition():
-            expected_paths += ["etc/omd/site.conf"]
-
     # TODO: The second condition should not be needed. Seems to be a subtle difference between the
     # CME and CRE/CEE snapshot logic
     if not cmk_version.is_managed_edition():
@@ -322,6 +322,17 @@ def _get_expected_paths(user_id, is_pre_17_site, with_local):
             "etc/check_mk/mkeventd.d/mkp/rule_packs",
             "etc/check_mk/mkeventd.d/wato/rules.mk",
         ]
+        if not is_pre_17_site:
+            expected_paths += [
+                "local",
+                "var/check_mk/packages",
+            ]
+        else:
+            if with_local:
+                expected_paths += [
+                    "local",
+                    "var/check_mk/packages",
+                ]
 
     # The paths are registered once the enterprise plugins are available, independent of the
     # cmk_version.edition().short value.
@@ -348,6 +359,12 @@ def _get_expected_paths(user_id, is_pre_17_site, with_local):
             "etc/check_mk/multisite.d/wato/groups.mk",
             "etc/check_mk/multisite.d/wato/user_connections.mk",
         ]
+
+        if with_local:
+            expected_paths += [
+                "local",
+                "var/check_mk/packages",
+            ]
 
         expected_paths.remove("etc/check_mk/conf.d/wato/hosts.mk")
 
@@ -474,9 +491,10 @@ def test_generate_pre_17_site_snapshot(
             "customer_check_mk.tar",
             "customer_gui_design.tar",
             "customer_multisite.tar",
-            "gui_logo.tar",
-            "gui_logo_dark.tar",
-            "gui_logo_facelift.tar",
+            "login_logo_dark.tar",
+            "login_logo_facelift.tar",
+            "navbar_logo_dark.tar",
+            "navbar_logo_facelift.tar",
         ]
 
     if not is_pre_17_site:
@@ -514,9 +532,10 @@ def test_generate_pre_17_site_snapshot(
                 "customer_check_mk.tar": ["customer.mk"],
                 "customer_gui_design.tar": [],
                 "customer_multisite.tar": ["customer.mk"],
-                "gui_logo.tar": [],
-                "gui_logo_dark.tar": [],
-                "gui_logo_facelift.tar": [],
+                "login_logo_dark.tar": [],
+                "login_logo_facelift.tar": [],
+                "navbar_logo_dark.tar": [],
+                "navbar_logo_facelift.tar": [],
                 # TODO: Shouldn't we clean up these subtle differences?
                 "mkeventd.tar": ["rules.mk"],
                 "check_mk.tar": ["groups.mk", "contacts.mk", "passwords.mk"],

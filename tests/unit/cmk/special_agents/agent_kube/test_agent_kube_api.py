@@ -6,7 +6,7 @@
 
 # pylint: disable=comparison-with-callable,redefined-outer-name
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import pytest
 from pydantic_factories import ModelFactory
@@ -22,6 +22,7 @@ from tests.unit.cmk.special_agents.agent_kube.factory import (
 
 from cmk.special_agents import agent_kube as agent
 from cmk.special_agents.agent_kube import aggregate_resources, Cluster
+from cmk.special_agents.utils_kubernetes.api_server import LOWEST_FUNCTIONING_VERSION
 from cmk.special_agents.utils_kubernetes.schemata import api, section
 
 
@@ -278,7 +279,7 @@ def test_collect_workload_resources_from_api_pods(pods_count: int):
     )
 
 
-@pytest.mark.parametrize("pods_count", [0, 5])
+@pytest.mark.parametrize("pods_count", [5, 10, 15])
 def test_collect_workload_resources_from_agent_pods(pods_count: int):
     requests = ResourcesRequirementsFactory.build(memory=ONE_MiB, cpu=0.5)
     limits = ResourcesRequirementsFactory.build(memory=2 * ONE_MiB, cpu=1.0)
@@ -318,4 +319,37 @@ def test_collect_workload_resources_from_agent_pods(pods_count: int):
         count_unspecified_requests=0,
         count_zeroed_limits=0,
         count_total=pods_count,
+    )
+
+
+def test_collect_workload_resources_from_agent_pods_no_pods_in_cluster():
+    pods: Sequence[agent.Pod] = []
+    memory_resources = agent._collect_memory_resources(pods)
+    cpu_resources = agent._collect_cpu_resources(pods)
+    empty_section = section.Resources(
+        request=0.0,
+        limit=0.0,
+        count_unspecified_limits=0,
+        count_unspecified_requests=0,
+        count_zeroed_limits=0,
+        count_total=0,
+    )
+
+    assert memory_resources == empty_section
+    assert cpu_resources == empty_section
+
+
+def test_version_verification_and_docstring_do_not_diverge():
+    """Keep _verify_version and arg_parser help text in sync.
+
+    When going from one version of Checkmk to the next one, we need to increase
+    LOWEST_FUNCTIONING_VERSION. In this case, make sure to update the
+    agent_kube.__doc__, since it is used by the arg_parser. Only version_string
+    is important, but we give a bit more context in order to ensure it is not
+    included for the wrong reason.
+    """
+
+    version_string = f"v{LOWEST_FUNCTIONING_VERSION[0]}.{LOWEST_FUNCTIONING_VERSION[1]}"
+    assert f"agent requires Kubernetes version {version_string} or higher" in agent.__doc__.replace(
+        "\n", " "
     )

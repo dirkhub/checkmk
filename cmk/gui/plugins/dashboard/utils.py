@@ -870,7 +870,8 @@ def _transform_dashlets_mut(dashlet_spec: DashletConfig) -> DashletConfig:
 
         # The service context has to be set, otherwise the pnpgraph dashlet would
         # complain about missing context information when displaying host graphs.
-        dashlet_spec["context"].setdefault("service", "_HOST_")
+        # -> 2.1.0i1 dashlets now use dict as context: change "_HOST_" to {"service": "_HOST_"}
+        dashlet_spec["context"].setdefault("service", {"service": "_HOST_"})
 
     if dashlet_spec["type"] in ["pnpgraph", "custom_graph"]:
         # -> 1.5.0i2
@@ -934,13 +935,17 @@ def transform_stats_dashlet(dashlet_spec: DashletConfig) -> DashletConfig:
 
 
 def transform_timerange_dashlet(dashlet_spec: DashletConfig) -> DashletConfig:
-    dashlet_spec["timerange"] = {
+    old2new = {
         "0": "4h",
         "1": "25h",
         "2": "8d",
         "3": "35d",
         "4": "400d",
-    }.get(dashlet_spec["timerange"], dashlet_spec["timerange"])
+    }
+    # default to 25h
+    old_timerange = dashlet_spec.get("timerange", "1")
+    if old_timerange in old2new:
+        dashlet_spec["timerange"] = old2new[old_timerange]
     return dashlet_spec
 
 
@@ -1233,7 +1238,7 @@ def dashboard_breadcrumb(name: str, board: DashboardConfig, title: str) -> Bread
     breadcrumb = make_topic_breadcrumb(
         mega_menu_registry.menu_monitoring(), PagetypeTopics.get_topic(board["topic"])
     )
-    breadcrumb.append(BreadcrumbItem(title, makeuri_contextless(request, [("name", name)])))
+    breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)])))
     return breadcrumb
 
 

@@ -35,6 +35,7 @@ RUN apt-get update \
     apache2-dev \
     autoconf \
     build-essential \
+    bison \
     curl \
     devscripts \
     dnsutils \
@@ -104,6 +105,10 @@ RUN /opt/install-protobuf-cpp.sh
 RUN /opt/install-openssl.sh
 RUN /opt/install-python.sh
 RUN /opt/install-freetds.sh
+
+# Now shrink all the binaries and libraries we produced to build a small image
+# in the next step
+RUN /opt/strip_binaries /opt
 
 ### Actual Image ###
 FROM base

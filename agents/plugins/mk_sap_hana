@@ -9,7 +9,7 @@
 
 # Disable unused variable error (needed to keep track of version)
 # shellcheck disable=SC2034
-CMK_VERSION="2.1.0b9"
+CMK_VERSION="2.1.0p20"
 
 # SAP HANA Plugin for Checkmk Agent on Linux
 # Copyright Gerd Stolz - SVA - 2016
@@ -147,7 +147,7 @@ QUERY
 
 query_sap_hana_backup_snapshots() {
     cat <<QUERY
-Select TOP 1 entry_type_name, sys_end_time, state_name, comment, message from
+Select TOP 1 entry_type_name, utc_end_time, state_name, comment, message from
 M_BACKUP_CATALOG where entry_type_name = 'data snapshot' AND state_name <>
 'running' order by sys_start_time desc
 QUERY
@@ -155,7 +155,7 @@ QUERY
 
 query_sap_hana_backup_complete() {
     cat <<QUERY
-Select TOP 1 entry_type_name, sys_end_time, state_name, comment, message from
+Select TOP 1 entry_type_name, utc_end_time, state_name, comment, message from
 M_BACKUP_CATALOG where entry_type_name = 'complete data backup' AND state_name
 <> 'running' order by sys_start_time desc
 QUERY
@@ -163,7 +163,7 @@ QUERY
 
 query_sap_hana_backup_log() {
     cat <<QUERY
-Select TOP 1 entry_type_name, sys_end_time, state_name, comment, message from
+Select TOP 1 entry_type_name, utc_end_time, state_name, comment, message from
 M_BACKUP_CATALOG where entry_type_name = 'log backup' AND state_name <>
 'running' order by sys_start_time desc
 QUERY
@@ -310,8 +310,9 @@ query_fileinfo() {
     local hostname="$4"
     cat <<QUERY
 SELECT '/SAP HANA $sid $instance $db/' || FILE_NAME, FILE_SIZE,
-SECONDS_BETWEEN('1970-01-01 00:00:00', FILE_MTIME) AS UNIXMTIME FROM
-M_TRACEFILES WHERE HOST = '$hostname'
+SECONDS_BETWEEN('1970-01-01 00:00:00', FILE_MTIME) - (SELECT VALUE FROM
+M_HOST_INFORMATION WHERE KEY = 'timezone_offset' AND HOST = '$hostname')
+AS UNIXMTIME FROM M_TRACEFILES WHERE HOST = '$hostname'
 QUERY
 }
 
@@ -634,7 +635,7 @@ get_sections() {
     echo "$tenant_name"
     mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_sap_hana_db_status)" "$credentials" "$ssloption"
 
-    echo "<<<sap_hana_backup:sep(59)>>>"
+    echo "<<<sap_hana_backup_v2:sep(59)>>>"
     echo "$tenant_name"
     mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_sap_hana_backup_snapshots)" "$credentials" "$ssloption"
     mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_sap_hana_backup_complete)" "$credentials" "$ssloption"
@@ -672,8 +673,22 @@ get_sections() {
     mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_sap_hana_proc "$hostname")" "$credentials" "$ssloption"
 
     echo "<<<sap_hana_fileinfo:sep(59)>>>"
+    # File age is calculated as
+
+    # reference timestamp (aka current time: 'date +%s') - file mtime (retrieved from the database using 'query_fileinfo')
+
+    # The logical order of operation should therefore be:
+    # 1. Get file mtime from SAP Hana
+    # 2. Determine current time as a reference timestamp to be used to
+    #    calculate file age
+
+    # If the reference timestamp is determined before the file mtime is
+    # collected, this could give rise to a scenario in which the file mtime is newer
+    # than the reference timestamp, leading to a negative file age.
+
+    filestats=$(mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_fileinfo "$sid" "$instance" "$db" "$hostname")" "$credentials" "$ssloption")
     date +%s
-    mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_fileinfo "$sid" "$instance" "$db" "$hostname")" "$credentials" "$ssloption"
+    echo "${filestats}"
 
     # echo "<<<sap_hana_threads:sep(59)>>>"
     # echo $tenant_name
@@ -698,7 +713,7 @@ get_empty_sections() {
     echo "$tenant_name"
     mk_hdbsql "$sid" "$instance" "$instance_user" "$db" "$(query_sap_hana_db_status)" "$credentials" "$ssloption"
 
-    echo "<<<sap_hana_backup:sep(59)>>>"
+    echo "<<<sap_hana_backup_v2:sep(59)>>>"
     echo "$tenant_name"
 
     echo "<<<sap_hana_data_volume:sep(59)>>>"

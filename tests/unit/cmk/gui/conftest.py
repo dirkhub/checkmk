@@ -7,11 +7,12 @@
 # pylint: disable=redefined-outer-name
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from contextlib import contextmanager
 from http.cookiejar import CookieJar
-from typing import Any, Dict, Iterator, Literal, NamedTuple, Optional
+from typing import Any, Callable, ContextManager, Dict, Iterator, Literal, NamedTuple, Optional
 
 import pytest
 import webtest  # type: ignore[import]
@@ -20,6 +21,7 @@ import webtest  # type: ignore[import]
 from _pytest.monkeypatch import MonkeyPatch
 from mock import MagicMock
 
+from tests.testlib.rest_api_client import expand_rel, get_link
 from tests.testlib.users import create_and_destroy_user
 
 import cmk.utils.log
@@ -33,6 +35,7 @@ from cmk.gui import main_modules, watolib
 from cmk.gui.globals import config
 from cmk.gui.utils import get_failed_plugins
 from cmk.gui.utils.json import patch_json
+from cmk.gui.utils.logged_in import SuperUserContext, UserContext
 from cmk.gui.utils.script_helpers import application_and_request_context, session_wsgi_app
 from cmk.gui.watolib import hosts_and_folders, search
 
@@ -189,30 +192,6 @@ def with_automation_user(request_context: None, load_config: None) -> Iterator[t
         yield user
 
 
-def get_link(resp: dict, rel: str):
-    for link in resp.get("links", []):
-        if link["rel"].startswith(rel):
-            return link
-    if "result" in resp:
-        for link in resp["result"].get("links", []):
-            if link["rel"].startswith(rel):
-                return link
-    for member in resp.get("members", {}).values():
-        if member["memberType"] == "action":
-            for link in member["links"]:
-                if link["rel"].startswith(rel):
-                    return link
-    raise KeyError("%r not found" % (rel,))
-
-
-def _expand_rel(rel: str) -> str:
-    if rel.startswith(".../"):
-        rel = rel.replace(".../", "urn:org.restfulobjects:rels/")
-    if rel.startswith("cmk/"):
-        rel = rel.replace("cmk/", "urn:com.checkmk:rels/")
-    return rel
-
-
 class WebTestAppForCMK(webtest.TestApp):
     """A webtest.TestApp class with helper functions for automation user APIs"""
 
@@ -226,14 +205,13 @@ class WebTestAppForCMK(webtest.TestApp):
         self.password = password
 
     def call_method(self, method: HTTPMethod, url, *args, **kw) -> webtest.TestResponse:
-        print(method, url, args, kw)
         return getattr(self, method.lower())(url, *args, **kw)
 
     def has_link(self, resp: webtest.TestResponse, rel) -> bool:
         if resp.status_code == 204:
             return False
         try:
-            _ = get_link(resp.json, _expand_rel(rel))
+            _ = get_link(resp.json, expand_rel(rel))
             return True
         except KeyError:
             return False
@@ -250,7 +228,7 @@ class WebTestAppForCMK(webtest.TestApp):
         if resp.status.startswith("2") and resp.content_type.endswith("json"):
             if json_data is None:
                 json_data = resp.json
-            link = get_link(json_data, _expand_rel(rel))
+            link = get_link(json_data, expand_rel(rel))
             if "body_params" in link and link["body_params"]:
                 params["params"] = json.dumps(link["body_params"])
                 params["content_type"] = "application/json"
@@ -319,13 +297,14 @@ def logged_in_admin_wsgi_app(wsgi_app, with_admin):
 
 
 @pytest.fixture()
-def with_groups(request_context, with_admin_login, suppress_remote_automation_calls):
+def with_groups(monkeypatch, request_context, with_admin_login, suppress_remote_automation_calls):
     watolib.add_group("windows", "host", {"alias": "windows"})
     watolib.add_group("routers", "service", {"alias": "routers"})
     watolib.add_group("admins", "contact", {"alias": "admins"})
     yield
     watolib.delete_group("windows", "host")
     watolib.delete_group("routers", "service")
+    monkeypatch.setattr(cmk.gui.watolib.mkeventd, "_get_rule_stats_from_ec", lambda: {})
     watolib.delete_group("admins", "contact")
 
 
@@ -350,3 +329,49 @@ def with_host(
 @pytest.fixture(autouse=True)
 def mock__add_extensions_for_license_usage(monkeypatch):
     monkeypatch.setattr(activate_changes, "_add_extensions_for_license_usage", lambda: None)
+
+
+@pytest.fixture
+def run_as_user() -> Callable[[UserId], ContextManager[None]]:
+    """Fixture to run parts of test-code as another user
+
+    Examples:
+
+        def test_function(run_as_user):
+            print("Run as Nobody")
+            with run_as_user(UserID("egon")):
+                 print("Run as 'egon'")
+            print("Run again as Nobody")
+
+    """
+
+    @contextlib.contextmanager
+    def _run_as_user(user_id: UserId) -> Iterator[None]:
+        cmk.gui.config.load_config()
+        with UserContext(user_id):
+            yield None
+
+    return _run_as_user
+
+
+@pytest.fixture
+def run_as_superuser() -> Callable[[], ContextManager[None]]:
+    """Fixture to run parts of test-code as the superuser
+
+    Examples:
+
+        def test_function(run_as_superuser):
+            print("Run as Nobody")
+            with run_as_superuser():
+                 print("Run as Superuser")
+            print("Run again as Nobody")
+
+    """
+
+    @contextlib.contextmanager
+    def _run_as_superuser() -> Iterator[None]:
+        cmk.gui.config.load_config()
+        with SuperUserContext():
+            yield None
+
+    return _run_as_superuser

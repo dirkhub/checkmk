@@ -80,6 +80,8 @@ const char *const kLogDebug = "debug";        // string no, yes, all
 const char *const kLogWinDbg = "windbg";      // bool
 const char *const kLogEvent = "eventlog";     // bool
 const char *const kLogFile = "file";          // string
+const char *const kLogFileMaxFileCount = "max_file_count";  // string
+const char *const kLogFileMaxFileSize = "max_file_size";    // string
 
 // group plugins
 const char *const kPluginsFolders = "folders";            // seq
@@ -201,6 +203,7 @@ constexpr std::string_view kControllerForceLegacy = "force_legacy";    // bool
 constexpr std::string_view kControllerAgentChannel = "agent_channel";  // str
 constexpr std::string_view kControllerLocalOnly = "local_only";        // bool
 constexpr std::string_view kControllerOnCrash = "on_crash";            // string
+constexpr std::string_view kControllerAllowElevated = "allow_elevated";  // bool
 
 constexpr const char *const kFirewall = "firewall";  // dictionary
 constexpr const char *const kFirewallMode = "mode";  // string
@@ -279,12 +282,13 @@ constexpr std::string_view kModulesDir = "modules\\{}";
 constexpr std::string_view kModuleUsageDefaultMode = values::kModuleUsageAuto;
 
 constexpr uint32_t kServiceWaitNetwork = 30;
-constexpr std::string_view kControllerAgentChannelDefault{"localhost:50001"};
+constexpr std::string_view kControllerAgentChannelDefault{"localhost:28250"};
 constexpr std::string_view kControllerOnCrashDefault{
     values::kControllerOnCrashIgnore};
 constexpr bool kControllerLocalOnly{true};
 constexpr bool kControllerForceLegacy{false};
 constexpr bool kControllerCheck{true};
+constexpr bool kControllerAllowElevated{true};
 
 }  // namespace defaults
 

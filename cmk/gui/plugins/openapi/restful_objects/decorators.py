@@ -9,14 +9,21 @@ Decorating a function with `Endpoint` will result in a change of the SPEC object
 which then has to be dumped into the checkmk.yaml file.
 
 """
+from __future__ import annotations
+
+import contextlib
 import functools
 import hashlib
 import http.client
 import json
+import logging
+import typing
 from types import FunctionType
 from typing import (
     Any,
+    Callable,
     Dict,
+    Generator,
     List,
     Literal,
     Mapping,
@@ -28,9 +35,11 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib import parse
 
 import apispec  # type: ignore[import]
 import apispec.utils  # type: ignore[import]
+from marshmallow import fields as ma_fields
 from marshmallow import Schema, ValidationError
 from marshmallow.schema import SchemaMeta
 from werkzeug.datastructures import MultiDict
@@ -38,9 +47,13 @@ from werkzeug.http import parse_options_header
 from werkzeug.utils import import_string
 
 from cmk.utils import store
+from cmk.utils.type_defs import HTTPMethod
 
 from cmk.gui import fields
+from cmk.gui import http as cmk_http
 from cmk.gui.globals import config, request
+from cmk.gui.permissions import permission_registry
+from cmk.gui.plugins.openapi.restful_objects import permissions
 from cmk.gui.plugins.openapi.restful_objects.code_examples import code_samples
 from cmk.gui.plugins.openapi.restful_objects.endpoint_registry import ENDPOINT_REGISTRY
 from cmk.gui.plugins.openapi.restful_objects.parameters import (
@@ -56,7 +69,6 @@ from cmk.gui.plugins.openapi.restful_objects.type_defs import (
     EndpointTarget,
     ErrorStatusCodeInt,
     ETagBehaviour,
-    HTTPMethod,
     LinkRelation,
     LocationType,
     OpenAPIParameter,
@@ -68,15 +80,40 @@ from cmk.gui.plugins.openapi.restful_objects.type_defs import (
     SchemaParameter,
     StatusCodeInt,
 )
-from cmk.gui.plugins.openapi.utils import problem
+from cmk.gui.plugins.openapi.utils import problem, ProblemException
 from cmk.gui.watolib.activate_changes import (
     update_config_generation as activate_changes_update_config_generation,
 )
 from cmk.gui.watolib.git import do_git_commit
 
+if typing.TYPE_CHECKING:
+    from cmk.gui.wsgi.type_defs import WSGIApplication
+
 _SEEN_ENDPOINTS: Set[FunctionType] = set()
 
 T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
+
+WrappedFunc = Callable[[typing.Mapping[str, Any]], cmk_http.Response]
+
+
+_logger = logging.getLogger(__name__)
+
+
+class WrappedEndpoint:
+    def __init__(
+        self,
+        endpoint: Endpoint,
+        func: WrappedFunc,
+    ) -> None:
+        self.endpoint: typing.Final = endpoint
+        self.path: typing.Final = endpoint.path
+        self.func: typing.Final = func
+
+    def __call__(self, param: typing.Mapping[str, Any]) -> cmk_http.Response:
+        return self.func(param)
+
 
 Version = str
 
@@ -175,14 +212,37 @@ def _render_path_item(
     return response
 
 
-def _from_multi_dict(multi_dict: MultiDict) -> Dict[str, Union[List[str], str]]:
+ArgDict = dict[str, Union[str, list[str]]]
+
+
+def _filter_profile_headers(arg_dict: ArgDict) -> ArgDict:
+    """Filter the _profile variable from the query string
+
+    Args:
+        arg_dict:
+            A dict of query string arguments
+
+    Returns:
+        A new dict without the '_profile' parameter.
+
+
+    Examples:
+
+        >>> _filter_profile_headers({'foo': 'bar', '_profile': '1'})
+        {'foo': 'bar'}
+
+    """
+    return {key: value for key, value in arg_dict.items() if not key.startswith("_profile")}
+
+
+def _from_multi_dict(multi_dict: MultiDict, list_fields: tuple[str, ...]) -> ArgDict:
     """Transform a MultiDict to a non-heterogenous dict
 
     Meaning: lists are lists and lists of lenght 1 are scalars.
 
     Examples:
-        >>> _from_multi_dict(MultiDict([('a', '1'), ('a', '2'), ('c', '3')]))
-        {'a': ['1', '2'], 'c': '3'}
+        >>> _from_multi_dict(MultiDict([('a', '1'), ('a', '2'), ('c', '3'), ('d', '4')]), ('d',))
+        {'a': ['1', '2'], 'c': '3', 'd': ['4']}
 
     Args:
         multi_dict:
@@ -194,7 +254,7 @@ def _from_multi_dict(multi_dict: MultiDict) -> Dict[str, Union[List[str], str]]:
     """
     ret = {}
     for key, values in multi_dict.to_dict(flat=False).items():
-        if len(values) == 1:
+        if len(values) == 1 and key not in list_fields:
             ret[key] = values[0]
         else:
             ret[key] = values
@@ -273,13 +333,42 @@ class Endpoint:
             with the 'ETag' response header. When set to 'both', it will act as if set to
             'input' and 'output' at the same time.
 
+        permissions_required:
+            A declaration of the permissions required by this endpoint. This needs to be
+            exhaustive in the sense that any permission which MAY be used by this endpoint NEEDS
+            to be declared here!
+
+            WARNING
+                Failing to do so will result in runtime exceptions when an *undeclared*
+                permission is required in the code.
+
+            The combinators "Any" and "All" can be used to express more complex cases. For example:
+
+                AnyPerm([All([Perm("wato.edit"), Perm("wato.access")]), Perm("wato.godmode")])
+
+            This expresses that the endpoint requires either "wato.godmode" or "wato.access"
+            and "wato.edit" at them same time. The nesting can be arbitrarily deep. For no access
+            at all, NoPerm() can be used. Import these helpers from the `permissions` package.
+
+        permissions_description:
+            All declared permissions are documented in the REST API documentation with their
+            default description taken from the permission_registry. When you need a more
+            descriptive permission description you can declare them with a dict.
+
+            Example:
+
+                {"wato.godmode": "You can do whatever you want!"}
+
         update_config_generation:
             Wether to generate a new configuration. All endpoints with methods other than `get`
             normally trigger a regeneration of the configuration. This can be turned off by
             setting `update_config_generation` to False.
 
-        **options:
-            Various keys which will be directly applied to the OpenAPI operation object.
+        deprecated_urls:
+            A map from deprecated URL to Werk ID. The given URLs will be rendered exactly like the
+            non-deprecated Endpoint, yet marked as *deprecated*. Additionally, a warning is written
+            into its documentation string, explaining the deprecation and a link to the Werk.
+            The URLs need to start with a slash /
 
     """
 
@@ -304,11 +393,11 @@ class Endpoint:
         tag_group: Literal["Monitoring", "Setup", "Checkmk Internal"] = "Setup",
         blacklist_in: Optional[Sequence[EndpointTarget]] = None,
         additional_status_codes: Optional[Sequence[StatusCodeInt]] = None,
+        permissions_required: Optional[permissions.BasePerm] = None,  # will be permissions.NoPerm()
+        permissions_description: Optional[Mapping[str, str]] = None,
         valid_from: Optional[Version] = None,
         valid_until: Optional[Version] = None,
-        func: Optional[FunctionType] = None,
-        operation_id: Optional[str] = None,
-        wrapped: Optional[Any] = None,
+        deprecated_urls: Optional[Mapping[str, int]] = None,
         update_config_generation: bool = True,
     ):
         self.path = path
@@ -325,17 +414,28 @@ class Endpoint:
         self.query_params = query_params
         self.header_params = header_params
         self.etag = etag
-        self.status_descriptions = status_descriptions if status_descriptions is not None else {}
-        self.options: Dict[str, str] = options if options is not None else {}
+        self.status_descriptions = self._dict(status_descriptions)
+        self.options = self._dict(options)
         self.tag_group = tag_group
         self.blacklist_in: List[EndpointTarget] = self._list(blacklist_in)
         self.additional_status_codes = self._list(additional_status_codes)
+        self.permissions_description = self._dict(permissions_description)
         self.valid_from = valid_from
         self.valid_until = valid_until
-        self.func = func
-        self.operation_id = operation_id
-        self.wrapped = wrapped
+        if deprecated_urls is not None:
+            for url in deprecated_urls:
+                if not url.startswith("/"):
+                    raise ValueError(f"Deprecated URL {url!r} doesn't start with a slash /.")
+        self.deprecated_urls = deprecated_urls
+
+        self.operation_id: str
+        self.func: WrappedFunc
+        self.wrapped: Callable[[typing.Mapping[str, Any]], WSGIApplication]
         self.update_config_generation = update_config_generation
+
+        self.permissions_required = permissions_required
+        self._used_permissions: Set[str] = set()
+        self.track_permissions = True
 
         self._expected_status_codes = self.additional_status_codes.copy()
 
@@ -388,6 +488,22 @@ class Endpoint:
                     f"Status code {status_code} not expected for endpoint: {method.upper()} {path}"
                 )
 
+    @contextlib.contextmanager
+    def do_not_track_permissions(self) -> typing.Iterator[None]:
+        self.track_permissions = False
+        yield
+        self.track_permissions = True
+
+    def remember_checked_permission(self, permission: str) -> None:
+        """Remember that a permission has been required (used)
+
+        The endpoint acts as a storage for triggered permissions under the current run. Once
+        the request has been done, everything is forgotten again."""
+        self._used_permissions.add(permission)
+
+    def __repr__(self):
+        return f"<Endpoint {self.func.__module__}:{self.func.__name__}>"
+
     def error_schema(self, status_code: ErrorStatusCodeInt) -> ApiError:
         schema: Type[ApiError] = self.error_schemas.get(status_code, ApiError)
         return schema()
@@ -395,7 +511,10 @@ class Endpoint:
     def _list(self, sequence: Optional[Sequence[T]]) -> List[T]:
         return list(sequence) if sequence is not None else []
 
-    def __call__(self, func):
+    def _dict(self, mapping: Optional[Mapping[K, V]]) -> Dict[K, V]:
+        return dict(mapping) if mapping is not None else {}
+
+    def __call__(self, func: WrappedFunc) -> WrappedEndpoint:
         """This is the real decorator.
         Returns:
         A wrapped function. The wrapper does input and output validation.
@@ -423,7 +542,7 @@ class Endpoint:
 
         self.func = func
 
-        wrapped = self.wrap_with_validation(
+        wrapped = self.wrapped = self.wrap_with_validation(
             request_schema,
             response_schema,
             header_schema,
@@ -466,9 +585,7 @@ class Endpoint:
                 "'response_schema' may not be used."
             )
 
-        self.wrapped = wrapped
-        self.wrapped.path = self.path
-        return self.wrapped
+        return WrappedEndpoint(self, wrapped)
 
     def _is_expected_content_type(self, content_type_header: Optional[str]) -> None:
         if content_type_header is None:
@@ -499,7 +616,7 @@ class Endpoint:
         header_schema: Optional[Type[Schema]],
         path_schema: Optional[Type[Schema]],
         query_schema: Optional[Type[Schema]],
-    ):
+    ) -> WrappedFunc:
         """Wrap a function with schema validation logic.
 
         Args:
@@ -525,8 +642,13 @@ class Endpoint:
             raise RuntimeError("Decorating failure. function not set.")
 
         @functools.wraps(self.func)
-        def _validating_wrapper(param):
+        def _validating_wrapper(param: typing.Mapping[str, Any]) -> cmk_http.Response:
             # TODO: Better error messages, pointing to the location where variables are missing
+
+            self._used_permissions = set()
+
+            _params = dict(param)
+            del param
 
             def _format_fields(_messages: Union[List, Dict]) -> str:
                 if isinstance(_messages, list):
@@ -559,16 +681,29 @@ class Endpoint:
 
             try:
                 if path_schema:
-                    param.update(path_schema().load(param))
+                    _params.update(
+                        path_schema().load({k: parse.unquote(v) for k, v in _params.items()})
+                    )
             except ValidationError as exc:
                 return _problem(exc, status_code=404)
 
             try:
                 if query_schema:
-                    param.update(query_schema().load(_from_multi_dict(request.args)))
+                    list_fields = tuple(
+                        {
+                            k
+                            for k, v in query_schema().fields.items()
+                            if isinstance(v, ma_fields.List)
+                        }
+                    )
+                    _params.update(
+                        query_schema().load(
+                            _filter_profile_headers(_from_multi_dict(request.args, list_fields))
+                        )
+                    )
 
                 if header_schema:
-                    param.update(header_schema().load(request.headers))
+                    _params.update(header_schema().load(request.headers))
 
                 if request_schema:
                     # Try to decode only when there is data. Decoding an empty string will fail.
@@ -576,7 +711,7 @@ class Endpoint:
                         json_data = request.json or {}
                     else:
                         json_data = {}
-                    param["body"] = request_schema().load(json_data)
+                    _params["body"] = request_schema().load(json_data)
             except ValidationError as exc:
                 return _problem(exc, status_code=400)
 
@@ -605,21 +740,65 @@ class Endpoint:
                     "You may be able to query the central site.",
                 )
 
+            # TODO: Uncomment in later commit
+            # if self.permissions_required is None:
+            #     # Intentionally generate a crash report.
+            #     raise PermissionError(f"Permissions need to be specified for {self}")
+
             try:
-                response = self.func(param)
+                response = self.func(_params)
             except ValidationError as exc:
                 response = _problem(exc, status_code=400)
+            except ProblemException as problem_exception:
+                response = problem_exception.to_problem()
+
+            # We don't expect a permission to be triggered when an endpoint ran into an error.
+            if response.status_code < 400:
+                if (
+                    self.permissions_required is not None
+                    and not self.permissions_required.validate(list(self._used_permissions))
+                ):
+
+                    required_permissions = list(self._used_permissions)
+                    declared_permissions = self.permissions_required
+
+                    _logger.error(
+                        "Permission mismatch: %r Params: %s Required: %s Declared: %s",
+                        self,
+                        _params,
+                        required_permissions,
+                        declared_permissions,
+                    )
+
+                    if request.environ.get("paste.testing"):
+                        raise PermissionError(
+                            "Permission mismatch\n"
+                            "There can be some causes for this error:\n"
+                            "* a permission which was required (successfully) was not declared\n"
+                            "* a permission which was declared (not optional) was not required\n"
+                            "* No permission was required at all, although permission were declared\n"
+                            f"Endpoint: {self}\n"
+                            f"Params: {_params!r}\n"
+                            f"Required: {required_permissions}\n"
+                            f"Declared: {declared_permissions}\n"
+                        )
+
+                    return problem(
+                        status=500,
+                        title="Internal Server Error",
+                        detail="Permission mismatch. See the server logs for more information.",
+                    )
 
             if self.output_empty and response.status_code < 400 and response.data:
                 return problem(
                     status=500,
                     title="Unexpected data was sent.",
-                    detail=(f"Endpoint {self.operation_id}\n" "This is a bug, please report."),
+                    detail=f"Endpoint {self.operation_id}\nThis is a bug, please report.",
                     ext={"data_sent": str(response.data)},
                 )
 
             if self.output_empty:
-                response.content_type = None
+                response.content_type = ""
 
             if response.status_code not in self._expected_status_codes:
                 return problem(
@@ -666,11 +845,13 @@ class Endpoint:
                 except ValidationError as exc:
                     return problem(
                         status=500,
-                        title="Server was about to send an invalid response.",
-                        detail="This is an error of the implementation.",
+                        title="Mismatch between endpoint and internal data format. ",
+                        detail="This could be due to invalid or outdated configuration, or be an error of the implementation. "
+                        "Please check your *.mk files in case you have modified them by hand and run cmk-update-config. "
+                        "If the problem persists afterwards, please report a bug.",
                         ext={
                             "errors": exc.messages,
-                            "orig": data,
+                            "debug_data": {"orig": data},
                         },
                     )
 
@@ -694,13 +875,13 @@ class Endpoint:
             response.freeze()
             return response
 
-        def _wrap_with_wato_lock(func):
+        def _wrap_with_wato_lock(func: WrappedFunc) -> WrappedFunc:
             # We need to lock the whole of the validation process, not just the function itself.
             # This is necessary, because sometimes validation logic loads values which trigger
             # a cache-load, which - without locking - could become inconsistent. This is obviously
             # a deeper problem of those components which needs to be fixed as well.
             @functools.wraps(func)
-            def _wrapper(param):
+            def _wrapper(param: typing.Mapping[str, Any]) -> cmk_http.Response:
                 if not self.skip_locking and self.method != "get":
                     with store.lock_checkmk_configuration():
                         response = func(param)
@@ -761,11 +942,20 @@ class Endpoint:
             headers=headers,
         )
 
-    def to_operation_dict(self) -> OperationSpecType:
+    def operation_dicts(self) -> Generator[Tuple[str, OperationSpecType], None, None]:
         """Generate the openapi spec part of this endpoint.
 
         The result needs to be added to the `apispec` instance manually.
         """
+        yield self.path, self.to_operation_dict()
+        if self.deprecated_urls is not None:
+            for url, werk_id in self.deprecated_urls.items():
+                yield url, self.to_operation_dict(werk_id)
+
+    def to_operation_dict(  # pylint: disable=too-many-branches
+        self,
+        werk_id: Optional[int] = None,
+    ) -> OperationSpecType:
         assert self.func is not None, "This object must be used in a decorator environment."
         assert self.operation_id is not None, "This object must be used in a decorator environment."
 
@@ -879,13 +1069,20 @@ class Endpoint:
         docstring_desc = _docstring_description(module_obj.__doc__)
         if docstring_desc:
             tag_obj["description"] = docstring_desc
+
         _add_tag(tag_obj, tag_group=self.tag_group)
 
         operation_spec: OperationSpecType = {
-            "operationId": self.operation_id,
             "tags": [docstring_name],
             "description": "",
         }
+        if werk_id:
+            operation_spec["deprecated"] = True
+            # ReDoc uses operationIds to build its URLs, so it needs a unique operationId,
+            # otherwise links won't work properly.
+            operation_spec["operationId"] = f"{self.operation_id}-{werk_id}"
+        else:
+            operation_spec["operationId"] = self.operation_id
 
         header_params: List[RawParameter] = []
         query_params: Sequence[RawParameter] = (
@@ -945,13 +1142,77 @@ class Endpoint:
             operation_spec["summary"] = docstring_name
         else:
             raise RuntimeError(f"Please put a docstring onto {self.operation_id}")
-        docstring_desc = _docstring_description(self.func.__doc__)
-        if docstring_desc:
-            operation_spec["description"] = docstring_desc
+
+        if description := _build_description(_docstring_description(self.func.__doc__), werk_id):
+            # The validator will complain on empty descriptions being set, even though it's valid.
+            operation_spec["description"] = description
+
+        if self.permissions_required is not None:
+            # Check that all the names are known to the system.
+            for perm in self.permissions_required.iter_perms():
+                if perm not in permission_registry:
+                    # NOTE:
+                    #   See rest_api.py. dynamic_permission() have to be loaded before request
+                    #   for this to work reliably.
+                    raise RuntimeError(
+                        f'Permission "{perm}" is not registered in the permission_registry.'
+                    )
+
+            # Write permission documentation in openapi spec.
+            if description := _permission_descriptions(
+                self.permissions_required, self.permissions_description
+            ):
+                operation_spec.setdefault("description", "")
+                if not operation_spec["description"]:
+                    operation_spec["description"] += "\n\n"
+                operation_spec["description"] += description
 
         apispec.utils.deepupdate(operation_spec, self.options)
 
         return {self.method: operation_spec}  # type: ignore[misc]
+
+
+def _build_description(description_text: Optional[str], werk_id: Optional[int] = None) -> str:
+    r"""Build a OperationSpecType description.
+
+    Examples:
+
+        >>> _build_description(None)
+        ''
+
+        >>> _build_description("Foo")
+        'Foo'
+
+        >>> _build_description(None, 12345)
+        '`WARNING`: This URL is deprecated, see [Werk 12345](https://checkmk.com/werk/12345) for more details.\n\n'
+
+        >>> _build_description('Foo', 12345)
+        '`WARNING`: This URL is deprecated, see [Werk 12345](https://checkmk.com/werk/12345) for more details.\n\nFoo'
+
+    Args:
+        description_text:
+            The text of the description. This may be None.
+
+        werk_id:
+            A Werk ID for a deprecation warning. This may be None.
+
+    Returns:
+        Either a complete description or None
+
+    """
+    if werk_id:
+        werk_link = f"https://checkmk.com/werk/{werk_id}"
+        description = (
+            f"`WARNING`: This URL is deprecated, see [Werk {werk_id}]({werk_link}) for more "
+            "details.\n\n"
+        )
+    else:
+        description = ""
+
+    if description_text is not None:
+        description += description_text
+
+    return description
 
 
 def _verify_parameters(
@@ -1162,3 +1423,106 @@ def _docstring_description(docstring: Optional[str]) -> Optional[str]:
     if len(parts) > 1:
         return parts[1].strip()
     return None
+
+
+def _permission_descriptions(
+    perms: permissions.BasePerm,
+    descriptions: Optional[dict[str, str]] = None,
+) -> str:
+    r"""Describe permissions human-readable
+
+    Args:
+        perms:
+        descriptions:
+
+    Examples:
+
+        >>> _permission_descriptions(
+        ...     permissions.Perm("wato.edit_folders"),
+        ...     {'wato.edit_folders': 'Allowed to cook the books.'},
+        ... )
+        'This endpoint requires the following permissions: \n * `wato.edit_folders`: Allowed to cook the books.\n'
+
+        >>> _permission_descriptions(
+        ...     permissions.AllPerm([permissions.Perm("wato.edit_folders")]),
+        ...     {'wato.edit_folders': 'Allowed to cook the books.'},
+        ... )
+        'This endpoint requires the following permissions: \n * `wato.edit_folders`: Allowed to cook the books.\n'
+
+        >>> _permission_descriptions(
+        ...     permissions.AllPerm([permissions.Perm("wato.edit_folders"),
+        ...                          permissions.Ignore(permissions.Perm("wato.edit"))]),
+        ...     {'wato.edit_folders': 'Allowed to cook the books.'},
+        ... )
+        'This endpoint requires the following permissions: \n * `wato.edit_folders`: Allowed to cook the books.\n'
+
+        >>> _permission_descriptions(
+        ...     permissions.AnyPerm([permissions.Perm("wato.edit_folders"), permissions.Perm("wato.edit_folders")]),
+        ...     {'wato.edit_folders': 'Allowed to cook the books.'},
+        ... )
+        'This endpoint requires the following permissions: \n * Any of:\n   * `wato.edit_folders`: Allowed to cook the books.\n   * `wato.edit_folders`: Allowed to cook the books.\n'
+
+        The description will have a structure like this:
+
+            * Any of:
+               * c
+               * All of:
+                  * a
+                  * b
+
+        >>> _permission_descriptions(
+        ...     permissions.AnyPerm([
+        ...         permissions.Perm("c"),
+        ...         permissions.AllPerm([
+        ...              permissions.Perm("a"),
+        ...              permissions.Perm("b"),
+        ...         ]),
+        ...     ]),
+        ...     {'a': 'Hold a', 'b': 'Hold b', 'c': 'Hold c'}
+        ... )
+        'This endpoint requires the following permissions: \n * Any of:\n   * `c`: Hold c\n   * All of:\n     * `a`: Hold a\n     * `b`: Hold b\n'
+
+    Returns:
+        The description as a string.
+
+    """
+    description_map: Dict[str, str] = descriptions if descriptions is not None else {}
+    _description: List[str] = ["This endpoint requires the following permissions: "]
+
+    def _count_perms(_perms):
+        return len([p for p in _perms if not isinstance(p, permissions.Ignore)])
+
+    def _add_desc(permission: permissions.BasePerm, indent: int, desc_list: List[str]) -> None:
+        # We indent by two spaces, as is required by markdown.
+        prefix = "  " * indent
+        if isinstance(permission, permissions.Perm):
+            perm_name = permission.name
+            desc = description_map.get(perm_name) or permission_registry[perm_name].description
+            _description.append(f"{prefix} * `{perm_name}`: {desc}")
+        elif isinstance(permission, permissions.AllPerm):
+            # If AllOf only contains one permission, we don't need to show the AllOf
+            if _count_perms(permission.perms) == 1:
+                _add_desc(permission.perms[0], indent, desc_list)
+            else:
+                desc_list.append(f"{prefix} * All of:")
+                for perm in permission.perms:
+                    _add_desc(perm, indent + 1, desc_list)
+        elif isinstance(permission, permissions.AnyPerm):
+            # If AnyOf only contains one permission, we don't need to show the AnyOf
+            if _count_perms(permission.perms) == 1:
+                _add_desc(permission.perms[0], indent, desc_list)
+            else:
+                desc_list.append(f"{prefix} * Any of:")
+                for perm in permission.perms:
+                    _add_desc(perm, indent + 1, desc_list)
+        elif isinstance(permission, permissions.Optional):
+            desc_list.append(f"{prefix} * Optionally:")
+            _add_desc(permission.perm, indent + 1, desc_list)
+        elif isinstance(permission, permissions.Ignore):
+            # Don't render
+            pass
+        else:
+            raise NotImplementedError(f"Printing of {permission!r} not yet implemented.")
+
+    _add_desc(perms, 0, _description)
+    return "\n".join(_description) + "\n"

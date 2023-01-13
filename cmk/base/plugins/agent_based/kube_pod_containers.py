@@ -76,7 +76,8 @@ def check_running(params: Mapping[str, int], state: ContainerRunningState) -> Ch
 
 
 def check_waiting(params: Mapping[str, int], state: ContainerWaitingState) -> CheckResult:
-    summary = f"Status: Waiting ({state.reason}: {state.detail})"
+    detail_for_summary = (state.detail or "None").replace("\n", "; ")
+    summary = f"Status: Waiting ({state.reason}: {detail_for_summary})"
     yield Result(state=State.OK, summary=summary)
 
 
@@ -86,12 +87,25 @@ def check_terminated(params: Mapping[str, int], state: ContainerTerminatedState)
     if state.exit_code != 0:
         result_state = State(params["failed_state"])
         status = "Failed"
-    summary = f"Status: {status} ({state.reason}: {state.detail})"
+    detail_for_summary = (state.detail or "None").replace("\n", "; ")
+    summary = f"Status: {status} ({state.reason}: {detail_for_summary})"
     yield Result(state=result_state, summary=summary)
-    end_time = render.datetime(state.end_time)
-    duration = render.timespan(state.end_time - state.start_time)
-    summary = f"End time: {end_time} Run duration: {duration}"
-    yield Result(state=State.OK, summary=summary)
+
+    if state.start_time is not None and state.end_time is not None:
+        duration = render.timespan(state.end_time - state.start_time)
+        summary = f"End time: {render.datetime(state.end_time)} Run duration: {duration}"
+        yield Result(state=State.OK, summary=summary)
+        return
+
+    # the scenario where both times are not set can be related to following code block
+    # https://pkg.go.dev/k8s.io/api@v0.23.5/core/v1#ContainerStateTerminated
+    # reproducing the error is not trivial and most likely involves enforcing a status processing
+    # error from Kubernetes' side
+    if state.start_time is not None:
+        yield Result(state=State.OK, summary=f"Start time: {render.datetime(state.start_time)}")
+
+    if state.end_time is not None:
+        yield Result(state=State.OK, summary=f"End time: {render.datetime(state.end_time)}")
 
 
 register.check_plugin(

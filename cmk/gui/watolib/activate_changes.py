@@ -42,6 +42,7 @@ import cmk.utils
 import cmk.utils.agent_registration as agent_registration
 import cmk.utils.daemon as daemon
 import cmk.utils.license_usage.samples as license_usage_samples
+import cmk.utils.packaging
 import cmk.utils.paths
 import cmk.utils.render as render
 import cmk.utils.store as store
@@ -75,9 +76,15 @@ from cmk.gui.plugins.watolib.utils import (
     SerializedSettings,
     wato_fileheader,
 )
-from cmk.gui.sites import activation_sites, allsites
+from cmk.gui.sites import activation_sites
 from cmk.gui.sites import disconnect as sites_disconnect
-from cmk.gui.sites import get_site_config, is_single_local_site, site_is_local, SiteStatus
+from cmk.gui.sites import (
+    get_enabled_sites,
+    get_site_config,
+    is_single_local_site,
+    site_is_local,
+    SiteStatus,
+)
 from cmk.gui.sites import states as sites_states
 from cmk.gui.type_defs import ConfigDomainName, HTTPVariables
 from cmk.gui.utils.ntop import is_ntop_configured
@@ -142,8 +149,8 @@ def get_trial_expired_message() -> str:
     return _(
         "Sorry, but your unlimited 30-day trial of Checkmk has ended. "
         "The Checkmk Free Edition does not allow distributed setups after the 30-day trial period. "
-        "In case you want to test distributed setups, please "
-        '<a href="https://checkmk.com/contact.php?" target="_blank">contact us</a>.'
+        "In case you want to test distributed setups, please contact us at "
+        "https://checkmk.com/contact"
     )
 
 
@@ -288,9 +295,10 @@ def get_replication_paths() -> List[ReplicationPath]:
                 "customer_multisite",
                 "customer_check_mk",
                 "customer_gui_design",
-                "gui_logo",
-                "gui_logo_facelift",
-                "gui_logo_dark",
+                "login_logo_facelift",
+                "login_logo_dark",
+                "navbar_logo_facelift",
+                "navbar_logo_dark",
             }
         ]
 
@@ -745,8 +753,9 @@ class ActivateChangesManager(ActivateChanges):
         return "%s/%s/info.mk" % (self.activation_tmp_base_dir, activation_id)
 
     def activations(self):
-        for activation_id in os.listdir(self.activation_tmp_base_dir):
-            yield activation_id, self._load_activation_info(activation_id)
+        if os.path.exists(self.activation_tmp_base_dir):
+            for activation_id in os.listdir(self.activation_tmp_base_dir):
+                yield activation_id, self._load_activation_info(activation_id)
 
     def _site_snapshot_file(self, site_id):
         return "%s/%s/site_%s_sync.tar.gz" % (
@@ -1024,6 +1033,9 @@ class SnapshotManager:
                         site_id, snapshot_settings, snapshot_creator, self._data_collector
                     )
 
+        # 3. Allow hooks to further modify the reference data for the remote site
+        hooks.call("post-snapshot-creation", self._site_snapshot_settings)
+
 
 class ABCSnapshotDataCollector(abc.ABC):
     """Prepares files to be synchronized to the remote sites"""
@@ -1113,9 +1125,23 @@ class CRESnapshotDataCollector(ABCSnapshotDataCollector):
         if os.path.exists(snapshot_settings.work_dir):
             shutil.rmtree(snapshot_settings.work_dir)
 
-        for component in snapshot_settings.snapshot_components:
-            if component.ident == "sitespecific":
-                continue  # Will be created for each site individually later
+        for component in self.get_generic_components():
+            # Generic components (i.e. any component that does not have "ident"
+            # = "sitespecific") are collected to be snapshotted. Site-specific
+            # components as well as distributed wato components are done later on
+            # in the process.
+
+            # Note that at this stage, components that have been deselected
+            # from site synchronisation by the user must not be pre-filtered,
+            # otherwise these settings would cascade randomly from the first site
+            # to the other sites.
+
+            # These components are deselected in the snapshot settings of the
+            # site, which is the basis of the actual synchronisation.
+
+            # Examples of components that can be excluded:
+            # - event console ("mkeventd", "mkeventd_mkp")
+            # - MKPs ("local", "mkps")
 
             source_path = cmk.utils.paths.omd_root / component.site_path
             target_path = Path(snapshot_settings.work_dir).joinpath(component.site_path)
@@ -1563,7 +1589,13 @@ class ActivateChangesSite(multiprocessing.Process, ActivateChanges):
             self._set_done_result(configuration_warnings)
         except Exception as e:
             self._logger.exception("error activating changes")
-            self._set_result(PHASE_DONE, _("Failed"), str(e), state=STATE_ERROR)
+            # The text of following exception will be rendered in the GUI and the error message may
+            # contain some remotely-fetched data (including HTML) so we are escaping it to avoid
+            # executing arbitrary HTML code.
+            # The escape function does not escape some simple tags used for formatting.
+            # SUP-9840
+            escaped_exception = escaping.escape_text(str(e))
+            self._set_result(PHASE_DONE, _("Failed"), escaped_exception, state=STATE_ERROR)
 
         finally:
             self._unlock_activation()
@@ -2171,6 +2203,8 @@ def _execute_post_config_sync_actions(site_id: SiteId) -> None:
         # version, the config migration logic has to be executed to make the local
         # configuration compatible with the local Checkmk version.
         if _need_to_update_config_after_sync():
+            logger.debug("Fixing up synced packages")
+            cmk.utils.packaging.pre_update_config_actions(logger)
             logger.debug("Executing cmk-update-config")
             _execute_cmk_update_config()
 
@@ -2652,7 +2686,7 @@ class AutomationReceiveConfigSync(AutomationCommand):
         return ReceiveConfigSyncRequest(
             site_id,
             _request.uploaded_file("sync_archive")[2],
-            ast.literal_eval(_request.get_ascii_input_mandatory("to_delete")),
+            ast.literal_eval(_request.get_str_input_mandatory("to_delete")),
             _request.get_integer_input_mandatory("config_generation"),
         )
 
@@ -2731,7 +2765,7 @@ def activate_changes_start(
                 )
             )
 
-    known_sites = allsites().keys()
+    known_sites = get_enabled_sites().keys()
     for site in sites:
         if site not in known_sites:
             raise MKUserError(

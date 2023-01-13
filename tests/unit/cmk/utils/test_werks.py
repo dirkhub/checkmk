@@ -64,6 +64,8 @@ def test_old_parse_check_mk_version_equals_new_version_class(version_str):
         ("2020.05.26", "2020.05.25"),
         ("2020.05.26", "2020.04.26"),
         ("2020.05.26", "2.0.0-2020.05.25"),
+        ("2022.06.02-sandbox-lm-2.2-thing", "2022.06.01"),
+        ("2.1.0-2022.06.02-sandbox-lm-2.2-thing", "2.1.0-2022.06.01"),
     ],
 )
 def test_version_comparison(version_str_a, version_str_b):
@@ -127,7 +129,22 @@ def test_werk_versions_after_tagged(precompiled_werks):
 
         # Some werks were added after the version was released. Mostly they were forgotten by
         # the developer. Consider it a hall of shame ;)
-        if werk_id in {10062, 10063, 10064, 10125, 12836, 13810, 13788, 13789, 14101}:
+        if werk_id in {
+            10062,
+            10063,
+            10064,
+            10125,
+            12836,
+            13810,
+            13788,
+            13789,
+            13930,
+            14101,
+            13829,
+            13830,
+            13949,
+            14485,
+        }:
             continue
 
         tag_name = "v%s" % werk["version"]

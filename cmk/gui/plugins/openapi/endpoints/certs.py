@@ -9,8 +9,8 @@ WARNING: Use at your own risk, not supported.
 
 Checkmk uses SSL certificates to verify push hosts.
 """
-
 from pathlib import Path
+from typing import Any, Mapping
 
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509 import CertificateSigningRequest
@@ -24,12 +24,12 @@ from cmk.gui.http import Response
 from cmk.gui.i18n import _l
 from cmk.gui.permissions import Permission, permission_registry
 from cmk.gui.plugins.openapi.restful_objects import (
-    constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
-from cmk.gui.plugins.openapi.utils import ProblemException
+from cmk.gui.plugins.openapi.utils import ProblemException, serve_json
 
 _403_STATUS_DESCRIPTION = "You do not have the permission for agent pairing."
 
@@ -72,16 +72,17 @@ def _serialized_signed_cert(csr: CertificateSigningRequest) -> str:
     status_descriptions={
         403: _403_STATUS_DESCRIPTION,
     },
+    permissions_required=permissions.Perm("general.agent_pairing"),
     response_schema=response_schemas.X509PEM,
 )
-def root_cert(param) -> Response:
+def root_cert(param: Mapping[str, Any]) -> Response:
     """X.509 PEM-encoded root certificate"""
     if not _user_is_authorized():
         raise ProblemException(
             status=403,
             title=_403_STATUS_DESCRIPTION,
         )
-    return constructors.serve_json(
+    return serve_json(
         {
             "cert": _serialized_root_cert(),
         }
@@ -97,17 +98,18 @@ def root_cert(param) -> Response:
     status_descriptions={
         403: _403_STATUS_DESCRIPTION,
     },
-    request_schema=request_schemas.X509ReqPEM,
+    request_schema=request_schemas.X509ReqPEMUUID,
     response_schema=response_schemas.X509PEM,
+    permissions_required=permissions.Perm("general.agent_pairing"),
 )
-def make_certificate(param) -> Response:
+def make_certificate(param: Mapping[str, Any]) -> Response:
     """X.509 PEM-encoded Certificate Signing Requests (CSRs)"""
     if not _user_is_authorized():
         raise ProblemException(
             status=403,
             title=_403_STATUS_DESCRIPTION,
         )
-    return constructors.serve_json(
+    return serve_json(
         {
             "cert": _serialized_signed_cert(param["body"]["csr"]),
         }

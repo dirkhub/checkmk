@@ -38,6 +38,7 @@ RUN apt-get update \
     apache2-dev \
     autoconf \
     build-essential \
+    bison \
     curl \
     default-jdk \
     devscripts \
@@ -115,6 +116,10 @@ RUN /opt/install-freetds.sh
 # jobs for special tasks (checking out git, "make dist", orchestrating other
 # containers, ...). Scripts should be usable with other Ubuntu versions.
 RUN /opt/install-rust-cargo.sh
+
+# Now shrink all the binaries and libraries we produced to build a small image
+# in the next step
+RUN /opt/strip_binaries /opt
 
 ### Actual Image ###
 FROM base

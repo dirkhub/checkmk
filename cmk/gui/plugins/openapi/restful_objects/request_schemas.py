@@ -4,7 +4,9 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 import urllib.parse
+from typing import Any, MutableMapping
 
+import marshmallow
 from marshmallow_oneofschema import OneOfSchema  # type: ignore[import]
 
 from cmk.utils.defines import weekday_ids
@@ -12,6 +14,8 @@ from cmk.utils.livestatus_helpers import tables
 
 from cmk.gui import fields as gui_fields
 from cmk.gui import watolib
+from cmk.gui.exceptions import MKInternalError
+from cmk.gui.fields import AuxTagIDField
 from cmk.gui.fields.utils import BaseSchema
 from cmk.gui.livestatus_utils.commands.acknowledgments import (
     acknowledge_host_problem,
@@ -25,9 +29,12 @@ from cmk.gui.livestatus_utils.commands.downtimes import (
     schedule_servicegroup_service_downtime,
 )
 from cmk.gui.plugins.openapi.utils import param_description
-from cmk.gui.userdb import load_users
+from cmk.gui.plugins.userdb.utils import user_attribute_registry
+from cmk.gui.userdb import load_users, register_custom_user_attributes
+from cmk.gui.watolib import userroles
+from cmk.gui.watolib.custom_attributes import load_custom_attrs_from_mk_file
 from cmk.gui.watolib.groups import is_alias_used
-from cmk.gui.watolib.tags import load_aux_tags, tag_group_exists
+from cmk.gui.watolib.tags import tag_group_exists
 from cmk.gui.watolib.timeperiods import verify_timeperiod_name_exists
 
 from cmk import fields
@@ -70,6 +77,7 @@ class CreateClusterHost(BaseSchema):
     attributes = gui_fields.attributes_field(
         "cluster",
         "create",
+        "inbound",
         description="Attributes to set on the newly created host.",
         example={"ipaddress": "192.168.0.123"},
     )
@@ -100,6 +108,7 @@ class CreateHost(BaseSchema):
     attributes = gui_fields.attributes_field(
         "host",
         "create",
+        "inbound",
         description="Attributes to set on the newly created host.",
         example={"ipaddress": "192.168.0.123"},
     )
@@ -139,6 +148,7 @@ class UpdateHost(BaseSchema):
     attributes = gui_fields.attributes_field(
         "host",
         "update",
+        "inbound",
         description=(
             "Replace all currently set attributes on the host, with these attributes. "
             "Any previously set attributes which are not given here will be removed."
@@ -149,6 +159,7 @@ class UpdateHost(BaseSchema):
     update_attributes = gui_fields.attributes_field(
         "host",
         "update",
+        "inbound",
         description=(
             "Just update the hosts attributes with these attributes. The previously set "
             "attributes will not be touched."
@@ -159,6 +170,7 @@ class UpdateHost(BaseSchema):
     remove_attributes = gui_fields.attributes_field(
         "host",
         "update",
+        "inbound",
         names_only=True,
         description="A list of attributes which should be removed.",
         example=["tag_foobar"],
@@ -459,6 +471,7 @@ class CreateFolder(BaseSchema):
     attributes = gui_fields.attributes_field(
         "folder",
         "create",
+        "inbound",
         required=False,
         description=(
             "Specific attributes to apply for all hosts in this folder " "(among other things)."
@@ -492,6 +505,7 @@ class UpdateFolder(BaseSchema):
     attributes = gui_fields.attributes_field(
         "folder",
         "update",
+        "inbound",
         description=(
             "Replace all attributes with the ones given in this field. Already set"
             "attributes, not given here, will be removed."
@@ -502,6 +516,7 @@ class UpdateFolder(BaseSchema):
     update_attributes = gui_fields.attributes_field(
         "folder",
         "update",
+        "inbound",
         description=(
             "Only set the attributes which are given in this field. Already set "
             "attributes will not be touched."
@@ -512,6 +527,7 @@ class UpdateFolder(BaseSchema):
     remove_attributes = gui_fields.attributes_field(
         "folder",
         "update",
+        "inbound",
         description="A list of attributes which should be removed.",
         example=["tag_foobar"],
         load_default=list,
@@ -1062,6 +1078,17 @@ class Username(fields.String):
             raise self.make_error("should_not_exist", username=value)
 
 
+class ExistingUserRole(fields.String):
+    default_error_messages = {
+        "invalid_role": "The specified role does not exist: {role!r}",
+    }
+
+    def _validate(self, value):
+        super()._validate(value)
+        if not userroles.role_exists(value):
+            raise self.make_error("invalid_role", role=value)
+
+
 class CustomTimeRange(BaseSchema):
     # TODO: gui_fields.Dict validation also for Timperiods
     start_time = fields.DateTime(
@@ -1306,6 +1333,10 @@ class UserContactUpdateOption(BaseSchema):
 
 
 class CreateUser(BaseSchema):
+    class Meta:
+        ordered = True
+        unknown = marshmallow.INCLUDE
+
     username = Username(
         required=True,
         should_exist=False,
@@ -1361,12 +1392,7 @@ class CreateUser(BaseSchema):
         example={"option": "global"},
     )
     roles = fields.List(
-        fields.String(
-            required=True,
-            description="A role of the user",
-            enum=["user", "admin", "guest"],
-            example="user",
-        ),
+        ExistingUserRole(description="A user role", required=True, example="user"),
         required=False,
         load_default=list,
         description="The list of assigned roles to the user",
@@ -1420,6 +1446,31 @@ class CreateUser(BaseSchema):
         description="",
     )
 
+    @marshmallow.post_load(pass_original=True)
+    def validate_custom_attributes(
+        self,
+        result_data: dict[str, Any],
+        original_data: MutableMapping[str, Any],
+        **_unused_args: Any,
+    ) -> dict[str, Any]:
+        register_custom_user_attributes(load_custom_attrs_from_mk_file(lock=False)["user"])
+
+        for field in self.fields:
+            original_data.pop(field, None)
+
+        for name, value in original_data.items():
+            attribute = user_attribute_registry.get(name)
+            if attribute is None:
+                raise marshmallow.ValidationError(f"Unknown Attribute: {name!r}")
+            if not attribute.is_custom():
+                raise MKInternalError(
+                    f"A non custom attribute is not in the CreateUser Schema: {name!r}"
+                )
+            valuespec = attribute().valuespec()
+            valuespec.validate_value(value, "")
+            result_data[name] = value
+        return result_data
+
 
 class UpdateUser(BaseSchema):
     fullname = fields.String(
@@ -1465,12 +1516,7 @@ class UpdateUser(BaseSchema):
         example={},
     )
     roles = fields.List(
-        fields.String(
-            required=False,
-            description="A role of the user",
-            enum=["user", "admin", "guest"],
-            example="user",
-        ),
+        ExistingUserRole(description="A user role", required=True, example="user"),
         required=False,
         description="The list of assigned roles to the user",
         example=["user"],
@@ -1582,32 +1628,6 @@ class Tags(fields.List):
             seen_ids.add(tag_id)
 
 
-class AuxTag(fields.String):
-    default_error_messages = {
-        "invalid": "The specified auxiliary tag id is not valid: {name!r}",
-    }
-
-    def __init__(
-        self,
-        example,
-        required=True,
-        validate=None,
-        **kwargs,
-    ):
-        super().__init__(
-            example=example,
-            required=required,
-            validate=validate,
-            **kwargs,
-        )
-
-    def _validate(self, value):
-        super()._validate(value)
-        available_aux_tags = load_aux_tags()
-        if value not in available_aux_tags:
-            raise self.make_error("invalid", name=value)
-
-
 class HostTag(BaseSchema):
     ident = fields.String(
         required=False,
@@ -1622,9 +1642,7 @@ class HostTag(BaseSchema):
         description="The title of the tag",
     )
     aux_tags = fields.List(
-        AuxTag(
-            example="ip-v4",
-            description="An auxiliary tag id",
+        AuxTagIDField(
             required=False,
         ),
         description="The list of auxiliary tag ids. Built-in tags (ip-v4, ip-v6, snmp, tcp, ping) and custom defined tags are allowed.",
@@ -1647,7 +1665,6 @@ class InputHostTagGroup(BaseSchema):
         description="A title for the host tag",
     )
     topic = fields.String(
-        required=True,
         example="Data Sources",
         description="Different tags can be grouped in a topic",
     )
@@ -1976,7 +1993,7 @@ class ActivateChanges(BaseSchema):
         example=False,
     )
     sites = fields.List(
-        gui_fields.SiteField(),
+        gui_fields.SiteField(presence="ignore"),
         description=(
             "The names of the sites on which the configuration shall be activated."
             " An empty list means all sites which have pending changes."
@@ -1995,9 +2012,9 @@ class ActivateChanges(BaseSchema):
     )
 
 
-class X509ReqPEM(BaseSchema):
-    csr = gui_fields.X509ReqPEMField(
+class X509ReqPEMUUID(BaseSchema):
+    csr = gui_fields.X509ReqPEMFieldUUID(
         required=True,
         example="-----BEGIN CERTIFICATE REQUEST-----\n...\n-----END CERTIFICATE REQUEST-----\n",
-        description="PEM-encoded X.509 CSR.",
+        description="PEM-encoded X.509 CSR. The CN must a valid version-4 UUID.",
     )

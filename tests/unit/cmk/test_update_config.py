@@ -4,7 +4,6 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# pylint: disable=redefined-outer-name
 import argparse
 import io
 import os
@@ -23,14 +22,24 @@ from tests.unit.cmk.gui.conftest import load_plugins  # noqa: F401 # pylint: dis
 import cmk.utils.log
 import cmk.utils.paths
 from cmk.utils import password_store, store, version
-from cmk.utils.type_defs import ContactgroupName, RulesetName, RuleSpec, RuleValue
-from cmk.utils.type_defs.pluginname import CheckPluginName
+from cmk.utils.type_defs import (
+    CheckPluginName,
+    ContactgroupName,
+    RulesetName,
+    RuleSpec,
+    RuleValue,
+    UserId,
+)
 from cmk.utils.version import is_raw_edition
 
 import cmk.gui.config
+from cmk.gui.type_defs import UserSpec
+from cmk.gui.userdb import load_users, save_users
 from cmk.gui.utils.script_helpers import application_and_request_context
 from cmk.gui.watolib.changes import AuditLogStore, ObjectRef, ObjectRefType
 from cmk.gui.watolib.hosts_and_folders import Folder
+
+# pylint: disable=redefined-outer-name
 from cmk.gui.watolib.password_store import PasswordStore
 from cmk.gui.watolib.rulesets import Rule, Ruleset, RulesetCollection
 
@@ -45,7 +54,7 @@ def request_context() -> Iterator[None]:
 
 @pytest.fixture(name="uc")
 def fixture_uc() -> update_config.UpdateConfig:
-    return update_config.UpdateConfig(cmk.utils.log.logger, argparse.Namespace())
+    return update_config.UpdateConfig(cmk.utils.log.logger, argparse.Namespace(debug=False))
 
 
 def test_parse_arguments_defaults() -> None:
@@ -130,6 +139,129 @@ def test__transform_wato_rulesets_params(
     assert ruleset.get_rules()[0][2].value == transformed_param_value
 
 
+def setup_fileinfo_groups_rulesets(ruleset_value) -> RulesetCollection:
+    RULESET_PATTERNS_SPEC = [
+        {
+            "condition": {},
+            "value": {
+                "group_patterns": [
+                    ("test-group-1", ("/tmp/test-sup-11745/*", "/tmp/test-sup-11745/exclude/*")),
+                    ("test-group-1", ("/tmp/test-sup-11745/*", "/tmp/test-sup-11745/exclude/*")),
+                    (
+                        "test-group-2",
+                        ("/tmp/test-sup-11745/test-2/*", "/tmp/test-sup-11745/test-2/exclude/*"),
+                    ),
+                    (
+                        "test-group-3",
+                        ("/tmp/test-sup-11745/3/*", "/tmp/test-sup-11745/exclude/3/*"),
+                    ),
+                ]
+            },
+        },
+        {
+            "condition": {},
+            "value": {
+                "group_patterns": [
+                    (
+                        "test-group-3",
+                        ("/tmp/test-sup-11745/3/*", "/tmp/test-sup-11745/exclude/3/*"),
+                    ),
+                    ("test-group-2", ("/tmp/test-sup-11745/2/*", "/tmp/test-sup-11745/2/*")),
+                ]
+            },
+        },
+    ]
+    # Setting up "fileinfo_groups" ruleset
+    patterns_ruleset = Ruleset("fileinfo_groups", {})
+    patterns_ruleset.from_config(Folder(""), RULESET_PATTERNS_SPEC)
+
+    rulesets = RulesetCollection()
+    rulesets.set("fileinfo_groups", patterns_ruleset)
+
+    # Setting up "static_checks:fileinfo-groups" ruleset
+    ruleset_spec = [
+        {"condition": {}, "value": ruleset_value},
+    ]
+    ruleset = Ruleset("static_checks:fileinfo-groups", {})
+    ruleset.from_config(Folder(""), ruleset_spec)
+    rulesets.set("static_checks:fileinfo-groups", ruleset)
+    return rulesets
+
+
+@pytest.mark.parametrize(
+    "ruleset_value, expected_group_patterns",
+    [
+        pytest.param(
+            ("fileinfo_groups", "test-group-1", {"maxsize_smallest": (1, 2), "group_patterns": []}),
+            [("/tmp/test-sup-11745/*", "/tmp/test-sup-11745/exclude/*")],
+            id="successful_transform",
+        ),
+        pytest.param(
+            ("fileinfo_groups", "test-group-3", {"maxsize_smallest": (1, 2), "group_patterns": []}),
+            [("/tmp/test-sup-11745/3/*", "/tmp/test-sup-11745/exclude/3/*")],
+            id="successful_transform_duplicate_identical_group",
+        ),
+        pytest.param(
+            (
+                "sap_hana_fileinfo_groups",
+                "test-group-1",
+                {"maxsize_smallest": (1, 2), "group_patterns": []},
+            ),
+            [("/tmp/test-sup-11745/*", "/tmp/test-sup-11745/exclude/*")],
+            id="successful_transform_sap_hana",
+        ),
+        pytest.param(
+            (
+                "fileinfo_groups",
+                "test-group-1",
+                {"group_patterns": [("/a/path", "/another/path/*")]},
+            ),
+            [("/a/path", "/another/path/*")],
+            id="patterns_already_filled",
+        ),
+        pytest.param(
+            ("fileinfo_groups", "not-existing-file-group", {"group_patterns": []}),
+            [],
+            id="not_existing_file_group",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("request_context")
+def test__transform_wato_ruleset_fileinfo_groups(
+    uc: update_config.UpdateConfig,
+    ruleset_value: Tuple[str, str, dict],
+    expected_group_patterns: list[Tuple[str, str]],
+) -> None:
+    rulesets = setup_fileinfo_groups_rulesets(ruleset_value)
+
+    uc._transform_wato_ruleset_fileinfo_groups(rulesets)
+
+    _folder, _idx, transformed_rule = rulesets.get("static_checks:fileinfo-groups").get_rules()[0]
+    assert transformed_rule.value[2]["group_patterns"] == expected_group_patterns
+
+
+@pytest.mark.usefixtures("request_context")
+def test__transform_wato_ruleset_fileinfo_groups_duplicate_group(
+    uc: update_config.UpdateConfig, mocker: MockerFixture
+) -> None:
+    ruleset_value = (
+        "fileinfo_groups",
+        "test-group-2",
+        {"maxsize_smallest": (1, 2), "group_patterns": []},
+    )
+    rulesets = setup_fileinfo_groups_rulesets(ruleset_value)
+
+    mock_error = mocker.patch.object(
+        uc._logger,
+        "error",
+    )
+    uc._transform_wato_ruleset_fileinfo_groups(rulesets)
+    assert (
+        "ERROR: Failed to transform fileinfo_groups enforced service"
+        in mock_error.call_args.args[0]
+    )
+
+
 @pytest.mark.parametrize(
     "ruleset_name, param_value, new_ruleset_name, transformed_param_value",
     [
@@ -166,6 +298,24 @@ def test__transform_replaced_wato_rulesets_and_params(
     rule = rules[0]
     assert len(rule) == 3
     assert rule[2].value == transformed_param_value
+
+
+@pytest.mark.usefixtures("request_context")
+def test__transform_enforced_services(
+    uc: update_config.UpdateConfig,
+) -> None:
+    ruleset_spec = [
+        {"condition": {}, "value": ("nvidia.temp", "", {})},
+    ]
+    ruleset = Ruleset("static_checks:temperature", {})
+    ruleset.from_config(Folder(""), ruleset_spec)
+    rulesets = RulesetCollection()
+    rulesets.set_rulesets({"static_checks:temperature": ruleset})
+
+    uc._transform_wato_rulesets_params(rulesets)
+
+    _folder, _idx, nvidia_rule = rulesets.get("static_checks:temperature").get_rules()[0]
+    assert nvidia_rule.value == ("nvidia_temp", "", {})
 
 
 def _instantiate_ruleset(ruleset_name, param_value) -> Ruleset:
@@ -944,3 +1094,168 @@ def test_transform_influxdb_connnections(uc: update_config.UpdateConfig) -> None
         "password",
         "to_be_transformed",
     )
+
+
+@pytest.fixture()
+def fixture_pre_2_1_mknotifyd_config():
+    sitespecific_file_path: Path = Path(
+        cmk.utils.paths.default_config_dir, "mknotifyd.d", "wato", "sitespecific.mk"
+    )
+    sitespecific_file_path.parent.mkdir(exist_ok=True, parents=True)
+    with sitespecific_file_path.open("w") as f:
+        f.write(
+            "notification_spooler_config.update(%r)"
+            % {
+                "concurrency": [],
+                "deferred_cooldown": 180,
+                "deferred_force_retransmit": 1800,
+                "incoming": {
+                    "authentication": "unauthenticated",
+                    "heartbeat_interval": 10,
+                    "listen_port": 6555,
+                },
+                "log_level": 0,
+                "outgoing": [
+                    {
+                        "address": "localhost",
+                        "cooldown": 20,
+                        "heartbeat_interval": 10,
+                        "heartbeat_timeout": 3,
+                        "port": 6555,
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.usefixtures("fixture_pre_2_1_mknotifyd_config")
+def test_rewrite_mknotifyd_migrate(uc: update_config.UpdateConfig) -> None:
+    for key, value in _read_sitespecific_mknotifyd_config().items():
+        if key == "incoming":
+            assert "encryption" not in value
+        if key == "outgoing":
+            for outgoing in value:
+                assert "encryption" not in outgoing
+
+    uc._update_mknotifyd()
+
+    for key, value in _read_sitespecific_mknotifyd_config().items():
+        if key == "incoming":
+            assert value["encryption"] == "unencrypted"
+        if key == "outgoing":
+            for outgoing in value:
+                assert outgoing["encryption"] == "upgradable"
+
+    # Once we have the new format, a second execution must not fail
+    uc._update_mknotifyd()
+
+
+def _read_sitespecific_mknotifyd_config() -> dict[str, Any]:
+    return store.load_from_mk_file(
+        path=Path(cmk.utils.paths.default_config_dir, "mknotifyd.d", "wato", "sitespecific.mk"),
+        key="notification_spooler_config",
+        default={},
+    )
+
+
+@pytest.fixture()
+def fixture_pre_2_1_servicenow_config():
+    sitespecific_file_path: Path = Path(
+        cmk.utils.paths.default_config_dir, "conf.d", "wato", "notifications.mk"
+    )
+    sitespecific_file_path.parent.mkdir(exist_ok=True, parents=True)
+    with sitespecific_file_path.open("w") as f:
+        f.write(
+            "notification_rules += %r"
+            % [
+                {
+                    "description": "Notify all contacts of a host/service via HTML email",
+                    "comment": "",
+                    "docu_url": "",
+                    "disabled": False,
+                    "allow_disable": True,
+                    "contact_object": True,
+                    "contact_all": False,
+                    "contact_all_with_email": False,
+                    "notify_plugin": (
+                        "servicenow",
+                        {
+                            "url": "http://https:/myservicenow.com",
+                            "username": "bla",
+                            "password": ("password", "bi"),
+                            "use_site_id": False,
+                            "caller": "calle",
+                        },
+                    ),
+                }
+            ]
+        )
+
+
+@pytest.mark.usefixtures("fixture_pre_2_1_servicenow_config", "request_context")
+def test_rewrite_servicenow_migrate(uc: update_config.UpdateConfig) -> None:
+    uc._rewrite_servicenow_notification_config()
+
+    assert _read_servicenow_config() == [
+        {
+            "description": "Notify all contacts of a host/service via HTML email",
+            "comment": "",
+            "docu_url": "",
+            "disabled": False,
+            "allow_disable": True,
+            "contact_object": True,
+            "contact_all": False,
+            "contact_all_with_email": False,
+            "notify_plugin": (
+                "servicenow",
+                {
+                    "url": "http://https:/myservicenow.com",
+                    "username": "bla",
+                    "password": ("password", "bi"),
+                    "use_site_id": False,
+                    "mgmt_type": ("incident", {"caller": "calle"}),
+                },
+            ),
+        }
+    ]
+
+
+def _read_servicenow_config() -> list[dict[str, Any]]:
+    return store.load_from_mk_file(
+        path=Path(cmk.utils.paths.default_config_dir, "conf.d", "wato", "notifications.mk"),
+        key="notification_rules",
+        default=[],
+    )
+
+
+def _user_dict(hashes: list[tuple[str, str]]) -> dict[UserId, UserSpec]:
+    return {UserId(u[0]): {"connector": "htpasswd", "password": u[1]} for u in hashes}
+
+
+@pytest.mark.usefixtures("request_context")
+def test_check_password_hashes(uc: update_config.UpdateConfig) -> None:
+    do_update = _user_dict(
+        [
+            ("md5", "$apr1$EpPwa/X9$TB2UcQxmrSTJWQQcwHzJM/"),
+            ("crypt", "WsbFVbJdvDcpY"),
+        ]
+    )
+    dont_update = _user_dict(
+        [
+            (
+                "sha256crypt",
+                "$5$rounds=1000$.J4mcfJGFGgWJA7R$bDhUCLMe2v1.L3oWclfsVYMyOhsS/6RmyzqFRyCgDi/",
+            ),
+            ("bcrypt", "$2b$04$5LiM0CX3wUoO55cGCwrkDeZIU5zyBqPDZfV9zU4Q2WH/Lkkn2lypa"),
+            ("unrecognized", "foo"),
+        ]
+    )
+    all_users = do_update | dont_update
+    save_users(all_users)
+
+    uc._check_password_hashes()
+
+    loaded = load_users()
+    assert all(user in loaded for user in all_users)
+    assert all(loaded[user].get("enforce_pw_change") for user in do_update)
+    assert not any(loaded[user].get("enforce_pw_change") for user in dont_update)

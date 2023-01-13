@@ -6,7 +6,6 @@
 """Modes for managing folders"""
 
 import abc
-import json
 import operator
 from typing import Dict, Iterator, List, Optional, Tuple, Type
 
@@ -21,7 +20,7 @@ from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem
 from cmk.gui.exceptions import MKUserError
 from cmk.gui.globals import config, html, output_funnel, request, transactions, user
 from cmk.gui.htmllib import HTML
-from cmk.gui.i18n import _
+from cmk.gui.i18n import _, ungettext
 from cmk.gui.page_menu import (
     make_checkbox_selection_json_text,
     make_checkbox_selection_topic,
@@ -46,9 +45,10 @@ from cmk.gui.plugins.wato.utils import (
 from cmk.gui.plugins.wato.utils.base_modes import mode_url, redirect, WatoMode
 from cmk.gui.plugins.wato.utils.context_buttons import make_folder_status_link
 from cmk.gui.plugins.wato.utils.main_menu import MainMenu, MenuItem
-from cmk.gui.table import init_rowselect, table_element
+from cmk.gui.table import show_row_count, table_element
 from cmk.gui.type_defs import ActionResult, Choices
 from cmk.gui.utils.agent_registration import remove_tls_registration_help
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.utils.escaping import escape_to_html_permissive
 from cmk.gui.utils.flashed_messages import flash
 from cmk.gui.utils.popups import MethodAjax
@@ -580,7 +580,8 @@ class ModeFolder(WatoMode):
         # Move
         if request.var("_bulk_move"):
             target_folder_path = request.var("_bulk_moveto", request.var("_top_bulk_moveto"))
-            if target_folder_path == "@":
+            target_folder_path = target_folder_path if target_folder_path != "@main" else ""
+            if target_folder_path is None:
                 raise MKUserError("_bulk_moveto", _("Please select the destination folder"))
             target_folder = watolib.Folder.folder(target_folder_path)
             watolib.Folder.current().move_hosts(selected_host_names, target_folder)
@@ -888,11 +889,11 @@ class ModeFolder(WatoMode):
         html.hidden_fields()
         html.end_form()
 
-        row_count = len(hostnames)
-        row_info = "%d %s" % (row_count, _("host") if row_count == 1 else _("hosts"))
-        html.javascript("cmk.utils.update_row_info(%s);" % json.dumps(row_info))
-
-        init_rowselect("wato-folder-/" + self._folder.path())
+        show_row_count(
+            row_count=(row_count := len(hostnames)),
+            row_info=ungettext("host", "hosts", row_count),
+            selection_id="wato-folder-/" + self._folder.path(),
+        )
 
     def _show_host_row(
         self, rendered_hosts, table, hostname, colspan, host_errors, contact_group_names
@@ -1392,5 +1393,6 @@ def _convert_title_to_filename(title: str) -> str:
 @page_registry.register_page("ajax_set_foldertree")
 class ModeAjaxSetFoldertree(AjaxPage):
     def page(self):
+        check_csrf_token()
         api_request = self.webapi_request()
         user.save_file("foldertree", (api_request.get("topic"), api_request.get("target")))

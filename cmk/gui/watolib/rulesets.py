@@ -494,6 +494,11 @@ class SearchedRulesets(FilteredRulesetCollection):
 
 
 class Ruleset:
+    # These constants are used to give a name to positions within the ruleset.
+    # mylist[-1] is the last element, mylist[0] is the first. See `move_to_folder`.
+    TOP = 0
+    BOTTOM = -1
+
     def __init__(self, name: RulesetName, tag_to_group_map: TagIDToTaggroupID) -> None:
         super().__init__()
         self.name = name
@@ -573,6 +578,25 @@ class Ruleset:
             object_ref=rule.object_ref(),
         )
 
+    def move_to_folder(
+        self,
+        rule: Rule,
+        folder: CREFolder,
+        index: int = BOTTOM,
+    ) -> None:
+        source_rules = self._rules[rule.folder.path()]
+        dest_rules = self._rules.setdefault(folder.path(), [])
+
+        # The actual move
+        source_rules.remove(rule)
+        if index == Ruleset.BOTTOM:
+            dest_rules.append(rule)
+        else:
+            dest_rules.insert(index, rule)
+        rule.folder = folder
+
+        self._on_change()
+
     def append_rule(self, folder: CREFolder, rule: Rule) -> int:
         rules = self._rules.setdefault(folder.path(), [])
         index = len(rules)
@@ -582,8 +606,9 @@ class Ruleset:
         return index
 
     def insert_rule_after(self, rule: Rule, after: Rule) -> None:
-        index = self._rules[rule.folder.path()].index(after) + 1
-        self._rules[rule.folder.path()].insert(index, rule)
+        rules = self._rules[rule.folder.path()]
+        index = rules.index(after) + 1
+        rules.insert(index, rule)
         self._rules_by_id[rule.id] = rule
         self._on_change()
 
@@ -808,7 +833,13 @@ class Ruleset:
 
     # Returns the outcoming value or None and a list of matching rules. These are pairs
     # of rule_folder and rule_number
-    def analyse_ruleset(self, hostname, svc_desc_or_item, svc_desc):
+    def analyse_ruleset(
+        self,
+        hostname,
+        svc_desc_or_item,
+        svc_desc,
+        service_labels: Labels,
+    ):
         resultlist = []
         resultdict: Dict[str, Any] = {}
         effectiverules = []
@@ -817,7 +848,11 @@ class Ruleset:
                 continue
 
             if not rule.matches_host_and_item(
-                Folder.current(), hostname, svc_desc_or_item, svc_desc
+                Folder.current(),
+                hostname,
+                svc_desc_or_item,
+                svc_desc,
+                service_labels=service_labels,
             ):
                 continue
 
@@ -1035,20 +1070,39 @@ class Rule:
                 svc_desc_or_item=None,
                 svc_desc=None,
                 only_host_conditions=True,
+                service_labels={},
             )
         )
 
-    def matches_host_and_item(self, host_folder, hostname, svc_desc_or_item, svc_desc):
+    def matches_host_and_item(
+        self,
+        host_folder,
+        hostname,
+        svc_desc_or_item,
+        svc_desc,
+        service_labels: Labels,
+    ):
         """Whether or not the given folder/host/item matches this rule"""
         return not any(
             True
             for _r in self.get_mismatch_reasons(
-                host_folder, hostname, svc_desc_or_item, svc_desc, only_host_conditions=False
+                host_folder,
+                hostname,
+                svc_desc_or_item,
+                svc_desc,
+                only_host_conditions=False,
+                service_labels=service_labels,
             )
         )
 
     def get_mismatch_reasons(
-        self, host_folder, hostname, svc_desc_or_item, svc_desc, only_host_conditions
+        self,
+        host_folder,
+        hostname,
+        svc_desc_or_item,
+        svc_desc,
+        only_host_conditions,
+        service_labels: Labels,
     ):
         """A generator that provides the reasons why a given folder/host/item not matches this rule"""
         host = host_folder.host(hostname)
@@ -1069,11 +1123,11 @@ class Rule:
             match_object = ruleset_matcher.RulesetMatchObject(hostname)
         elif self.ruleset.item_type() == "service":
             match_object = cmk.base.export.ruleset_match_object_of_service(
-                hostname, svc_desc_or_item
+                hostname, svc_desc_or_item, svc_labels=service_labels
             )
         elif self.ruleset.item_type() == "item":
             match_object = cmk.base.export.ruleset_match_object_for_checkgroup_parameters(
-                hostname, svc_desc_or_item, svc_desc
+                hostname, svc_desc_or_item, svc_desc, svc_labels=service_labels
             )
         elif not self.ruleset.item_type():
             match_object = ruleset_matcher.RulesetMatchObject(hostname)

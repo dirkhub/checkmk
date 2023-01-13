@@ -6,9 +6,11 @@
 
 # pylint: disable=protected-access,redefined-outer-name
 
+import json
 import os
 import sys
 
+import pymongo  # type: ignore[import] # pylint: disable=import-error
 import pytest
 from utils import import_module
 
@@ -204,7 +206,12 @@ def test_router_instance_mongodb_3_4(mk_mongodb):
 @pytest.mark.parametrize(
     "config, expected_pymongo_config",
     [
-        ({}, {}),
+        (
+            {},
+            {
+                "read_preference": pymongo.ReadPreference.SECONDARY,
+            },
+        ),
         (
             {
                 "username": "t_user",
@@ -213,6 +220,7 @@ def test_router_instance_mongodb_3_4(mk_mongodb):
             {
                 "username": "t_user",
                 "password": "t_pwd",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
             },
         ),
         (
@@ -225,6 +233,7 @@ def test_router_instance_mongodb_3_4(mk_mongodb):
                 "username": "t_user",
                 "password": "t_pwd",
                 "tls": True,
+                "read_preference": pymongo.ReadPreference.SECONDARY,
             },
         ),
         (
@@ -241,6 +250,7 @@ def test_router_instance_mongodb_3_4(mk_mongodb):
                 "tls": True,
                 "tlsInsecure": True,
                 "tlsCAFile": "/path/to/ca.pem",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
             },
         ),
         (
@@ -261,6 +271,7 @@ def test_router_instance_mongodb_3_4(mk_mongodb):
                 "tlsCAFile": "/path/to/ca.pem",
                 "tlsInsecure": True,
                 "username": "t_user",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
             },
         ),
     ],
@@ -273,6 +284,10 @@ def test_read_config(config, expected_pymongo_config, mk_mongodb):
     config_parser.add_section("MONGODB")
     for key, value in config.items():
         config_parser.set("MONGODB", key, value)
+
+    if mk_mongodb.PYMONGO_VERSION >= (3, 11, 0):
+        expected_pymongo_config.update({"directConnection": True})
+
     assert mk_mongodb.Config(config_parser).get_pymongo_config() == expected_pymongo_config
 
 
@@ -286,13 +301,47 @@ def test_read_config(config, expected_pymongo_config, mk_mongodb):
                 "password": "/?!/",
                 "tls": True,
                 "username": "username",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
+                "directConnection": True,
             },
         ),
         (
-            (3, 2, 0),
+            (3, 11, 0),
+            {
+                "host": "example.com",
+                "password": "/?!/",
+                "tls": True,
+                "username": "username",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
+                "directConnection": True,
+            },
+        ),
+        (
+            (3, 10, 0),
+            {
+                "host": "example.com",
+                "password": "/?!/",
+                "tls": True,
+                "username": "username",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
+            },
+        ),
+        (
+            (3, 8, 0),
+            {
+                "host": "example.com",
+                "password": "/?!/",
+                "ssl": True,
+                "username": "username",
+                "read_preference": pymongo.ReadPreference.SECONDARY,
+            },
+        ),
+        (
+            (3, 4, 0),
             {
                 "host": "mongodb://username:%2F%3F%21%2F@example.com:27017",
                 "ssl": True,
+                "read_preference": pymongo.ReadPreference.SECONDARY,
             },
         ),
     ],
@@ -320,3 +369,125 @@ def test_transform_config(pymongo_version, pymongo_config, mk_mongodb):
         mk_mongodb.PYMONGO_VERSION = original_pymongo_version
 
     assert result == pymongo_config
+
+
+def _stdout_stderr(captured_output_and_error):
+    if isinstance(captured_output_and_error, tuple):
+        # Python 3.3 for some reason
+        return captured_output_and_error
+    return captured_output_and_error.out, captured_output_and_error.err
+
+
+def test_sections_replica_empty_section(mk_mongodb, capsys):
+    mk_mongodb.sections_replica({})
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    assert not stdout
+    assert not stderr
+
+
+def test_sections_replica_no_replicas(mk_mongodb, capsys):
+    mk_mongodb.sections_replica({"repl": {}})
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    assert not stdout
+    assert not stderr
+
+
+def test_sections_replica_primary(mk_mongodb, capsys):
+    mk_mongodb.sections_replica({"repl": {"primary": "abc"}})
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    header, json_body, noop = stdout.split("\n")
+    replicas = json.loads(json_body)
+
+    assert header == "<<<mongodb_replica:sep(0)>>>"
+
+    assert len(replicas) == 3
+    assert replicas["primary"] == "abc"
+    assert sorted(replicas["secondaries"].items()) == [("active", []), ("passive", [])]
+    assert replicas["arbiters"] == []
+
+    assert not noop
+    assert not stderr
+
+
+def test_sections_replica_active_secondaries(mk_mongodb, capsys):
+    """Make sure primaries are removed from hosts when secondaries are determined."""
+
+    mk_mongodb.sections_replica({"repl": {"primary": "abc", "hosts": ["abc", "def"]}})
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    header, json_body, noop = stdout.split("\n")
+    replicas = json.loads(json_body)
+
+    assert header == "<<<mongodb_replica:sep(0)>>>"
+
+    assert len(replicas) == 3
+    assert replicas["primary"] == "abc"
+    assert sorted(replicas["secondaries"].items()) == [("active", ["def"]), ("passive", [])]
+    assert replicas["arbiters"] == []
+
+    assert not noop
+    assert not stderr
+
+
+def test_sections_replica_passive_secondaries(mk_mongodb, capsys):
+    mk_mongodb.sections_replica({"repl": {"primary": "abc", "passives": ["def"]}})
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    header, json_body, noop = stdout.split("\n")
+    replicas = json.loads(json_body)
+
+    assert header == "<<<mongodb_replica:sep(0)>>>"
+
+    assert len(replicas) == 3
+    assert replicas["primary"] == "abc"
+    assert sorted(replicas["secondaries"].items()) == [("active", []), ("passive", ["def"])]
+    assert replicas["arbiters"] == []
+
+    assert not noop
+    assert not stderr
+
+
+def test_sections_replica_arbiters(mk_mongodb, capsys):
+    mk_mongodb.sections_replica({"repl": {"primary": "abc", "arbiters": ["def"]}})
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    header, json_body, noop = stdout.split("\n")
+    replicas = json.loads(json_body)
+
+    assert header == "<<<mongodb_replica:sep(0)>>>"
+
+    assert len(replicas) == 3
+    assert replicas["primary"] == "abc"
+    assert sorted(replicas["secondaries"].items()) == [("active", []), ("passive", [])]
+    assert replicas["arbiters"] == ["def"]
+
+    assert not noop
+    assert not stderr
+
+
+def test__write_section_replica_none_primary(mk_mongodb, capsys):
+    mk_mongodb._write_section_replica(None)
+    captured_output_and_error = capsys.readouterr()
+    stdout, stderr = _stdout_stderr(captured_output_and_error)
+
+    header, json_body, noop = stdout.split("\n")
+    replicas = json.loads(json_body)
+
+    assert header == "<<<mongodb_replica:sep(0)>>>"
+
+    assert len(replicas) == 3
+    assert replicas["primary"] is None
+    assert sorted(replicas["secondaries"].items()) == [("active", []), ("passive", [])]
+    assert replicas["arbiters"] == []
+
+    assert not noop
+    assert not stderr

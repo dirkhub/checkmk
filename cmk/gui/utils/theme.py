@@ -12,6 +12,16 @@ from typing import List, Optional, Tuple
 import cmk.utils.paths
 from cmk.utils.version import is_managed_edition
 
+from cmk.gui.exceptions import MKInternalError
+from cmk.gui.hooks import request_memoize
+
+
+# Avoid circular import of _()
+def _(message: str, /) -> str:
+    from cmk.gui.i18n import _ as _orig
+
+    return _orig(message)
+
 
 class Theme:
     def __init__(self) -> None:
@@ -19,11 +29,22 @@ class Theme:
         self._theme = "facelift"
         self.theme_choices: List[Tuple[str, str]] = theme_choices()
 
-    def from_config(self, default_theme: str) -> None:
-        self._default_theme = default_theme
-        self._theme = default_theme
+        if not self.theme_choices:
+            raise MKInternalError(_("No valid theme directories found."))
 
-    def set(self, theme_id: str) -> None:
+        if self._default_theme not in dict(self.theme_choices):
+            raise MKInternalError(
+                _('The default theme "%s" is not given among the found theme choices: %s.')
+                % (self._default_theme, self.theme_choices)
+            )
+
+    def from_config(self, default_theme: str) -> None:
+        # Only set the config default theme if it's part of the theme choices
+        if default_theme in dict(self.theme_choices):
+            self._default_theme = default_theme
+            self._theme = default_theme
+
+    def set(self, theme_id: Optional[str]) -> None:
         if not theme_id:
             theme_id = self._default_theme
 
@@ -43,12 +64,13 @@ class Theme:
         """
         return ["facelift"] if self._theme == "facelift" else [self._theme, "facelift"]
 
+    @request_memoize()
     def detect_icon_path(self, icon_name: str, prefix: str) -> str:
         """Detect from which place an icon shall be used and return it's path relative to htdocs/
 
         Priority:
         1. In case the modern-dark theme is active: <theme> = modern-dark -> priorities 3-6
-        2. In case the modern-dark theme is active: <theme> = facelift -> priorities 3-6
+        2. In case the facelift theme is active: <theme> = facelift -> priorities 3-6
         3. In case a theme is active: themes/<theme>/images/icon_[name].svg in site local hierarchy
         4. In case a theme is active: themes/<theme>/images/icon_[name].svg in standard hierarchy
         5. In case a theme is active: themes/<theme>/images/icon_[name].png in site local hierarchy
@@ -82,13 +104,15 @@ class Theme:
     def base_dir(self) -> Path:
         return cmk.utils.paths.local_web_dir / "htdocs" / "themes" / self._theme
 
-    def has_custom_logo(self) -> bool:
+    def has_custom_logo(self, logo_name: str) -> bool:
         """Whether or not the current CME customer has a custom logo
 
-        CME snapshot sync copies the customer logo to themes/facelift/images/mk-logo.png.
+        CME snapshot sync copies the customer logo to themes/facelift/images/<logo_name>.png.
         See CMESnapshotDataCollector._update_customer_sidebar_top.
         """
-        return is_managed_edition() and self.base_dir().joinpath("images", "mk-logo.png").exists()
+        return (
+            is_managed_edition() and self.base_dir().joinpath("images", f"{logo_name}.png").exists()
+        )
 
 
 def theme_choices() -> List[Tuple[str, str]]:

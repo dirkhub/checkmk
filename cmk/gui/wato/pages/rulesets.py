@@ -14,7 +14,7 @@ import pprint
 import re
 from dataclasses import asdict
 from enum import auto, Enum
-from typing import Any, cast, Dict, Iterable, List, Optional, overload
+from typing import Any, cast, Dict, Generator, Iterable, Iterator, List, Optional, overload, Set
 from typing import Tuple as _Tuple
 from typing import Type, Union
 
@@ -25,6 +25,7 @@ from cmk.utils.type_defs import (
     HostName,
     HostOrServiceConditions,
     HostOrServiceConditionsSimple,
+    Labels,
     RuleOptions,
     ServiceName,
     TagConditionNE,
@@ -70,7 +71,7 @@ from cmk.gui.plugins.wato.utils import (
 )
 from cmk.gui.plugins.wato.utils.main_menu import main_module_registry
 from cmk.gui.sites import wato_slave_sites
-from cmk.gui.table import Foldable, Table, table_element
+from cmk.gui.table import Foldable, show_row_count, Table, table_element
 from cmk.gui.type_defs import ActionResult, HTTPVariables, PermissionName
 from cmk.gui.utils.escaping import escape_to_html, escape_to_html_permissive, strip_tags
 from cmk.gui.utils.urls import makeuri, makeuri_contextless
@@ -89,9 +90,9 @@ from cmk.gui.valuespec import (
     ValueSpec,
 )
 from cmk.gui.watolib.changes import make_object_audit_log_url
-from cmk.gui.watolib.check_mk_automations import get_check_information
+from cmk.gui.watolib.check_mk_automations import analyse_service, get_check_information
 from cmk.gui.watolib.host_label_sync import execute_host_label_sync
-from cmk.gui.watolib.hosts_and_folders import Folder
+from cmk.gui.watolib.hosts_and_folders import CREFolder, Folder
 from cmk.gui.watolib.predefined_conditions import PredefinedConditionStore
 from cmk.gui.watolib.rulesets import Rule, RuleConditions, SearchOptions
 from cmk.gui.watolib.rulespecs import (
@@ -392,6 +393,10 @@ def _is_var_to_delete(form_prefix: str, varname: str, value: str) -> bool:
     and tags with an own tagvalue variable, if not 'ignored':
     'search_p_rule_hosttags_tag_address_family' : 'ignore'/'is'/'is not'
     'search_p_rule_hosttags_tagvalue_address_family' : 'ip-v4-only'
+
+    We also keep folder:
+    'search_p_rule_folder_USE' : 'on'
+    'search_p_rule_folder_1' : '60a33e6cf5151f2d52eddae9685cfa270426aa89d8dbc7dfb854606f1d1a40fe'
     """
     if "_auxtag_" in varname and value != "ignore":
         return False
@@ -409,6 +414,19 @@ def _is_var_to_delete(form_prefix: str, varname: str, value: str) -> bool:
         tag_value = html.request.var(tag_varname)
         if tag_value and tag_value != "ignore":
             return False
+
+    if "_folder_" in varname:
+        return False
+
+    # We could be more specific here but that would mean that we have to
+    # exclude the other ~ 14 options with "if x not in varname". So let's just
+    # exclude all that are not explicit handled above and hope the tests secure that.
+    if (
+        "_auxtag_" not in varname
+        and "_hosttags_tag_" not in varname
+        and "_hosttags_tagvalue_" not in varname
+    ):
+        return False
 
     return True
 
@@ -493,6 +511,7 @@ class ModeRulesetGroup(ABCRulesetMode):
 
     def _breadcrumb_url(self) -> str:
         assert self._group_name is not None
+
         return self.mode_url(group=self._group_name)
 
     def _get_page_type(self, search_options: Dict[str, str]) -> PageType:
@@ -698,7 +717,6 @@ class ModeEditRuleset(WatoMode):
 
         self._item: Optional[ServiceName] = None
         self._service: Optional[ServiceName] = None
-        self._hostname: Optional[HostName] = None
 
         # TODO: Clean this up. In which case is it used?
         # - The calculation for the service_description is not even correct, because it does not
@@ -738,8 +756,16 @@ class ModeEditRuleset(WatoMode):
                     pass
 
         hostname = request.get_ascii_input("host")
-        if hostname and self._folder.has_host(hostname):
+        self._host: Optional[watolib.CREHost] = None
+        self._hostname: Optional[HostName] = None
+        if hostname:
             self._hostname = HostName(hostname)
+            host = watolib.Folder.current().host(self._hostname)
+            self._host = host
+            if self._host:
+                self._host.need_permission("read")
+            else:
+                raise MKUserError("host", _("The given host does not exist."))
 
         # The service argument is only needed for performing match testing of rules
         if not self._service:
@@ -979,22 +1005,25 @@ class ModeEditRuleset(WatoMode):
         html.close_div()
 
     def _rule_listing(self, ruleset: watolib.Ruleset) -> None:
-        rules = ruleset.get_rules()
+        rules: List[_Tuple[CREFolder, int, Rule]] = ruleset.get_rules()
         if not rules:
             html.div(_("There are no rules defined in this set."), class_="info")
             return
-        match_state = {"matched": False, "keys": set()}
-        search_options = ModeRuleSearchForm().search_options
-        groups = (
-            (folder, folder_rules)  #
-            for folder, folder_rules in itertools.groupby(rules, key=lambda rule: rule[0])
-            if folder.is_transitive_parent_of(self._folder)
-            or self._folder.is_transitive_parent_of(folder)
-        )
+
+        match_state: Dict[str, Union[bool, Set]] = {"matched": False, "keys": set()}
+        search_options: SearchOptions = ModeRuleSearchForm().search_options
 
         html.div("", id_="row_info")
         num_rows = 0
-        for folder, folder_rules in groups:
+        service_labels: Labels = {}
+        if self._hostname and self._host and self._service:
+            service_labels = analyse_service(
+                self._host.site_id(),
+                self._hostname,
+                self._service,
+            ).service_info.get("labels", {})
+
+        for folder, folder_rules in _get_groups(rules, self._folder):
             with table_element(
                 "rules_%s_%s" % (self._name, folder.ident()),
                 title="%s %s (%d)"
@@ -1014,11 +1043,21 @@ class ModeEditRuleset(WatoMode):
                     num_rows += 1
                     table.row(css=self._css_for_rule(search_options, rule))
                     self._set_focus(rule)
-                    self._show_rule_icons(table, match_state, folder, rule, rulenr)
+                    self._show_rule_icons(
+                        table,
+                        match_state,
+                        folder,
+                        rule,
+                        rulenr,
+                        service_labels=service_labels,
+                        analyse_rule_matching=bool(self._hostname),
+                    )
                     self._rule_cells(table, rule)
 
-        row_info = _("1 row") if num_rows == 1 else _("%d rows") % num_rows
-        html.javascript("cmk.utils.update_row_info(%s);" % json.dumps(row_info))
+        show_row_count(
+            row_count=(row_count := num_rows),
+            row_info=_("row") if row_count == 1 else _("rows"),
+        )
 
     @staticmethod
     def _css_for_rule(search_options, rule: Rule) -> Optional[str]:
@@ -1047,10 +1086,12 @@ class ModeEditRuleset(WatoMode):
         folder,
         rule: Rule,
         rulenr,
+        service_labels: Labels,
+        analyse_rule_matching: bool,
     ) -> None:
-        if self._hostname:
-            table.cell(_("Ma."))
-            title, img = self._match(match_state, rule)
+        table.cell(_("Ma."))
+        if analyse_rule_matching:
+            title, img = self._match(match_state, rule, service_labels=service_labels)
             html.icon("rule%s" % img, title)
 
         table.cell("", css="buttons")
@@ -1095,7 +1136,12 @@ class ModeEditRuleset(WatoMode):
             icon="delete",
         )
 
-    def _match(self, match_state, rule: Rule) -> _Tuple[str, str]:
+    def _match(
+        self,
+        match_state,
+        rule: Rule,
+        service_labels: Labels,
+    ) -> _Tuple[str, str]:
         self._get_host_labels_from_remote_site()
         reasons = (
             [_("This rule is disabled")]
@@ -1107,6 +1153,7 @@ class ModeEditRuleset(WatoMode):
                     self._item,
                     self._service,
                     only_host_conditions=False,
+                    service_labels=service_labels,
                 )
             )
         )
@@ -1273,6 +1320,25 @@ class ModeEditRuleset(WatoMode):
         html.hidden_field("mode", "new_rule")
         html.hidden_field("folder", self._folder.path())
         html.end_form()
+
+
+def _get_groups(
+    rules: List[_Tuple[CREFolder, int, Rule]],
+    current_folder: CREFolder,
+) -> Generator[_Tuple[CREFolder, Iterator[_Tuple[CREFolder, int, Rule]]], None, None]:
+    """Get ruleset groups in correct sort order. Sort by title_path() to honor
+    renamed folders"""
+    sorted_rules: List[_Tuple[CREFolder, int, Rule]] = sorted(
+        rules,
+        key=lambda x: (x[0].title_path(), len(rules) - x[1]),
+        reverse=True,
+    )
+    return (
+        (folder, folder_rules)  #
+        for folder, folder_rules in itertools.groupby(sorted_rules, key=lambda rule: rule[0])
+        if folder.is_transitive_parent_of(current_folder)
+        or current_folder.is_transitive_parent_of(folder)
+    )
 
 
 @mode_registry.register
@@ -1940,28 +2006,6 @@ class ABCEditRuleMode(WatoMode):
 
     def _vs_explicit_conditions(self, **kwargs) -> VSExplicitConditions:
         return VSExplicitConditions(rulespec=self._rulespec, **kwargs)
-
-    def _show_rule_representation(self) -> None:
-        pretty_rule_config = pprint.pformat(self._rule.to_config()).replace("\n", "<br>")
-        content = escape_to_html_permissive(pretty_rule_config)
-
-        html.write_text(_("This rule representation can be used for Web API calls."))
-        html.br()
-        html.br()
-
-        html.open_center()
-        html.open_table(class_="progress")
-
-        html.open_tr()
-        html.th("Rule representation for Web API")
-        html.close_tr()
-
-        html.open_tr()
-        html.td(html.render_div(content, id_="rule_representation"), class_="log")
-        html.close_tr()
-
-        html.close_table()
-        html.close_center()
 
     def _vs_rule_options(self, rule: watolib.Rule, disabling: bool = True) -> Dictionary:
         return Dictionary(
@@ -2719,23 +2763,33 @@ class ModeExportRule(ABCEditRuleMode):
         pass
 
     def page(self) -> None:
-        pretty_rule_config = pprint.pformat(self._rule.to_config())
+        pretty_rule_config = pprint.pformat(self._rule.ruleset.valuespec().mask(self._rule.value))
         content_id = "rule_representation"
         success_msg_id = "copy_success"
 
         html.begin_form("rule_representation")
         html.div(
-            _("Successfully copied rule representation to the clipboard."),
+            _("Successfully copied rule value representation to the clipboard."),
             id_=success_msg_id,
             class_=["success", "hidden"],
         )
 
-        forms.header(_("Rule representation for web API"))
-        forms.section("Rule representation")
-        html.text_area(content_id, deflt=pretty_rule_config, id_=content_id, readonly="true")
+        html.p(
+            _(
+                "To set the value of a rule using the REST API, you need to set the "
+                "<tt>value_raw</tt> field. The value of this fields is individual for each rule set. "
+                "To help you understand what kind of data structure you need to provide, this rule "
+                "export mechanism is showing you the value you need to set for a given rule. The "
+                "value needs to be a string representation of a compatible Python data structure."
+            )
+        )
+        html.p(_("You can copy and use the data structure below in your REST API requests."))
+        forms.header(_("Rule value representation for REST API"))
+        forms.section("Rule value representation")
+        html.text_area(content_id, deflt=repr(pretty_rule_config), id_=content_id, readonly="true")
         html.icon_button(
             url=None,
-            title=_("Copy rule representation to clipboard"),
+            title=_("Copy rule value representation to clipboard"),
             icon="clone",
             onclick="cmk.utils.copy_to_clipboard(%s, %s)"
             % (json.dumps(content_id), json.dumps(success_msg_id)),

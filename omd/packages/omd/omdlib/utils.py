@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- encoding: utf-8; py-indent-offset: 4 -*-
 #
 #       U  ___ u  __  __   ____
 #        \/"_ \/U|' \/ '|u|  _"\
@@ -26,14 +25,15 @@
 import contextlib
 import os
 import shutil
-import sys
 from typing import Iterator
-
-import cmk.utils.tty as tty
 
 
 def is_dockerized() -> bool:
-    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+    return (
+        os.path.exists("/.dockerenv")
+        or os.path.exists("/run/.containerenv")
+        or os.environ.get("CMK_CONTAINERIZED") == "TRUE"
+    )
 
 
 @contextlib.contextmanager
@@ -45,10 +45,6 @@ def chdir(path: str) -> Iterator[None]:
         yield
     finally:
         os.chdir(prev_cwd)
-
-
-def ok() -> None:
-    sys.stdout.write(tty.ok + "\n")
 
 
 def delete_user_file(user_path: str) -> None:

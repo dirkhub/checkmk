@@ -321,6 +321,7 @@ class NodeStatus(BaseModel):
     conditions: Optional[Sequence[NodeCondition]]
     node_info: NodeInfo
     addresses: NodeAddresses
+    # images always equals [] due to the substituion done by api_server.py::_query_raw_nodes
 
 
 class Node(BaseModel):
@@ -511,8 +512,8 @@ class ContainerWaitingState(BaseModel):
 class ContainerTerminatedState(BaseModel):
     type: str = Field("terminated", const=True)
     exit_code: int
-    start_time: int
-    end_time: int
+    start_time: Optional[int]
+    end_time: Optional[int]
     reason: Optional[str]
     detail: Optional[str]
 
@@ -561,12 +562,12 @@ class PodCondition(BaseModel):
 
 
 class PodStatus(BaseModel):
-    conditions: List[PodCondition]
+    conditions: Optional[List[PodCondition]]
     phase: Phase
     start_time: Optional[Timestamp]  # None if pod is faulty
     host_ip: Optional[IpAddress] = None
     pod_ip: Optional[IpAddress] = None
-    qos_class: QosClass
+    qos_class: Optional[QosClass]
 
 
 class Pod(BaseModel):
@@ -601,6 +602,16 @@ class ClusterDetails(BaseModel):
 
     api_health: APIHealth
     version: GitVersion
+
+
+class UnknownKubernetesVersion(BaseModel):
+    git_version: GitVersion
+
+
+class KubernetesVersion(BaseModel):
+    git_version: GitVersion
+    major: int
+    minor: int
 
 
 class API(Protocol):

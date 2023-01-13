@@ -108,10 +108,16 @@ function update(handler_data, response) {
         handler_data.transid
     );
 
+    // Save values not meant for update
+    var menu_display = document.getElementById("general_display_options");
+
     // Update the page menu
     var page_menu_bar = document.getElementById("page_menu_bar");
     page_menu_bar.outerHTML = response.page_menu;
     utils.execute_javascript_by_object(page_menu_bar);
+
+    // Set saved values to old value
+    document.getElementById("general_display_options").replaceWith(menu_display);
 
     // Update fix all button
     var fixall_container = document.getElementById("fixall_container");
@@ -208,19 +214,22 @@ function trigger_delayed_active_checks() {
 
 export function execute_active_check(entry) {
     var div = document.getElementById(entry.divid);
-    var url =
-        "wato_ajax_execute_check.py?" +
-        "site=" +
-        encodeURIComponent(entry.site) +
-        "&folder=" +
-        encodeURIComponent(entry.folder_path) +
-        "&host=" +
-        encodeURIComponent(entry.hostname) +
-        "&checktype=" +
-        encodeURIComponent(entry.checktype) +
-        "&item=" +
-        encodeURIComponent(entry.item);
-    ajax.get_url(url, handle_execute_active_check, div);
+    ajax.call_ajax("wato_ajax_execute_check.py", {
+        post_data:
+            "site=" +
+            encodeURIComponent(entry.site) +
+            "&folder=" +
+            encodeURIComponent(entry.folder_path) +
+            "&host=" +
+            encodeURIComponent(entry.hostname) +
+            "&checktype=" +
+            encodeURIComponent(entry.checktype) +
+            "&item=" +
+            encodeURIComponent(entry.item),
+        method: "POST",
+        response_handler: handle_execute_active_check,
+        handler_data: div,
+    });
 }
 
 function handle_execute_active_check(oDiv, response_json) {

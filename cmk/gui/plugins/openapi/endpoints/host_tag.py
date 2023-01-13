@@ -14,22 +14,23 @@ You can find an introduction to hosts including host tags and host tag groups in
 [Checkmk guide](https://docs.checkmk.com/latest/en/wato_hosts.html).
 """
 
-import json
-from typing import Any, Dict
+from typing import Any
 
 from cmk.utils.tags import BuiltinTagConfig, TagGroup, TaggroupSpec
 
 import cmk.gui.watolib as watolib
+from cmk.gui.globals import user
 from cmk.gui.http import Response
 from cmk.gui.plugins.openapi.restful_objects import (
     constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
-from cmk.gui.plugins.openapi.utils import problem, ProblemException
+from cmk.gui.plugins.openapi.utils import problem, ProblemException, serve_json
 from cmk.gui.watolib.tags import (
-    change_host_tags_in_folders,
+    change_host_tags,
     edit_tag_group,
     is_builtin,
     load_tag_config,
@@ -43,6 +44,21 @@ from cmk.gui.watolib.tags import (
 )
 
 from cmk import fields
+
+PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.hosttags"),
+        permissions.Optional(permissions.Perm("wato.all_folders")),
+    ]
+)
+
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        permissions.Perm("wato.hosttags"),
+        permissions.Optional(permissions.Perm("wato.all_folders")),
+    ]
+)
 
 
 class HostTagGroupName(fields.String):
@@ -76,9 +92,12 @@ HOST_TAG_GROUP_NAME = {
     etag="output",
     request_schema=request_schemas.InputHostTagGroup,
     response_schema=response_schemas.DomainObject,
+    permissions_required=RW_PERMISSIONS,
 )
 def create_host_tag_group(params):
     """Create a host tag group"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.hosttags")
     host_tag_group_details = params["body"]
     save_tag_group(TagGroup.from_config(host_tag_group_details))
     return _serve_host_tag_group(_retrieve_group(host_tag_group_details["id"]).get_dict_format())
@@ -91,9 +110,11 @@ def create_host_tag_group(params):
     etag="output",
     path_params=[HOST_TAG_GROUP_NAME],
     response_schema=response_schemas.ConcreteHostTagGroup,
+    permissions_required=PERMISSIONS,
 )
 def show_host_tag_group(params):
     """Show a host tag group"""
+    user.need_permission("wato.hosttags")
     ident = params["name"]
     tag_group = _retrieve_group(ident=ident)
     return _serve_host_tag_group(tag_group.get_dict_format())
@@ -103,26 +124,24 @@ def show_host_tag_group(params):
     constructors.collection_href("host_tag_group"),
     ".../collection",
     method="get",
-    response_schema=response_schemas.DomainObjectCollection,
+    response_schema=response_schemas.HostTagGroupCollection,
+    permissions_required=PERMISSIONS,
 )
 def list_host_tag_groups(params):
     """Show all host tag groups"""
+    user.need_permission("wato.hosttags")
     tag_config = load_tag_config()
     tag_config += BuiltinTagConfig()
     tag_groups_collection = {
         "id": "host_tag",
         "domainType": "host_tag_group",
         "value": [
-            constructors.collection_item(
-                domain_type="host_tag_group",
-                title=tag_group_obj.title,
-                identifier=tag_group_obj.id,
-            )
+            serialize_host_tag_group(tag_group_obj.get_dict_format())
             for tag_group_obj in tag_config.get_tag_groups()
         ],
         "links": [constructors.link_rel("self", constructors.collection_href("host_tag_group"))],
     }
-    return constructors.serve_json(tag_groups_collection)
+    return serve_json(tag_groups_collection)
 
 
 @Endpoint(
@@ -133,11 +152,14 @@ def list_host_tag_groups(params):
     path_params=[HOST_TAG_GROUP_NAME],
     additional_status_codes=[401, 405],
     request_schema=request_schemas.UpdateHostTagGroup,
+    permissions_required=RW_PERMISSIONS,
     response_schema=response_schemas.ConcreteHostTagGroup,
 )
 def update_host_tag_group(params):
     """Update a host tag group"""
     # TODO: ident verification mechanism with ParamDict replacement
+    user.need_permission("wato.edit")
+    user.need_permission("wato.hosttags")  # see cmk.gui.wato.pages.tags
     body = params["body"]
     ident = params["name"]
     if is_builtin(ident):
@@ -156,10 +178,12 @@ def update_host_tag_group(params):
         edit_tag_group(ident, TagGroup.from_config(group_details), allow_repair=body["repair"])
     except RepairError:
         return problem(
-            401,
-            f'Updating this host tag group "{ident}" requires additional authorization',
-            "The host tag group you intend to edit is used by other instances. You must authorize Checkmk "
-            "to update the relevant instances using the repair parameter",
+            status=401,
+            title=f'Updating this host tag group "{ident}" requires additional authorization',
+            detail=(
+                "The host tag group you intend to edit is used by other instances. You must "
+                "authorize Checkmk to update the relevant instances using the repair parameter"
+            ),
         )
     updated_tag_group = _retrieve_group(ident)
     return _serve_host_tag_group(updated_tag_group.get_dict_format())
@@ -172,10 +196,13 @@ def update_host_tag_group(params):
     path_params=[HOST_TAG_GROUP_NAME],
     additional_status_codes=[405],
     query_params=[request_schemas.DeleteHostTagGroup],
+    permissions_required=RW_PERMISSIONS,
     output_empty=True,
 )
 def delete_host_tag_group(params):
     """Delete a host tag group"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.hosttags")
     ident = params["name"]
     if is_builtin(ident):
         return problem(
@@ -184,21 +211,19 @@ def delete_host_tag_group(params):
             detail=f"The built-in host tag group {ident} cannot be deleted",
         )
 
-    affected = change_host_tags_in_folders(
-        OperationRemoveTagGroup(ident), TagCleanupMode.CHECK, watolib.Folder.root_folder()
-    )
+    affected = change_host_tags(OperationRemoveTagGroup(ident), TagCleanupMode.CHECK)
     if any(affected):
         if not params["repair"]:
             return problem(
-                401,
-                f'Deleting this host tag group "{ident}" requires additional authorization',
-                "The host tag group you intend to delete is used by other instances. You must authorize Checkmk "
-                "to update the relevant instances using the repair parameter",
+                status=401,
+                title=f'Deleting this host tag group "{ident}" requires additional authorization',
+                detail=(
+                    "The host tag group you intend to delete is used by other instances. You must "
+                    "authorize Checkmk to update the relevant instances using the repair parameter"
+                ),
             )
         watolib.host_attributes.undeclare_host_tag_attribute(ident)
-        _ = change_host_tags_in_folders(
-            OperationRemoveTagGroup(ident), TagCleanupMode("delete"), watolib.Folder.root_folder()
-        )
+        _ = change_host_tags(OperationRemoveTagGroup(ident), TagCleanupMode("delete"))
 
     tag_config = load_tag_config()
     tag_config.remove_tag_group(ident)
@@ -217,14 +242,12 @@ def _retrieve_group(ident: str) -> TagGroup:
 
 
 def _serve_host_tag_group(tag_details: TaggroupSpec) -> Response:
-    response = Response()
-    response.set_data(json.dumps(serialize_host_tag_group(dict(tag_details))))
-    response.set_content_type("application/json")
+    response = serve_json(serialize_host_tag_group(tag_details))
     response.headers.add("ETag", constructors.etag_of_dict(dict(tag_details)).to_header())
     return response
 
 
-def serialize_host_tag_group(details: Dict[str, Any]):
+def serialize_host_tag_group(details: TaggroupSpec) -> dict[str, Any]:
     return constructors.domain_object(
         domain_type="host_tag_group",
         identifier=details["id"],
@@ -237,5 +260,5 @@ def serialize_host_tag_group(details: Dict[str, Any]):
                 base=constructors.object_href("host_tag_group", details["id"]),
             )
         },
-        extensions={key: details[key] for key in details if key in ("topic", "tags")},
+        extensions={"topic": details.get("topic", "Tags"), "tags": details["tags"]},
     )

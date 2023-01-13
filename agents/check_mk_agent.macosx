@@ -36,7 +36,7 @@ fi
 
 section_checkmk() {
     echo "<<<check_mk>>>"
-    echo "Version: 2.1.0b9"
+    echo "Version: 2.1.0p20"
     echo "AgentOS: macosx"
     echo "Hostname: $(hostname)"
     echo "AgentDirectory: $MK_CONFDIR"
@@ -118,20 +118,21 @@ run_purely_synchronous_sections() {
     }
     exit if ! @patterns;
 
-    print "<<<fileinfo:sep(124)>>>\n", time, "\n[[[header]]]\nname|status|size|time\n[[[content]]]\n";
-
+    my $file_stats = "";
     foreach (@patterns) {
         foreach (bsd_glob("$_")) {
             if (! -f) {
-                print "$_|missing\n" if ! -d;
+                $file_stats .= "$_|missing\n" if ! -d;
             } elsif (my @infos = stat) {
-                print "$_|ok|$infos[7]|$infos[9]\n";
+                $file_stats .= "$_|ok|$infos[7]|$infos[9]\n";
             } else {
-                print "$_|stat failed: $!\n";
+                $file_stats .= "$_|stat failed: $!\n";
             }
         }
     }
-    ' -- "$MK_CONFDIR"
+
+    print "<<<fileinfo:sep(124)>>>\n", time, "\n[[[header]]]\nname|status|size|time\n[[[content]]]\n$file_stats";
+    ' -- "${MK_CONFDIR}"
 
     if type tmutil >/dev/null; then
         echo '<<<timemachine>>>'
@@ -156,10 +157,10 @@ run_mrpe_plugins() {
         # SC2162: read without -r will mangle backslashes.
         # The following suppression was added when we enabled the corresponding shellcheck.
         # It may well be that "read -r" would be more appropriate.
-        # shellcheck disable=SC2162
+        # shellcheck disable=SC2162,SC2001
         grep -Ev '^[[:space:]]*($|#)' "/etc/mrpe.cfg" |
-            while read descr cmdline; do
-                PLUGIN=${cmdline%% *}
+            while read descr rest; do
+                cmdline=$(echo "$rest" | sed -e 's/^([a-zA-Z:=[0-9]*]*) //g')
                 OUTPUT=$(eval "$cmdline")
                 echo "(${PLUGIN##*/}) $descr $? $OUTPUT" | tr \\n \\1
                 echo

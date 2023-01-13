@@ -254,9 +254,12 @@ class SNMPTrapTranslator:
         try:
             builder = pysnmp.smi.builder.MibBuilder()  # manages python MIB modules
 
-            # load MIBs from our compiled MIB and default MIB paths
-            builder.setMibSources(
-                *[pysnmp.smi.builder.DirMibSource(str(mibs_dir))] + list(builder.getMibSources())
+            # load MIBs from our compiled MIB
+            builder.addMibSources(*[pysnmp.smi.builder.DirMibSource(str(mibs_dir))])
+
+            # explicit System MIBs
+            builder.addMibSources(
+                *[pysnmp.smi.builder.DirMibSource(str(Path("/usr/share/snmp/mibs")))]
             )
 
             # Indicate if we wish to load DESCRIPTION and other texts from MIBs
@@ -326,8 +329,8 @@ class SNMPTrapTranslator:
         node = mib_var[0].getMibNode()
         translated_oid = mib_var[0].prettyPrint().replace('"', "")
         translated_value = mib_var[1].prettyPrint()
-        if units := getattr(node, "getUnits", ""):
+        if units := getattr(node, "getUnits", lambda: "")():
             translated_value += " %s" % units
-        if description := getattr(node, "getDescription", ""):
+        if description := getattr(node, "getDescription", lambda: "")():
             translated_value += "(%s)" % description
         return translated_oid, translated_value

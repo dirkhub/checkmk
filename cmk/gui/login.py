@@ -18,6 +18,7 @@ from werkzeug.local import LocalProxy
 
 import cmk.utils.paths
 import cmk.utils.version as cmk_version
+from cmk.utils.crypto import Password
 from cmk.utils.site import omd_site, url_prefix
 from cmk.utils.type_defs import UserId
 
@@ -87,6 +88,10 @@ def authenticate(req: Request) -> Iterator[bool]:
 def UserSessionContext(user_id: UserId) -> Iterator[None]:
     """Managing context of authenticated user session with cleanup before logout."""
     with UserContext(user_id):
+        # Auth with automation secret succeeded before - mark transid as
+        # unneeded in this case
+        if local.auth_type == "automation":
+            transactions.ignore()
         try:
             yield
         finally:
@@ -169,7 +174,7 @@ def del_auth_cookie() -> None:
 
     cookie = _fetch_cookie(cookie_name)
     if auth_cookie_is_valid(cookie):
-        response.delete_cookie(cookie_name)
+        response.unset_http_cookie(cookie_name)
 
 
 def _auth_cookie_value(username: UserId, session_id: str) -> str:
@@ -268,13 +273,19 @@ def _check_auth_cookie(cookie_name: str) -> Optional[UserId]:
 
 
 def _redirect_for_password_change(user_id: UserId) -> None:
-    if requested_file_name(request) != "user_change_pw":
-        result = userdb.need_to_change_pw(user_id)
-        if result:
-            raise HTTPRedirect(
-                "user_change_pw.py?_origtarget=%s&reason=%s"
-                % (urlencode(makeuri(request, [])), result)
-            )
+    if requested_file_name(request) in (
+        "user_login_two_factor",
+        "user_webauthn_login_begin",
+        "user_webauthn_login_complete",
+        "user_change_pw",
+    ):
+        return
+
+    result = userdb.need_to_change_pw(user_id)
+    if result:
+        raise HTTPRedirect(
+            "user_change_pw.py?_origtarget=%s&reason=%s" % (urlencode(makeuri(request, [])), result)
+        )
 
 
 def _redirect_for_two_factor_authentication(user_id: UserId) -> None:
@@ -335,9 +346,9 @@ def _check_auth(req: Request) -> Optional[UserId]:
         user_id = _check_auth_http_header()
 
     if user_id is None:
-        if not config.user_login:
+        if not config.user_login and not _is_site_login():
             return None
-        user_id = _check_auth_by_cookie()
+        user_id = check_auth_by_cookie()
 
     if (user_id is not None and not isinstance(user_id, str)) or user_id == "":
         raise MKInternalError(_("Invalid user authentication"))
@@ -375,8 +386,6 @@ def _check_auth_automation() -> UserId:
     request.del_var_from_env("_secret")
 
     if verify_automation_secret(user_id, secret):
-        # Auth with automation secret succeeded - mark transid as unneeded in this case
-        transactions.ignore()
         set_auth_type("automation")
         return user_id
     raise MKAuthException(_("Invalid automation secret for user %s") % user_id)
@@ -409,7 +418,11 @@ def _check_auth_web_server(req: Request) -> Optional[UserId]:
     return None
 
 
-def _check_auth_by_cookie() -> Optional[UserId]:
+def check_auth_by_cookie() -> Optional[UserId]:
+    """check if session cookie exists and if it is valid
+
+    Returns None if not authenticated. If a user was successful authenticated the UserId is returned"""
+
     cookie_name = auth_cookie_name()
     if not request.has_cookie(cookie_name):
         return None
@@ -417,15 +430,14 @@ def _check_auth_by_cookie() -> Optional[UserId]:
     try:
         set_auth_type("cookie")
         return _check_auth_cookie(cookie_name)
-    except MKAuthException:
-        # Suppress cookie validation errors from other sites cookies
-        auth_logger.debug(
-            "Exception while checking cookie %s: %s" % (cookie_name, traceback.format_exc())
-        )
+    except HTTPRedirect:
+        # Reraising redirects
+        raise
     except Exception:
         auth_logger.debug(
             "Exception while checking cookie %s: %s" % (cookie_name, traceback.format_exc())
         )
+
     return None
 
 
@@ -494,8 +506,13 @@ class LoginPage(Page):
             return
 
         try:
-            if not config.user_login:
+            if not config.user_login and not _is_site_login():
                 raise MKUserError(None, _("Login is not allowed on this site."))
+
+            if request.request_method != "POST":
+                logger.warning(
+                    "Using the GET method to authenticate against login.py leaks user credentials in the Apache logs (see more details in our Werk 14261). Consider using the POST method.",
+                )
 
             username_var = request.get_str_input("_username", "")
             assert username_var is not None
@@ -503,9 +520,10 @@ class LoginPage(Page):
             if not username:
                 raise MKUserError("_username", _("Missing username"))
 
-            password = request.var("_password", "")
-            if not password:
+            password_var = request.var("_password", "")
+            if not password_var:
                 raise MKUserError("_password", _("Missing password"))
+            password = Password(password_var)
 
             default_origtarget = url_prefix() + "check_mk/"
             origtarget = request.get_url_input("_origtarget", default_origtarget)
@@ -531,6 +549,13 @@ class LoginPage(Page):
                 # c) Redirect to really requested page
                 _create_auth_session(username, session_id)
 
+                # This must happen before the enforced password change is
+                # checked in order to have the redirects correct...
+                if userdb.is_two_factor_login_enabled(username):
+                    raise HTTPRedirect(
+                        "user_login_two_factor.py?_origtarget=%s" % urlencode(makeuri(request, []))
+                    )
+
                 # Never use inplace redirect handling anymore as used in the past. This results
                 # in some unexpected situations. We simpy use 302 redirects now. So we have a
                 # clear situation.
@@ -541,11 +566,6 @@ class LoginPage(Page):
                     raise HTTPRedirect(
                         "user_change_pw.py?_origtarget=%s&reason=%s"
                         % (urlencode(origtarget), change_pw_result)
-                    )
-
-                if userdb.is_two_factor_login_enabled(username):
-                    raise HTTPRedirect(
-                        "user_login_two_factor.py?_origtarget=%s" % urlencode(makeuri(request, []))
                     )
 
                 raise HTTPRedirect(origtarget)
@@ -585,9 +605,11 @@ class LoginPage(Page):
 
         html.open_a(href="https://checkmk.com")
         html.img(
-            src=theme.detect_icon_path(icon_name="logo", prefix="mk-"),
+            src=theme.detect_icon_path(
+                icon_name="login_logo" if theme.has_custom_logo("login_logo") else "mk-logo",
+                prefix="",
+            ),
             id_="logo",
-            class_="custom" if theme.has_custom_logo() else None,
         )
         html.close_a()
 
@@ -653,6 +675,25 @@ class LoginPage(Page):
         html.close_div()
 
         html.footer()
+
+
+def _is_site_login() -> bool:
+    """Determine if login is a site login for connecting central and remote
+    site. This login has to be allowed even if site login on remote site is not
+    permitted by rule "Direct login to Web GUI allowed" """
+    if requested_file_name(request) == "login":
+        if (origtarget_var := request.var("_origtarget")) is None:
+            return False
+        return (
+            origtarget_var.startswith("automation_login.py")
+            and "_version=" in origtarget_var
+            and "_edition_short=" in origtarget_var
+        )
+
+    if requested_file_name(request) == "automation_login":
+        return bool(request.var("_edition_short") and request.var("_version"))
+
+    return False
 
 
 @page_registry.register_page("logout")

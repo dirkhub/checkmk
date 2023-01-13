@@ -30,6 +30,22 @@ from cmk.utils.exceptions import MKGeneralException
 from cmk.utils.i18n import _
 
 
+class DeleteErrorUsedByAggregation(MKGeneralException):
+    pass
+
+
+class DeleteErrorUsedByRule(MKGeneralException):
+    pass
+
+
+class RuleNotFoundException(MKGeneralException):
+    pass
+
+
+class AggregationNotFoundException(MKGeneralException):
+    pass
+
+
 class RuleReferencesResult(NamedTuple):
     aggr_refs: int
     rule_refs: int
@@ -156,17 +172,17 @@ class BIAggregationPacks:
         bi_rule = self.get_rule(rule_id)
         if bi_rule:
             return bi_rule
-        raise MKGeneralException(_("The requested BI rule does not exist."))
+        raise RuleNotFoundException(_("The requested BI rule does not exist."))
 
     def delete_rule(self, rule_id: str) -> None:
         # Only delete a rule if it is not referenced by other rules/aggregations
         references = self.count_rule_references(rule_id)
         if references.aggr_refs:
-            raise MKGeneralException(
+            raise DeleteErrorUsedByAggregation(
                 _("You cannot delete this rule: it is still used by other aggregations.")
             )
         if references.rule_refs:
-            raise MKGeneralException(
+            raise DeleteErrorUsedByRule(
                 _("You cannot delete this rule: it is still used by other rules.")
             )
 
@@ -217,7 +233,7 @@ class BIAggregationPacks:
         bi_aggregation = self.get_aggregation(aggregation_id)
         if bi_aggregation:
             return bi_aggregation
-        raise MKGeneralException(_("The requested BI aggregation does not exist."))
+        raise AggregationNotFoundException(_("The requested BI aggregation does not exist."))
 
     def get_all_aggregations(self) -> List[BIAggregation]:
         aggregations: List[BIAggregation] = []

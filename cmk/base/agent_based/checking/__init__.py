@@ -32,7 +32,6 @@ from cmk.utils.type_defs import (
     EVERYTHING,
     ExitSpec,
     HostAddress,
-    HostKey,
     HostName,
     MetricTuple,
     ParsedSectionName,
@@ -159,7 +158,8 @@ def _execute_checkmk_checks(
                 key=lambda service: service.description,
             ),
         )
-        broker, source_results = make_broker(
+
+        broker, source_results, fetcher_messages = make_broker(
             config_cache=config_cache,
             host_config=host_config,
             ip_address=ipaddress,
@@ -434,6 +434,7 @@ def get_aggregated_result(
             plugin=plugin,
             service_id=service.id(),
             persist_value_store_changes=persist_value_store_changes,
+            value_store_manager=value_store_manager,
         )
         if host_config.is_cluster
         else plugin.check_function
@@ -474,7 +475,7 @@ def get_aggregated_result(
                 )
             )
 
-    except (item_state.MKCounterWrapped, checking_classes.IgnoreResultsError) as e:
+    except checking_classes.IgnoreResultsError as e:
         msg = str(e) or "No service summary available"
         return AggregatedResult(
             submit=False,

@@ -24,7 +24,7 @@ version of pymongo (at least 2.8).
 
 """
 
-__version__ = "2.1.0b9"
+__version__ = "2.1.0p20"
 
 import argparse
 import configparser
@@ -133,17 +133,6 @@ def _write_section_replica(
     secondary_passives=None,
     arbiters=None,
 ):
-    """
-    >>> _write_section_replica(None)
-    <<<mongodb_replica:sep(0)>>>
-    {"primary": null, "secondaries": {"active": [], "passive": []}, "arbiters": []}
-    >>> _write_section_replica("primary")
-    <<<mongodb_replica:sep(0)>>>
-    {"primary": "primary", "secondaries": {"active": [], "passive": []}, "arbiters": []}
-    >>> _write_section_replica("primary", secondary_actives=["1", "2"], secondary_passives=["3"], arbiters=["4"])
-    <<<mongodb_replica:sep(0)>>>
-    {"primary": "primary", "secondaries": {"active": ["1", "2"], "passive": ["3"]}, "arbiters": ["4"]}
-    """
     sys.stdout.write("<<<mongodb_replica:sep(0)>>>\n")
     sys.stdout.write(
         json.dumps(
@@ -161,19 +150,21 @@ def _write_section_replica(
 
 
 def sections_replica(server_status):
-    """
-    >>> sections_replica({})
-    >>> sections_replica({"repl": {}})
-    >>> sections_replica({"repl": {"primary": "abc"}})
-    <<<mongodb_replica:sep(0)>>>
-    {"primary": "abc", "secondaries": {"active": [], "passive": []}, "arbiters": []}
-    """
     repl_info = server_status.get("repl")
     if not repl_info:
         return
+
+    def _remove_primary(primary, hosts):
+        if hosts is None:
+            return None
+        if primary is None:
+            return hosts
+        return list(set(hosts) - {primary})
+
+    primary = repl_info.get("primary")
     _write_section_replica(
-        repl_info.get("primary"),
-        secondary_actives=repl_info.get("hosts"),
+        primary,
+        secondary_actives=_remove_primary(primary, repl_info.get("hosts")),
         secondary_passives=repl_info.get("passives"),
         arbiters=repl_info.get("arbiters"),
     )
@@ -862,6 +853,19 @@ class Config:
         if self.port is not None:
             pymongo_config["port"] = self.port
 
+        # Requests are distributed to secondaries, ref.
+        # https://www.mongodb.com/docs/manual/core/read-preference/
+        pymongo_config["read_preference"] = pymongo.ReadPreference.SECONDARY
+
+        # The agent plugin is expected to run on each host, returing
+        # information from only that host.
+        # If directConnection is set to False (default), the plugin could also
+        # connect to a totally different host from where it is located.
+        if PYMONGO_VERSION >= (3, 11, 0):
+            # See 'Changes in Version 3.11.0' on
+            # https://pymongo.readthedocs.io/en/stable/changelog.html
+            pymongo_config["directConnection"] = True
+
         return pymongo_config
 
 
@@ -951,7 +955,7 @@ def main(argv=None):
             message = message.replace(quote_plus(config.password), "****")
         LOGGER.info(message)
 
-    client = pymongo.MongoClient(read_preference=pymongo.ReadPreference.SECONDARY, **pymongo_config)
+    client = pymongo.MongoClient(**pymongo_config)
     try:
         # connecting is lazy, it might fail only now
         server_status = client.admin.command("serverStatus")

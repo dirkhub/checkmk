@@ -478,7 +478,9 @@ def _werk_table_option_entries():
                     (None, _("All editions")),
                     *(
                         (e.short, _("Werks only concerning the %s") % e.title)
-                        for e in (Edition.CPE, Edition.CME, Edition.CEE, Edition.CRE)
+                        # Enable this once we release a plus edition. CMK-10535
+                        # for e in (Edition.CPE, Edition.CME, Edition.CEE, Edition.CRE)
+                        for e in (Edition.CME, Edition.CEE, Edition.CRE)
                     ),
                 ],
             ),
@@ -619,6 +621,10 @@ def werk_matches_options(werk, werk_table_options):
     ):
         return False
 
+    # remove this block with CMK-10535
+    if werk_table_options["edition"] is None and werk["edition"] == Edition.CPE.short:
+        return False
+
     if werk_table_options["edition"] and werk["edition"] != werk_table_options["edition"]:
         return False
 
@@ -632,7 +638,7 @@ def werk_matches_options(werk, werk_table_options):
     if werk_table_options["werk_content"]:
         have_match = False
         search_text = werk_table_options["werk_content"].lower()
-        for line in [werk["title"]] + werk["body"]:
+        for line in [werk["title"]] + werk["description"]:
             if search_text in line.lower():
                 have_match = True
                 break
@@ -699,7 +705,7 @@ def render_werk_description(werk) -> HTML:
         html.open_p()
         in_list = False
         in_code = False
-        for line in werk["body"]:
+        for line in werk["description"]:
             if line.startswith("LI:"):
                 if not in_list:
                     html.open_ul()

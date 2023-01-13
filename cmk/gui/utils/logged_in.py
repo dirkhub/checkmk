@@ -7,9 +7,11 @@
 
 import contextlib
 import errno
+import logging
 import os
 import time
-from typing import Any, ContextManager, Dict, Iterator, List, Optional, Set, Tuple, Union
+from collections.abc import Container
+from typing import Any, ContextManager, Dict, Final, Iterator, List, Optional, Set, Tuple, Union
 
 from livestatus import SiteConfigurations, SiteId
 
@@ -22,10 +24,12 @@ import cmk.gui.permissions as permissions
 import cmk.gui.sites as sites
 from cmk.gui.config import builtin_role_ids
 from cmk.gui.exceptions import MKAuthException
-from cmk.gui.globals import config, local, request
+from cmk.gui.globals import config, endpoint, local, request
 from cmk.gui.i18n import _
 from cmk.gui.utils.roles import may_with_roles, roles_of_user
 from cmk.gui.utils.transaction_manager import TransactionManager
+
+_logger = logging.getLogger(__name__)
 
 
 class LoggedInUser:
@@ -35,7 +39,12 @@ class LoggedInUser:
     authentication.
     """
 
-    def __init__(self, user_id: Optional[str]) -> None:
+    def __init__(
+        self,
+        user_id: Optional[str],
+        *,
+        explicitly_given_permissions: Container[str] = frozenset(),
+    ) -> None:
         self.id = UserId(user_id) if user_id else None
         self.transactions = TransactionManager(request, self)
 
@@ -47,7 +56,8 @@ class LoggedInUser:
         self.alias = self._attributes.get("alias", self.id)
         self.email = self._attributes.get("email", self.id)
 
-        self._permissions = _initial_permission_cache(self.id)
+        self.explicitly_given_permissions: Final = explicitly_given_permissions
+        self._permissions: dict[str, bool] = {}
         self._siteconf = self.load_file("siteconfig", {})
         self._button_counts: Dict[str, float] = {}
         self._stars: Set[str] = set()
@@ -195,7 +205,7 @@ class LoggedInUser:
 
     @property
     def bi_expansion_level(self) -> int:
-        return self.load_file("bi_treestate", (None,))[0]
+        return self.load_file("bi_treestate", (0,))[0]
 
     @bi_expansion_level.setter
     def bi_expansion_level(self, value: int) -> None:
@@ -334,7 +344,7 @@ class LoggedInUser:
         self, unfiltered_sites: Optional[SiteConfigurations] = None
     ) -> SiteConfigurations:
         if unfiltered_sites is None:
-            unfiltered_sites = sites.allsites()
+            unfiltered_sites = sites.get_enabled_sites()
 
         authorized_sites = self.get_attribute("authorized_sites")
         if authorized_sites is None:
@@ -347,14 +357,44 @@ class LoggedInUser:
     def authorized_login_sites(self) -> SiteConfigurations:
         login_site_ids = sites.get_login_slave_sites()
         return self.authorized_sites(
-            {site_id: s for site_id, s in sites.allsites().items() if site_id in login_site_ids}
+            {
+                site_id: s
+                for site_id, s in sites.get_enabled_sites().items()
+                if site_id in login_site_ids
+            }
         )
 
     def may(self, pname: str) -> bool:
-        if pname in self._permissions:
-            return self._permissions[pname]
-        they_may = may_with_roles(self.role_ids, pname)
+        they_may = (pname in self.explicitly_given_permissions) or may_with_roles(
+            self.role_ids, pname
+        )
         self._permissions[pname] = they_may
+
+        is_rest_api_call = bool(endpoint)  # we can't check if "is None" because it's a LocalProxy
+        if is_rest_api_call and endpoint.track_permissions:
+            # We need to remember this, in oder to later check if the set of required permissions
+            # actually fits the declared permission schema.
+            endpoint.remember_checked_permission(pname)
+            permission_not_declared = (
+                endpoint.permissions_required is not None
+                and pname not in endpoint.permissions_required
+            )
+            if permission_not_declared:
+                _logger.error(
+                    "Permission mismatch: Endpoint %r Use of undeclared permission %s",
+                    endpoint,
+                    pname,
+                )
+
+                if request.environ.get("paste.testing"):
+                    raise PermissionError(
+                        f"Required permissions not declared for this endpoint.\n"
+                        f"Endpoint: {endpoint}\n"
+                        f"Permission: {pname}\n"
+                        f"Used permission: {endpoint._used_permissions}\n"
+                        f"Declared: {endpoint.permissions_required}\n"
+                    )
+
         return they_may
 
     def need_permission(self, pname: str) -> None:
@@ -434,11 +474,32 @@ class LoggedInNobody(LoggedInUser):
         raise TypeError("The profiles of LoggedInNobody cannot be saved")
 
 
-def UserContext(user_id: UserId) -> ContextManager[None]:
-    return _UserContext(LoggedInUser(user_id))
+def UserContext(
+    user_id: UserId,
+    *,
+    explicit_permissions: Container[str] = frozenset(),
+) -> ContextManager[None]:
+    """Execute a block of code as another user
+
+    After the block exits, the previous user will be replaced again.
+    """
+    return _UserContext(
+        LoggedInUser(
+            user_id,
+            explicitly_given_permissions=explicit_permissions,
+        )
+    )
 
 
 def SuperUserContext() -> ContextManager[None]:
+    """Execute a block code as the superuser
+
+    After the block exits, the previous user will be replaced again.
+
+    Returns:
+        The context manager.
+
+    """
     return _UserContext(LoggedInSuperUser())
 
 
@@ -480,22 +541,6 @@ def _most_permissive_baserole_id(baserole_ids: List[str]) -> str:
     if "user" in baserole_ids:
         return "user"
     return "guest"
-
-
-def _initial_permission_cache(user_id: Optional[UserId]) -> Dict[str, bool]:
-    if user_id is None:
-        return {}
-
-    # Prepare cache of already computed permissions
-    # Make sure, admin can restore permissions in any case!
-    if user_id in config.admin_users:
-        return {
-            "general.use": True,  # use Multisite
-            "wato.use": True,  # enter WATO
-            "wato.edit": True,  # make changes in WATO...
-            "wato.users": True,  # ... with access to user management
-        }
-    return {}
 
 
 def save_user_file(name: str, data: Any, user_id: UserId) -> None:

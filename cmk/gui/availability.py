@@ -1050,7 +1050,9 @@ def filter_groups_of_entries(
     # They need to be able to filter the list of all groups.
     # TODO: Negated filters are not handled here. :(
     if group_by == "service_groups":
-        if "servicegroups" not in context and "optservicegroup" not in context:
+        servicegroups = context.get("servicegroups", {})
+        optservicegroup = context.get("optservicegroup", {})
+        if not any(iter(servicegroups.values())) and not any(iter(optservicegroup.values())):
             return
 
         # Extract from context:
@@ -1387,7 +1389,7 @@ def reclassify_config_by_annotation(
     new_entry: AVSpan,
     new_config: ReclassifyConfig,
 ) -> AVSpan:
-    if new_config.downtime:
+    if new_config.downtime is not None:
         new_entry["in_downtime"] = 1 if annotation["downtime"] else 0
         # If the annotation removes a downtime from the services, but
         # the actual reason for the service being in downtime is a host
@@ -1395,11 +1397,11 @@ def reclassify_config_by_annotation(
         # that would override the unset service downtime.
         if history_entry.get("in_host_downtime") and annotation["downtime"] is False:
             new_entry["in_host_downtime"] = 0
-    if new_config.host_state:
+    if new_config.host_state is not None:
         new_host_state = annotation.get("host_state", history_entry.get("host_state"))
         new_entry["state"] = new_host_state
         new_entry["host_down"] = 1 if new_host_state else 0
-    if new_config.service_state:
+    if new_config.service_state is not None:
         new_entry["state"] = annotation.get("service_state", history_entry.get("state"))
 
     return new_entry
@@ -2091,6 +2093,8 @@ def layout_timeline(
     for row_nr, (row, state_id) in enumerate(timeline_rows):
         this_from_time = row["from"]
         this_until_time = row["until"]
+        # If timeline span begins after timeline beginning time, add
+        # unmonitored span in front
         if this_from_time > current_time:  # GAP
             spans.append(
                 (
@@ -2162,6 +2166,17 @@ def layout_timeline(
 
             width += min_percentage
             spans.append((row_nr, title, width, css))
+    # If timeline span ends before the current time, fill it up with
+    # unmonitored entry until end
+    if avoptions["service_period"] == "honor" and this_until_time < until_time:  # GAP
+        spans.append(
+            (
+                None,
+                "",
+                100.0 * (until_time - this_until_time) / total_duration,
+                "unmonitored",
+            )
+        )
 
     if chaos_count > 1 and chaos_begin and chaos_end:
         spans.append(chaos_period(chaos_begin, chaos_end, chaos_count, chaos_width))

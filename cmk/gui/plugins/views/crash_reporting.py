@@ -8,7 +8,7 @@ import json
 from typing import Dict, List, Optional
 
 import livestatus
-from livestatus import SiteId
+from livestatus import MKLivestatusNotFoundError, SiteId
 
 import cmk.gui.sites as sites
 from cmk.gui.globals import html, request
@@ -29,6 +29,7 @@ from cmk.gui.plugins.views.utils import (
     Sorter,
     sorter_registry,
 )
+from cmk.gui.type_defs import Rows
 from cmk.gui.utils.urls import makeuri_contextless
 
 
@@ -104,7 +105,7 @@ class CrashReportsRowTable(RowTable):
             headers = ["crash_info"]
             columns = ["file:crash_info:%s/crash.info" % livestatus.lqencode(file_path)]
 
-            if crash_info["crash_type"] == "check":
+            if crash_info["crash_type"] in ("check", "section"):
                 headers += ["agent_output", "snmp_info"]
                 columns += [
                     "file:agent_output:%s/agent_output" % livestatus.lqencode(file_path),
@@ -121,6 +122,8 @@ class CrashReportsRowTable(RowTable):
                     "Filter: id = %s"
                     % (" ".join(columns), livestatus.lqencode(crash_info["crash_id"]))
                 )
+            except MKLivestatusNotFoundError:
+                continue
             finally:
                 sites.live().set_only_sites(None)
                 sites.live().set_prepend_site(False)
@@ -316,7 +319,7 @@ class CommandDeleteCrashReports(Command):
         html.button("_delete_crash_reports", _("Delete"))
 
     def _action(
-        self, cmdtag: str, spec: str, row: dict, row_index: int, num_rows: int
+        self, cmdtag: str, spec: str, row: dict, row_index: int, action_rows: Rows
     ) -> CommandActionResult:
         if request.has_var("_delete_crash_reports"):
             commands = [("DEL_CRASH_REPORT;%s" % row["crash_id"])]

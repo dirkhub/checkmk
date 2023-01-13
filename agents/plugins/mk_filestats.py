@@ -87,7 +87,7 @@ You should find an example configuration file at
 '../cfg_examples/filestats.cfg' relative to this file.
 """
 
-__version__ = "2.1.0b9"
+__version__ = "2.1.0p20"
 
 # this file has to work with both Python 2 and 3
 # pylint: disable=super-with-arguments
@@ -344,7 +344,7 @@ class SizeFilter(AbstractNumericFilter):
     def matches(self, filestat):
         """apply AbstractNumericFilter ti file size"""
         size = filestat.size
-        if size is not None:
+        if size is not None and size != "null":
             return self._matches_value(size)
         # Don't return vanished files.
         # Other cases are a problem, and should be included
@@ -355,7 +355,7 @@ class AgeFilter(AbstractNumericFilter):
     def matches(self, filestat):
         """apply AbstractNumericFilter ti file age"""
         age = filestat.age
-        if age is not None:
+        if age is not None and age != "null":
             return self._matches_value(age)
         # Don't return vanished files.
         # Other cases are a problem, and should be included
@@ -441,7 +441,7 @@ def parse_grouping_config(
     )
 
 
-def _grouping_construct_group_name(parent_group_name, child_group_name):
+def _grouping_construct_group_name(parent_group_name, child_group_name=""):
     """allow the user to format the service name using '%s'.
 
     >>> _grouping_construct_group_name('aard %s vark', 'banana')

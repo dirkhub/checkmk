@@ -30,6 +30,7 @@ RUN zypper ref -s \
     && zypper -n in -y --force-resolution \
     apache2-devel \
     bind-utils \
+    bison \
     curl \
     flex \
     freeradius-client-devel \
@@ -113,6 +114,10 @@ RUN /opt/install-protobuf-cpp.sh
 RUN /opt/install-openssl.sh
 RUN /opt/install-python.sh
 RUN /opt/install-freetds.sh
+
+# Now shrink all the binaries and libraries we produced to build a small image
+# in the next step
+RUN /opt/strip_binaries /opt
 
 ### Actual Image ###
 FROM base

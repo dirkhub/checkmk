@@ -7,12 +7,23 @@
 import json
 import re
 from functools import partial
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Container,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import livestatus
 
 import cmk.utils.version as cmk_version
-from cmk.utils.prediction import lq_logic
 
 import cmk.gui.bi as bi
 import cmk.gui.mkeventd as mkeventd
@@ -490,7 +501,7 @@ filter_registry.register(
         title=_l("Service Contact Group"),
         sort_index=206,
         description=_l("Optional selection of service contact group"),
-        autocompleter=GroupAutocompleterConfig(ident="allgroups", group_type="service"),
+        autocompleter=GroupAutocompleterConfig(ident="allgroups", group_type="contact"),
         query_filter=query_filters.MultipleQuery(
             ident="optservice_contactgroup",
             request_var="optservice_contact_group",
@@ -1444,6 +1455,7 @@ class TagFilter(Filter):
             html.dropdown(
                 prefix + "_op",
                 operators,
+                deflt=value.get(prefix + "_op", ""),
                 style="width:36px",
                 ordered=True,
                 class_="op",
@@ -1509,11 +1521,12 @@ class FilterHostAuxTags(Filter):
     def display(self, value: FilterHTTPVariables) -> None:
         for num in range(self.query_filter.count):
             varname = "%s_%d" % (self.query_filter.var_prefix, num)
+            negate_varname = varname + "_neg"
             html.dropdown(
                 varname, self._options(), deflt=value.get(varname, ""), ordered=True, class_="neg"
             )
             html.open_nobr()
-            html.checkbox(varname + "_neg", bool(value.get(varname)), label=_("negate"))
+            html.checkbox(negate_varname, bool(value.get(negate_varname)), label=_("negate"))
             html.close_nobr()
 
     @staticmethod
@@ -1740,35 +1753,46 @@ class FilterECServiceLevelRange(Filter):
         )
         html.close_div()
 
-    def filter(self, value: FilterHTTPVariables) -> FilterHeader:
-        lower_bound = value.get(self.lower_bound_varname)
-        upper_bound = value.get(self.upper_bound_varname)
+    def filter_table(self, context: VisualContext, rows: Rows) -> Rows:
         # NOTE: We need this special case only because our construction of the
         # disjunction is broken. We should really have a Livestatus Query DSL...
-        if not lower_bound and not upper_bound:
+        bounds: FilterHTTPVariables = context.get(self.ident, {})
+        if not any(v for _k, v in bounds.items()):
+            return rows
+
+        lower_bound: Optional[str] = bounds.get(self.lower_bound_varname)
+        upper_bound: Optional[str] = bounds.get(self.upper_bound_varname)
+
+        # If user only chooses "From" or "To", use same value from the choosen
+        # field for the empty field and update filter form with that value
+        if not lower_bound:
+            lower_bound = upper_bound
+            assert upper_bound is not None
+            html.request.set_var(self.lower_bound_varname, upper_bound)
+        if not upper_bound:
+            upper_bound = lower_bound
+            assert lower_bound is not None
+            html.request.set_var(self.upper_bound_varname, lower_bound)
+
+        filtered_rows: Rows = []
+        assert lower_bound is not None
+        assert upper_bound is not None
+        for row in rows:
+            service_level = int(row["%s_custom_variables" % self.info]["EC_SL"])
+            if int(lower_bound) <= service_level <= int(upper_bound):
+                filtered_rows.append(row)
+
+        return filtered_rows
+
+    def filter(self, value: FilterHTTPVariables) -> FilterHeader:
+        if not value.get(self.lower_bound_varname) and not value.get(self.upper_bound_varname):
             return ""
 
-        if lower_bound:
-            match_lower = lambda val, lo=int(lower_bound): lo <= val
-        else:
-            match_lower = lambda val, lo=0: True
+        return "Filter: %s_custom_variable_names >= EC_SL\n" % self.info
 
-        if upper_bound:
-            match_upper = lambda val, hi=int(upper_bound): val <= hi
-        else:
-            match_upper = lambda val, hi=0: True
-
-        filterline = "Filter: %s_custom_variable_names >= EC_SL\n" % self.info
-
-        filterline_values = [
-            str(val)
-            for val, _readable in config.mkeventd_service_levels
-            if match_lower(val) and match_upper(val)
-        ]
-
-        return filterline + lq_logic(
-            "Filter: %s_custom_variable_values >=" % self.info, filterline_values, "Or"
-        )
+    def columns_for_filter_table(self, context: VisualContext) -> Iterable[str]:
+        if self.ident in context:
+            yield "%s_custom_variables" % self.info
 
 
 filter_registry.register(
@@ -2453,23 +2477,27 @@ class FilterCMKSiteStatisticsByCorePIDs(Filter):
             )
         )
 
+    def filter(self, value: FilterHTTPVariables) -> FilterHeader:
+        return (
+            f"Filter: service_description ~~ Site ({'|'.join(self._connected_sites_to_pids())}) statistics$"
+            if self._should_apply(value)
+            else ""
+        )
+
     def columns_for_filter_table(self, context: VisualContext) -> Iterable[str]:
-        if self.ID in context:
+        if self._should_apply(context):
+            yield "host_name"
             yield "service_description"
             yield "long_plugin_output"
 
     def filter_table(self, context: VisualContext, rows: Rows) -> Rows:
-        if self.ID not in context:
+        if not self._should_apply(context):
             return rows
 
         # ids and core pids of connected sites, i.e., what we hope to find the service output
-        pids_of_connected_sites = {
-            site_id: site_status["core_pid"]
-            for site_id, site_status in sites.states().items()
-            if site_status["state"] == "online"
-        }
+        pids_of_connected_sites = dict(self._connected_sites_to_pids())
         # apply potential filters on sites
-        if only_sites := get_only_sites_from_context(context):
+        if (only_sites := get_only_sites_from_context(context)) is not None:
             pids_of_connected_sites = {
                 site_id: core_pid
                 for site_id, core_pid in pids_of_connected_sites.items()
@@ -2481,7 +2509,11 @@ class FilterCMKSiteStatisticsByCorePIDs(Filter):
         # ids and core pids from the service output
         sites_and_pids_from_services = []
         rows_right_service = []
-        for row in rows:
+        # we sort to be independent of the order of the incoming rows
+        for row in sorted(
+            rows,
+            key=lambda r: (r.get("site", ""), r["host_name"], r["service_description"]),
+        ):
             if not re.match("Site [^ ]* statistics$", row["service_description"]):
                 continue
             rows_right_service.append(row)
@@ -2535,6 +2567,18 @@ class FilterCMKSiteStatisticsByCorePIDs(Filter):
                 del pids_of_connected_sites[site]
 
         return rows_filtered
+
+    @classmethod
+    def _should_apply(cls, ctx: Container[str]) -> bool:
+        return cls.ID in ctx
+
+    @staticmethod
+    def _connected_sites_to_pids() -> Mapping[livestatus.SiteId, int]:
+        return {
+            site_id: site_status["core_pid"]
+            for site_id, site_status in sites.states().items()
+            if site_status["state"] == "online"
+        }
 
 
 filter_registry.register(

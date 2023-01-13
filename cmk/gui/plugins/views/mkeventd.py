@@ -10,17 +10,19 @@ from typing import Callable, Optional, TypeVar, Union
 from livestatus import SiteId
 
 from cmk.utils.defines import short_service_state_name
+from cmk.utils.type_defs import HostName
 
 import cmk.gui.mkeventd as mkeventd
-import cmk.gui.sites as sites
 import cmk.gui.utils.escaping as escaping
 from cmk.gui.config import builtin_role_ids
 from cmk.gui.globals import config, html, request, transactions, user
 from cmk.gui.htmllib import HTML
 from cmk.gui.i18n import _, _l, ungettext
 from cmk.gui.permissions import Permission, permission_registry
+from cmk.gui.plugins.dashboard.utils import DashletConfig
 from cmk.gui.plugins.views.utils import (
     ABCDataSource,
+    Cell,
     cmp_num_split,
     cmp_simple_number,
     cmp_simple_string,
@@ -39,9 +41,10 @@ from cmk.gui.plugins.views.utils import (
     row_id,
     RowTableLivestatus,
 )
-from cmk.gui.type_defs import HTTPVariables, Row
-from cmk.gui.utils.urls import makeactionuri, urlencode_vars
+from cmk.gui.type_defs import ColumnName, HTTPVariables, Row, Rows, ViewSpec
+from cmk.gui.utils.urls import makeactionuri, makeuri_contextless, urlencode_vars
 from cmk.gui.valuespec import MonitoringState
+from cmk.gui.view_utils import CellSpec
 
 #   .--Datasources---------------------------------------------------------.
 #   |       ____        _                                                  |
@@ -432,23 +435,54 @@ class PainterEventSl(Painter):
 @painter_registry.register
 class PainterEventHost(Painter):
     @property
-    def ident(self):
+    def ident(self) -> str:
         return "event_host"
 
-    def title(self, cell):
+    def title(self, cell: "Cell") -> str:
         return _("Hostname")
 
-    def short_title(self, cell):
+    def short_title(self, cell: "Cell") -> str:
         return _("Host")
 
     @property
-    def columns(self):
+    def columns(self) -> list[ColumnName]:
         return ["event_host", "host_name"]
 
-    def render(self, row, cell):
-        if row["host_name"]:
-            return "", row["host_name"]
-        return "", row["event_host"]
+    @property
+    def use_painter_link(self) -> bool:
+        return False
+
+    def render(self, row: Row, cell: "Cell") -> CellSpec:
+        host_name = row.get("host_name", row["event_host"])
+
+        return "", HTML(html.render_a(host_name, _get_event_host_link(host_name, row, cell)))
+
+
+def _get_event_host_link(host_name: HostName, row: Row, cell: "Cell") -> str:
+    """
+    Needed to support links to views and dashboards. If no link is configured,
+    always use ec_events_of_host as target view.
+    """
+    link_type: str = "view_name"
+    filename: str = "view.py"
+    link_target: str = "ec_events_of_host"
+    if link_spec := cell._link_spec:
+        if link_spec.type_name == "dashboards":
+            link_type = "name"
+            filename = "dashboard.py"
+        link_target = link_spec.name
+
+    # See SUP-10272 for a detailed explanation, hacks of view.py do not
+    # work for SNMP traps
+    return makeuri_contextless(
+        html.request,
+        [
+            (link_type, link_target),
+            ("host", host_name),
+            ("event_host", row["event_host"]),
+        ],
+        filename=filename,
+    )
 
 
 @painter_registry.register
@@ -723,24 +757,30 @@ def render_delete_event_icons(row):
 
     # Found no cleaner way to get the view. Sorry.
     # TODO: This needs to be cleaned up with the new view implementation.
-    if request.has_var("name") and request.has_var("id"):
+    filename: Optional[str] = None
+    if _is_rendered_from_view_dashlet():
         ident = request.get_integer_input_mandatory("id")
 
         import cmk.gui.dashboard as dashboard
 
-        view = dashboard.get_dashlet(request.get_str_input_mandatory("name"), ident)
+        dashlet_config: DashletConfig = dashboard.get_dashlet(
+            request.get_str_input_mandatory("name"), ident
+        )
+        if dashlet_config.get("type") == "linked_view":
+            view: Union[DashletConfig, ViewSpec] = get_permitted_views()[dashlet_config["name"]]
+        else:
+            view = dashlet_config
 
         # These actions are not performed within the dashlet. Assume the title url still
         # links to the source view where the action can be performed.
-        title_url = view.get("title_url")
+        title_url = dashlet_config.get("title_url")
         if title_url:
             parsed_url = urllib.parse.urlparse(title_url)
-            filename: Optional[str] = parsed_url.path
+            filename = parsed_url.path
             urlvars += urllib.parse.parse_qsl(parsed_url.query)
     else:
         # Regular view
-        view = get_permitted_views()[(request.get_str_input_mandatory("view_name"))]
-        filename = None
+        view = get_permitted_views()[request.get_str_input_mandatory("view_name")]
 
     urlvars += [
         ("filled_in", "actions"),
@@ -754,6 +794,10 @@ def render_delete_event_icons(row):
         request, transactions, urlvars, filename=filename, delvars=["selection", "show_checkboxes"]
     )
     return html.render_icon_button(url, _("Archive this event"), "archive_event")
+
+
+def _is_rendered_from_view_dashlet() -> bool:
+    return html.request.has_var("name") and html.request.has_var("id")
 
 
 @painter_registry.register
@@ -933,18 +977,18 @@ class PainterHistoryWhat(Painter):
 @painter_registry.register
 class PainterHistoryWhatExplained(Painter):
     @property
-    def ident(self):
+    def ident(self) -> str:
         return "history_what_explained"
 
-    def title(self, cell):
+    def title(self, cell: Cell) -> str:
         return _("Explanation for event action")
 
     @property
-    def columns(self):
+    def columns(self) -> list[ColumnName]:
         return ["history_what"]
 
-    def render(self, row, cell):
-        return ("", mkeventd.action_whats[row["history_what"]])
+    def render(self, row: Row, cell: Cell) -> CellSpec:
+        return ("", str(mkeventd.action_whats[row["history_what"]]))
 
 
 @painter_registry.register
@@ -1088,7 +1132,7 @@ class CommandECUpdateEvent(ECCommand):
         html.button("_mkeventd_update", _("Update"))
 
     def _action(
-        self, cmdtag: str, spec: str, row: Row, row_index: int, num_rows: int
+        self, cmdtag: str, spec: str, row: Row, row_index: int, action_rows: Rows
     ) -> CommandActionResult:
         if request.var("_mkeventd_update"):
             if user.may("mkeventd.update_comment"):
@@ -1158,11 +1202,12 @@ class CommandECChangeState(ECCommand):
         MonitoringState().render_input("_mkeventd_state", 2)
 
     def _action(
-        self, cmdtag: str, spec: str, row: Row, row_index: int, num_rows: int
+        self, cmdtag: str, spec: str, row: Row, row_index: int, action_rows: Rows
     ) -> CommandActionResult:
         if request.var("_mkeventd_changestate"):
+            events = ",".join([str(entry["event_id"]) for entry in action_rows])
             state = MonitoringState().from_html_vars("_mkeventd_state")
-            return "CHANGESTATE;%s;%s;%s" % (row["event_id"], user.id, state), _("change the state")
+            return "CHANGESTATE;%s;%s;%s" % (events, user.id, state), _("change the state")
         return None
 
 
@@ -1206,7 +1251,7 @@ class CommandECCustomAction(ECCommand):
             html.br()
 
     def _action(
-        self, cmdtag: str, spec: str, row: Row, row_index: int, num_rows: int
+        self, cmdtag: str, spec: str, row: Row, row_index: int, action_rows: Rows
     ) -> CommandActionResult:
         for action_id, title in mkeventd.action_choices(omit_hidden=True):
             if request.var("_action_" + action_id):
@@ -1250,10 +1295,11 @@ class CommandECArchiveEvent(ECCommand):
         html.button("_delete_event", _("Archive Event"))
 
     def _action(
-        self, cmdtag: str, spec: str, row: Row, row_index: int, num_rows: int
+        self, cmdtag: str, spec: str, row: Row, row_index: int, action_rows: Rows
     ) -> CommandActionResult:
         if request.var("_delete_event"):
-            command = "DELETE;%s;%s" % (row["event_id"], user.id)
+            events = ",".join([str(entry["event_id"]) for entry in action_rows])
+            command = "DELETE;%s;%s" % (events, user.id)
             title = _("<b>archive</b>")
             return command, title
         return None
@@ -1299,25 +1345,10 @@ class CommandECArchiveEventsOfHost(ECCommand):
         html.button("_archive_events_of_hosts", _("Archive events"), cssclass="hot")
 
     def _action(
-        self, cmdtag: str, spec: str, row: Row, row_index: int, num_rows: int
+        self, cmdtag: str, spec: str, row: Row, row_index: int, action_rows: Rows
     ) -> CommandActionResult:
         if request.var("_archive_events_of_hosts"):
-            if cmdtag == "HOST":
-                tag: Optional[str] = "host"
-            elif cmdtag == "SVC":
-                tag = "service"
-            else:
-                tag = None
-
-            commands = []
-            if tag and row.get("%s_check_command" % tag, "").startswith("check_mk_active-mkevents"):
-                data = sites.live().query(
-                    "GET eventconsoleevents\n"
-                    + "Columns: event_id\n"
-                    + "Filter: host_name = %s" % row["host_name"]
-                )
-                commands = ["DELETE;%s;%s" % (entry[0], user.id) for entry in data]
-
+            commands = [f"DELETE_EVENTS_OF_HOST;{row['host_name']};{user.id}"]
             return commands, "<b>archive all events</b> of"
         return None
 

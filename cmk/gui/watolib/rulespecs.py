@@ -12,6 +12,7 @@ from typing import Tuple as _Tuple
 from typing import Type, Union
 
 import cmk.utils.plugin_registry
+from cmk.utils.check_utils import maincheckify
 
 from cmk.gui.exceptions import MKGeneralException
 from cmk.gui.globals import html, request
@@ -207,7 +208,7 @@ class RulespecGroupEnforcedServices(RulespecGroup):
     @property
     def help(self):
         return _(
-            "Rules to set up [wato_services#manual_checks|manual services]. Services set "
+            "Rules to set up [wato_services#enforced_services|enforced services]. Services set "
             "up in this way do not depend on the service discovery. This is useful if you want "
             "to enforce compliance with a specific guideline. You can for example ensure that "
             "a certain Windows service is always present on a host."
@@ -967,10 +968,13 @@ class ManualCheckParameterRulespec(HostRulespec):
         return Tuple(
             title=parameter_vs.title(),
             elements=[
-                CheckTypeGroupSelection(
-                    self.check_group_name,
-                    title=_("Checktype"),
-                    help=_("Please choose the check plugin"),
+                Transform(
+                    CheckTypeGroupSelection(
+                        self.check_group_name,
+                        title=_("Checktype"),
+                        help=_("Please choose the check plugin"),
+                    ),
+                    forth=maincheckify,
                 ),
                 self._get_item_spec(),
                 parameter_vs,
@@ -1274,6 +1278,9 @@ class TimeperiodValuespec(ValueSpec):
         return (
             self._get_timeperiod_valuespec() if self.is_active(value) else self._enclosed_valuespec
         )
+
+    def mask(self, value: dict[str, Any]) -> dict[str, Any]:
+        return self._get_used_valuespec(value).mask(value)
 
     def transform_value(self, value: Any) -> Any:
         return self._get_used_valuespec(value).transform_value(value)

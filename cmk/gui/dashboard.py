@@ -915,18 +915,18 @@ def _page_menu_dashboards(name) -> Iterable[PageMenuTopic]:
         linked_dashboards = ["main", "problems", "checkmk"]
 
     yield PageMenuTopic(
-        title=_("Related Dashboards"),
+        title=_("Related dashboards"),
         entries=list(_dashboard_related_entries(name, linked_dashboards)),
     )
     yield PageMenuTopic(
-        title=_("Other Dashboards"),
+        title=_("Other dashboards"),
         entries=list(_dashboard_other_entries(name, linked_dashboards)),
     )
     yield PageMenuTopic(
         title=_("Customize"),
         entries=[
             PageMenuEntry(
-                title=_("Customize Dashboards"),
+                title=_("Edit dashboards"),
                 icon_name="dashboard",
                 item=make_simple_link("edit_dashboards.py"),
             )
@@ -991,7 +991,7 @@ def _dashboard_edit_entries(
         # edit mode using javascript, use the URL with edit=1. When this URL is opened,
         # the dashboard will be cloned for this user
         yield PageMenuEntry(
-            title=_("Customize builtin dashboard"),
+            title=_("Clone builtin dashboard"),
             icon_name="edit",
             item=make_simple_link(makeuri(request, [("edit", 1)])),
         )
@@ -1259,13 +1259,13 @@ def _dashboard_add_graphs_dashlet_entries(name: DashboardName) -> Iterable[PageM
 def _dashboard_add_state_dashlet_entries(name: DashboardName) -> Iterable[PageMenuEntryCEEOnly]:
 
     yield PageMenuEntryCEEOnly(
-        title="Host State",
+        title="Host state",
         icon_name="host_state",
         item=_dashboard_add_non_view_dashlet_link(name, "state_host"),
     )
 
     yield PageMenuEntryCEEOnly(
-        title="Service State",
+        title="Service state",
         icon_name="service_state",
         item=_dashboard_add_non_view_dashlet_link(name, "state_service"),
     )
@@ -1292,7 +1292,7 @@ def _dashboard_add_state_dashlet_entries(name: DashboardName) -> Iterable[PageMe
 def _dashboard_add_inventory_dashlet_entries(name: DashboardName) -> Iterable[PageMenuEntryCEEOnly]:
 
     yield PageMenuEntryCEEOnly(
-        title="Host Inventory",
+        title="Host inventory",
         icon_name="inventory",
         item=_dashboard_add_non_view_dashlet_link(name, "inventory"),
     )
@@ -1334,9 +1334,9 @@ def _dashboard_add_checkmk_dashlet_entries(name: DashboardName) -> Iterable[Page
     )
 
     yield PageMenuEntryCEEOnly(
-        title="Alert statistics",
+        title="Alert overview",
         icon_name={"icon": "alerts", "emblem": "statistic"},
-        item=_dashboard_add_non_view_dashlet_link(name, "alert_statistics"),
+        item=_dashboard_add_non_view_dashlet_link(name, "alert_overview"),
     )
     yield PageMenuEntry(
         title="Host statistics",
@@ -1631,7 +1631,7 @@ def _add_context_to_dashboard(board: DashboardConfig) -> DashboardConfig:
 def page_edit_dashboards() -> None:
     visuals.page_list(
         what="dashboards",
-        title=_("Edit Dashboards"),
+        title=_("Edit dashboards"),
         visuals=get_all_dashboards(),
         render_custom_buttons=_render_dashboard_buttons,
     )
@@ -1639,18 +1639,25 @@ def page_edit_dashboards() -> None:
 
 def _render_dashboard_buttons(dashboard_name: DashboardName, dashboard: DashboardConfig) -> None:
     if dashboard["owner"] == user.id:
-        html.icon_button(
-            makeuri_contextless(
-                request,
-                [
-                    ("name", dashboard_name),
-                    ("edit", "1"),
-                ],
-                "dashboard.py",
-            ),
-            title=_("Edit dashboard"),
-            icon="dashboard",
-        )
+        if dashboard.get("show_title"):
+            html.icon_button(
+                makeuri_contextless(
+                    request,
+                    [
+                        ("name", dashboard_name),
+                        ("edit", "1"),
+                    ],
+                    "dashboard.py",
+                ),
+                title=_("Edit layout"),
+                icon="dashboard",
+            )
+        else:
+            html.icon(
+                icon="dashboard",
+                title=_("Edit layout only available if header is enabled"),
+                cssclass="colorless",
+            )
 
 
 # .
@@ -1726,7 +1733,7 @@ def create_dashboard(old_dashboard: DashboardConfig, dashboard: DashboardConfig)
 
 def _vs_dashboard() -> Dictionary:
     return Dictionary(
-        title=_("Dashboard Properties"),
+        title=_("Dashboard properties"),
         render="form",
         optional_keys=False,
         elements=[
@@ -2035,6 +2042,9 @@ class EditDashletPage(Page):
                     if option not in general_properties and option in dashlet_spec:
                         del dashlet_spec[option]
 
+                if context_specs:
+                    dashlet_spec["context"] = visuals.process_context_specs(context_specs)
+
                 if vs_type:
                     type_properties = vs_type.from_html_vars("type")
                     vs_type.validate_value(type_properties, "type")
@@ -2044,9 +2054,6 @@ class EditDashletPage(Page):
                     # The returned dashlet must be equal to the parameter! It is not replaced/re-added
                     # to the dashboard object. FIXME TODO: Clean this up!
                     dashlet_spec = handle_input_func(self._ident, dashlet_spec)
-
-                if context_specs:
-                    dashlet_spec["context"] = visuals.process_context_specs(context_specs)
 
                 if mode == "add":
                     self._dashboard["dashlets"].append(dashlet_spec)

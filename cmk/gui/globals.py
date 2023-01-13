@@ -15,6 +15,7 @@ from typing import Any, List, Optional, TYPE_CHECKING
 
 from werkzeug.local import LocalProxy, LocalStack
 
+from cmk.gui.utils.theme import Theme
 from cmk.gui.utils.user_errors import UserErrors
 
 #####################################################################
@@ -26,9 +27,9 @@ if TYPE_CHECKING:
     from cmk.gui.config import Config
     from cmk.gui.display_options import DisplayOptions
     from cmk.gui.i18n import Translation
+    from cmk.gui.plugins.openapi.restful_objects import Endpoint
     from cmk.gui.utils.logged_in import LoggedInUser
     from cmk.gui.utils.output_funnel import OutputFunnel
-    from cmk.gui.utils.theme import Theme
     from cmk.gui.utils.timeout_manager import TimeoutManager
     from cmk.gui.utils.transaction_manager import TransactionManager
 
@@ -161,9 +162,10 @@ class RequestContext:
         user: LoggedInUser,  # pylint: disable=redefined-outer-name
         html_obj: Optional[htmllib.html] = None,
         timeout_manager: Optional[TimeoutManager] = None,  # pylint: disable=redefined-outer-name
-        theme: Optional[Theme] = None,  # pylint: disable=redefined-outer-name
+        theme: Theme = Theme(),  # pylint: disable=redefined-outer-name
         display_options: Optional[DisplayOptions] = None,  # pylint: disable=redefined-outer-name
         prefix_logs_with_url: bool = True,
+        endpoint: Optional[Endpoint] = None,  # pylint: disable=redefined-outer-name
     ):
         self.html = html_obj
         self.auth_type: Optional[str] = None
@@ -175,6 +177,7 @@ class RequestContext:
         self.translation: Optional[Translation] = None
         self._prefix_logs_with_url = prefix_logs_with_url
 
+        self.endpoint = endpoint
         self.request = req
         self.response = resp
         self.output_funnel = funnel
@@ -258,6 +261,7 @@ response: http.Response = request_local_attr("response")
 output_funnel: OutputFunnel = request_local_attr("output_funnel")
 config: Config = request_local_attr("config")
 session: userdb.Session = request_local_attr("session")
+endpoint: Endpoint = request_local_attr("endpoint")
 user_errors: UserErrors = request_local_attr("user_errors")
 
 html: htmllib.html = request_local_attr("html")

@@ -52,6 +52,7 @@ import cmk.utils.password_store as password_store
 import cmk.utils.paths
 import cmk.utils.store as store
 import cmk.utils.version as cmk_version
+from cmk.utils.crypto import Password
 from cmk.utils.macros import replace_macros_in_str
 from cmk.utils.site import omd_site
 from cmk.utils.type_defs import UserId
@@ -63,6 +64,7 @@ from cmk.gui.exceptions import MKGeneralException, MKUserError
 from cmk.gui.globals import config
 from cmk.gui.i18n import _
 from cmk.gui.plugins.userdb.utils import (
+    active_connections,
     add_internal_attributes,
     CheckCredentialsResult,
     get_connection,
@@ -1112,14 +1114,19 @@ class LDAPUserConnector(UserConnector):
     #
 
     # This function only validates credentials, no locked checking or similar
-    def check_credentials(self, user_id, password: str) -> CheckCredentialsResult:
+    def check_credentials(self, user_id: UserId, password: Password[str]) -> CheckCredentialsResult:
         # Connect only to servers of connections, the user is configured for,
         # to avoid connection errors for unrelated servers
         user_connection_id = self._connection_id_of_user(user_id)
         if user_connection_id is not None and user_connection_id != self.id():
             return None
 
-        self.connect()
+        try:
+            self.connect()
+        except Exception as e:
+            self._logger.exception("Failed to connect to LDAP:", e)
+            # Could not connect to any of the LDAP servers, or unknown error. Skip this connection.
+            return None
 
         enforce_this_connection = None
         # Also honor users that are currently not known, e.g. when sync did not
@@ -1152,7 +1159,7 @@ class LDAPUserConnector(UserConnector):
         # Try to bind with the user provided credentials. This unbinds the default
         # authentication which should be rebound again after trying this.
         try:
-            self._bind(user_dn, ("password", password))
+            self._bind(user_dn, ("password", password.raw))
             result = user_id if not self._has_suffix() else self._add_suffix(user_id)
         except (ldap.INVALID_CREDENTIALS, ldap.INAPPROPRIATE_AUTH) as e:
             self._logger.warning(
@@ -1243,9 +1250,20 @@ class LDAPUserConnector(UserConnector):
 
         has_changed_passwords = False
         profiles_to_synchronize = {}
+        all_active_connections: List[str] = [connection[0] for connection in active_connections()]
         for user_id, ldap_user in ldap_users.items():
             mode_create, user = load_user(user_id)
             user_connection_id = user.get("connector")
+
+            # Change user connector if the current one of an existing user is
+            # disabled or not known any more
+            is_known_connection: Optional[UserConnector] = get_connection(user_connection_id)
+            if not mode_create and (
+                not is_known_connection
+                or (is_known_connection and user_connection_id not in all_active_connections)
+            ):
+                user_connection_id = connection_id
+                user["connector"] = connection_id
 
             if self._create_users_only_on_login() and mode_create:
                 self._logger.info(

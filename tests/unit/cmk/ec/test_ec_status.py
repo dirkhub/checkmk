@@ -6,9 +6,10 @@
 
 import ast
 import logging
-import pathlib  # pylint: disable=import-error
+import socket
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -16,26 +17,27 @@ from tests.testlib import CMKEventConsole
 
 import cmk.utils.paths
 
-import cmk.ec.export as ec
 import cmk.ec.history
 import cmk.ec.main
+from cmk.ec.main import Event, EventStatus, StatusServer
 
 
-class FakeStatusSocket:
+class FakeStatusSocket(socket.socket):
     def __init__(self, query: bytes) -> None:
+        super().__init__()
         self._query = query
         self._sent = False
         self._response = b""
 
-    def recv(self, size: int) -> bytes:
+    def recv(self, buflen: int, flags: int = 4711) -> bytes:
         if self._sent:
             return b""
 
         self._sent = True
         return self._query
 
-    def sendall(self, data: bytes) -> None:
-        self._response += data
+    def sendall(self, b: Any, flags: int = 4711) -> None:
+        self._response += b
 
     def close(self) -> None:
         pass
@@ -46,16 +48,6 @@ class FakeStatusSocket:
         return response
 
 
-@pytest.fixture(name="settings", scope="function")
-def fixture_settings():
-    return ec.settings(
-        "1.2.3i45",
-        cmk.utils.paths.omd_root,
-        pathlib.Path(cmk.utils.paths.default_config_dir),
-        ["mkeventd"],
-    )
-
-
 @pytest.fixture(name="lock_configuration", scope="function")
 def fixture_lock_configuration():
     return cmk.ec.main.ECLock(logging.getLogger("cmk.mkeventd.configuration"))
@@ -64,22 +56,6 @@ def fixture_lock_configuration():
 @pytest.fixture(name="slave_status", scope="function")
 def fixture_slave_status():
     return cmk.ec.main.default_slave_status_master()
-
-
-@pytest.fixture(name="config", scope="function")
-def fixture_config():
-    return ec.default_config()
-
-
-@pytest.fixture(name="history", scope="function")
-def fixture_history(settings, config):
-    return cmk.ec.history.History(
-        settings,
-        config,
-        logging.getLogger("cmk.mkeventd"),
-        cmk.ec.main.StatusTableEvents.columns,
-        cmk.ec.main.StatusTableHistory.columns,
-    )
 
 
 @pytest.fixture(name="perfcounters", scope="function")
@@ -258,3 +234,77 @@ def test_mkevent_query_filters(
     status_server.handle_client(status_socket, True, "127.0.0.1")
     response = status_socket.get_response()
     assert (len(response) == 2) is is_match
+
+
+def test_delete_event(event_status: EventStatus, status_server: StatusServer) -> None:
+    """Delete 1 event"""
+    event: Event = {
+        "host": "ABC1",
+        "text": "not important",
+        "core_host": "ABC",
+    }
+    event_status.new_event(CMKEventConsole.new_event(event))  # type: ignore[arg-type]
+
+    assert len(event_status.events()) == 1
+
+    s = FakeStatusSocket(b"COMMAND DELETE;1;testuser")
+    status_server.handle_client(s, True, "127.0.0.1")
+
+    assert len(event_status.events()) == 0
+
+
+def test_delete_multiple_events(event_status: EventStatus, status_server: StatusServer) -> None:
+    """Delete event list"""
+    events: list[Event] = [
+        {
+            "host": "ABC1",
+            "text": "event1 text",
+            "core_host": "ABC",
+        },
+        {
+            "host": "ABC2",
+            "text": "event2 text",
+            "core_host": "ABC",
+        },
+    ]
+    for event in events:
+        event_status.new_event(CMKEventConsole.new_event(event))  # type: ignore[arg-type]
+
+    assert len(event_status.events()) == 2
+
+    s = FakeStatusSocket(b"COMMAND DELETE;1,2;testuser")
+    status_server.handle_client(s, True, "127.0.0.1")
+
+    assert len(event_status.events()) == 0
+
+
+def test_delete_partially_existing_multiple_events(
+    event_status: EventStatus, status_server: StatusServer
+) -> None:
+    """Event list with a missing ID still deletes the existing ID"""
+    events: list[Event] = [
+        {
+            "host": "ABC1",
+            "text": "event1 text",
+            "core_host": "ABC",
+        },
+        {
+            "host": "ABC2",
+            "text": "event2 text",
+            "core_host": "ABC",
+        },
+    ]
+    for event in events:
+        event_status.new_event(CMKEventConsole.new_event(event))  # type: ignore[arg-type]
+
+    assert len(event_status.events()) == 2
+
+    s = FakeStatusSocket(b"COMMAND DELETE;2;testuser")
+    status_server.handle_client(s, True, "127.0.0.1")
+
+    assert len(event_status.events()) == 1
+
+    s = FakeStatusSocket(b"COMMAND DELETE;1,2;testuser")
+    status_server.handle_client(s, True, "127.0.0.1")
+
+    assert len(event_status.events()) == 0

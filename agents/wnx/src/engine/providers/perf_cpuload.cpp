@@ -37,15 +37,58 @@ uint64_t ReadSingleCounter(std::wstring_view path) {
     PDH_HCOUNTER counter{nullptr};
     DWORD type{0u};
     PDH_RAW_COUNTER value;
-    if (::PdhAddCounter(query, path.data(), 0, &counter) == ERROR_SUCCESS &&
-        ::PdhCollectQueryData(query) == ERROR_SUCCESS &&
-        ::PdhGetRawCounterValue(counter, &type, &value) == ERROR_SUCCESS) {
-        return static_cast<uint64_t>(value.FirstValue);
+
+    auto err = ::PdhAddEnglishCounter(query, path.data(), 0, &counter);
+    if (err != ERROR_SUCCESS) {
+        XLOG::l("- Failed PdhAddEnglishCounter {:0X}", err);
+
+        return 0u;
     }
-    return 0u;
+    err = ::PdhCollectQueryData(query);
+    if (err != ERROR_SUCCESS) {
+        XLOG::l("- Failed PdhCollectQueryData {:0X}", err);
+        return 0u;
+    }
+    err = ::PdhGetRawCounterValue(counter, &type, &value);
+    if (err != ERROR_SUCCESS) {
+        XLOG::l("- Failed PdhCollectQueryData {:0X}", err);
+        return 0u;
+    }
+
+    XLOG::t.i("counter = {}", static_cast<uint64_t>(value.FirstValue));
+    return static_cast<uint64_t>(value.FirstValue);
 }
 
 namespace cma::provider {
+bool CheckSingleCounter(std::wstring_view path) {
+    PDH_HQUERY query{nullptr};
+    if (::PdhOpenQuery(NULL, 0, &query) != ERROR_SUCCESS) {
+        XLOG::l("Failed PdhOpenQuery [{}]", ::GetLastError());
+        return false;
+    }
+    ON_OUT_OF_SCOPE(::PdhCloseQuery(query));
+
+    PDH_HCOUNTER counter{nullptr};
+    DWORD type{0u};
+    PDH_RAW_COUNTER value;
+    auto err = ::PdhAddEnglishCounter(query, path.data(), 0, &counter);
+    if (err != ERROR_SUCCESS) {
+        XLOG::l("Failed PdhAddEnglishCounter {:0X}", err);
+        return false;
+    }
+    err = ::PdhCollectQueryData(query);
+    if (err != ERROR_SUCCESS) {
+        XLOG::l("Failed PdhCollectQueryData {:0X}", err);
+        return false;
+    }
+    err = ::PdhGetRawCounterValue(counter, &type, &value);
+    if (err != ERROR_SUCCESS) {
+        XLOG::l("Failed PdhCollectQueryData {:0X}", err);
+        return false;
+    }
+
+    return true;
+}
 
 std::unordered_map<std::string, std::string> GetComputerSystemInfo(
     const std::vector<std::string> &names, std::wstring_view separator) {
@@ -61,6 +104,9 @@ std::unordered_map<std::string, std::string> GetComputerSystemInfo(
         wmi.queryTable({}, L"Win32_ComputerSystem", separator,
                        cfg::groups::global.getWmiTimeout());
     auto rows = tools::SplitString(table, L"\n");
+    if (rows.size() < 2) {
+        return {};
+    }
     auto all_names = tools::SplitString(rows[0], separator);
     // case when last value is empty
     if (rows[1].back() == separator[0]) {
@@ -92,6 +138,11 @@ std::string PerfCpuLoad::makeBody() {
         "Name", "NumberOfLogicalProcessors", "NumberOfProcessors"};
     auto sep = wtools::ConvertToUTF16(fmt::format("{}", separator()));
     auto values = GetComputerSystemInfo(names, sep);
+    if (values.empty()) {
+        values = computer_info_cache_;
+    } else {
+        computer_info_cache_ = values;
+    }
     auto processor_queue_length = ReadSingleCounter(kProcessorQueueLength);
     auto perf_time = wtools::QueryPerformanceCo();
     auto perf_freq = wtools::QueryPerformanceFreq();
@@ -101,16 +152,18 @@ std::string PerfCpuLoad::makeBody() {
         kSepChar);
     out += fmt::format("{0}{1}{0}{2}{0}{3}{0}OK\n", separator(),
                        processor_queue_length, perf_time, perf_freq);
-    out += section::MakeSubSectionHeader(kSubSectionComputerSystem);
-    for (const auto &n : names) {
-        out += n + separator();
-    }
-    out += "WMIStatus\n";
+    if (!values.empty()) {
+        out += section::MakeSubSectionHeader(kSubSectionComputerSystem);
+        for (const auto &n : names) {
+            out += n + separator();
+        }
+        out += "WMIStatus\n";
 
-    for (const auto &n : names) {
-        out += (values.contains(n) ? values.at(n) : "") + separator();
+        for (const auto &n : names) {
+            out += (values.contains(n) ? values.at(n) : "") + separator();
+        }
+        out += "OK\n";
     }
-    out += "OK\n";
 
     return out;
 }

@@ -14,15 +14,22 @@ import cmk.utils.version as cmk_version
 from cmk.utils.site import omd_site
 
 from cmk.gui.globals import request
-from cmk.gui.plugins.openapi.restful_objects import constructors, Endpoint, response_schemas
+from cmk.gui.plugins.openapi.restful_objects import Endpoint, response_schemas
+from cmk.gui.plugins.openapi.utils import serve_json
 
 
-@Endpoint("/version", "cmk/show", method="get", response_schema=response_schemas.InstalledVersions)
+@Endpoint(
+    "/version",
+    "cmk/show",
+    tag_group="Monitoring",
+    method="get",
+    response_schema=response_schemas.InstalledVersions,
+)
 def search(param):
     """Display some version information"""
     if request.args.get("fail"):
         raise Exception("This is an intentional failure.")
-    return constructors.serve_json(
+    return serve_json(
         {
             "site": omd_site(),
             "group": request.environ.get("mod_wsgi.application_group", "unknown"),

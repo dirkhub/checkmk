@@ -12,6 +12,7 @@ from typing import Any, Iterable, Mapping, NamedTuple
 from unittest import mock
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 from fakeredis import FakeRedis  # type: ignore[import]
 
 from tests.testlib import is_enterprise_repo, is_managed_repo, is_plus_repo
@@ -94,7 +95,7 @@ def patch_omd_site(monkeypatch):
     _touch(cmk.utils.paths.default_config_dir + "/mkeventd.mk")
     _touch(cmk.utils.paths.default_config_dir + "/multisite.mk")
 
-    omd_config_dir = "%s/etc/omd" % (cmk.utils.paths.omd_root,)
+    omd_config_dir = f"{cmk.utils.paths.omd_root}/etc/omd"
     _dump(
         omd_config_dir + "/site.conf",
         """
@@ -209,9 +210,16 @@ def clear_caches_per_function():
 def fixup_ip_lookup(monkeypatch):
     # Fix IP lookup when
     def _getaddrinfo(host, port, family=None, socktype=None, proto=None, flags=None):
+        if host not in ("localhost", "::1", "127.0.0.1"):
+            return None
         if family == socket.AF_INET:
-            # TODO: This is broken. It should return (family, type, proto, canonname, sockaddr)
-            return "0.0.0.0"
+            return [
+                (family, socket.SocketKind.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+            ]
+        if family == socket.AF_INET6:
+            return [
+                (family, socket.SocketKind.SOCK_STREAM, 6, "", ("::1", 0)),
+            ]
         raise NotImplementedError()
 
     monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
@@ -412,3 +420,9 @@ def registry_reset():
             for entry in list(registry):  # type: ignore[call-overload]
                 if entry not in defaults:
                     registry.unregister(entry)  # type: ignore[attr-defined]
+
+
+@pytest.fixture(autouse=True)
+def reduce_password_hashing_rounds(monkeypatch: MonkeyPatch) -> None:
+    """Reduce the number of rounds for hashing with bcrypt to the allowed minimum"""
+    monkeypatch.setattr("cmk.utils.crypto.password_hashing.BCRYPT_ROUNDS", 4)

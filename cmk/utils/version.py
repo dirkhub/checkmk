@@ -10,7 +10,7 @@ does not offer stable APIs. The code may change at any time."""
 
 from __future__ import annotations
 
-__version__ = "2.1.0b9"
+__version__ = "2.1.0p20"
 
 import datetime
 import enum
@@ -206,10 +206,11 @@ class Version:
     _pat_date: str = r"([1-9]\d{3})\.([0-1]\d)\.([0-3]\d)"  # e.g. "2021.12.24"
     _pat_build: str = r"([bip])(\d+)"  # b=beta, i=innov, p=patch; e.g. "b4"
     _pat_stable: str = r"%s(?:%s)?" % (_pat_base, _pat_build)  # e.g. "2.1.0p17"
-    _pat_daily: str = "(?:%s-)?%s" % (
-        _pat_base,
-        _pat_date,
-    )  # e.g. "2.1.0-2021.12.24" also "2021.12.24"
+    # e.g. daily of version branch: "2.1.0-2021.12.24",
+    # daily of master branch: "2021.12.24"
+    # daily of master sandbox branch: "2022.06.02-sandbox-lm-2.2-thing"
+    # daily of version sandbox branch: "2.1.0-2022.06.02-sandbox-lm-2.2-thing"
+    _pat_daily: str = "(?:%s-)?%s(?:-sandbox.+)?" % (_pat_base, _pat_date)
 
     def __init__(self, vstring: str) -> None:
         try:

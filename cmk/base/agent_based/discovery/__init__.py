@@ -37,6 +37,7 @@ from cmk.utils.exceptions import MKGeneralException, MKTimeout, OnError
 from cmk.utils.log import console
 from cmk.utils.parameters import TimespecificParameters
 from cmk.utils.type_defs import (
+    assert_never,
     CheckPluginName,
     DiscoveryResult,
     EVERYTHING,
@@ -67,7 +68,12 @@ from cmk.base.agent_based.data_provider import make_broker, ParsedSectionsBroker
 from cmk.base.agent_based.utils import check_parsing_errors, check_sources
 from cmk.base.api.agent_based.value_store import load_host_value_store, ValueStoreManager
 from cmk.base.check_utils import ConfiguredService, LegacyCheckParameters, ServiceID
-from cmk.base.core_config import MonitoringCore
+from cmk.base.core_config import (
+    get_active_check_descriptions,
+    get_host_attributes,
+    MonitoringCore,
+    ObjectAttributes,
+)
 from cmk.base.discovered_labels import HostLabel, ServiceLabel
 
 from ._discovered_services import analyse_discovered_services
@@ -77,7 +83,8 @@ from .utils import DiscoveryMode, QualifiedDiscovery, TimeLimitFilter
 
 _BasicTransition = Literal["old", "new", "vanished"]
 _Transition = Union[
-    _BasicTransition, Literal["ignored", "clustered_old", "clustered_new", "clustered_vanished"]
+    _BasicTransition,
+    Literal["ignored", "clustered_old", "clustered_new", "clustered_vanished", "clustered_ignored"],
 ]
 
 
@@ -161,7 +168,7 @@ def commandline_discovery(
         host_config = config_cache.get_host_config(host_name)
         section.section_begin(host_name)
         try:
-            parsed_sections_broker, _results = make_broker(
+            parsed_sections_broker, _results, _fetcher_messages = make_broker(
                 config_cache=config_cache,
                 host_config=host_config,
                 ip_address=config.lookup_ip_address(host_config),
@@ -319,7 +326,7 @@ def automation_discovery(
 
         ipaddress = None if host_config.is_cluster else config.lookup_ip_address(host_config)
 
-        parsed_sections_broker, _source_results = make_broker(
+        parsed_sections_broker, _source_results, _fetcher_messages = make_broker(
             config_cache=config_cache,
             host_config=host_config,
             ip_address=ipaddress,
@@ -413,17 +420,17 @@ def _get_post_discovery_autocheck_services(
                 }
                 result.self_new += len(new)
                 post_discovery_services.update(new)
-            continue
 
-        if check_source in ("old", "ignored"):
+        elif (
+            check_source == "old" or check_source == "ignored"  # pylint: disable=consider-using-in
+        ):
             # keep currently existing valid services in any case
             post_discovery_services.update(
                 (s.service.id(), s) for s in discovered_services_with_nodes
             )
             result.self_kept += len(discovered_services_with_nodes)
-            continue
 
-        if check_source == "vanished":
+        elif check_source == "vanished":
             # keep item, if we are currently only looking for new services
             # otherwise fix it: remove ignored and non-longer existing services
             for entry in discovered_services_with_nodes:
@@ -437,21 +444,22 @@ def _get_post_discovery_autocheck_services(
                 else:
                     post_discovery_services[entry.service.id()] = entry
                     result.self_kept += 1
-            continue
 
-        if check_source.startswith("clustered_"):
+        else:
             # Silently keep clustered services
             post_discovery_services.update(
                 (s.service.id(), s) for s in discovered_services_with_nodes
             )
-            setattr(
-                result,
-                check_source,
-                getattr(result, check_source) + len(discovered_services_with_nodes),
-            )
-            continue
-
-        raise MKGeneralException("Unknown check source '%s'" % check_source)
+            if check_source == "clustered_new":
+                result.clustered_new += len(discovered_services_with_nodes)
+            elif check_source == "clustered_old":
+                result.clustered_old += len(discovered_services_with_nodes)
+            elif check_source == "clustered_vanished":
+                result.clustered_vanished += len(discovered_services_with_nodes)
+            elif check_source == "clustered_ignored":
+                result.clustered_ignored += len(discovered_services_with_nodes)
+            else:
+                assert_never(check_source)
 
     return post_discovery_services
 
@@ -538,7 +546,7 @@ def active_check_discovery(
     if ipaddress is None and not host_config.is_cluster:
         ipaddress = config.lookup_ip_address(host_config)
 
-    parsed_sections_broker, source_results = make_broker(
+    parsed_sections_broker, source_results, _fetcher_messages = make_broker(
         config_cache=config_cache,
         host_config=host_config,
         ip_address=ipaddress,
@@ -758,7 +766,10 @@ class _AutodiscoveryQueue:
 
     def add(self, host_name: HostName) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._file_path(host_name).touch()
+
+        file_path = self._file_path(host_name)
+        if not file_path.exists():
+            file_path.touch()
 
     def remove(self, host_name: HostName) -> None:
         with suppress(FileNotFoundError):
@@ -1197,11 +1208,12 @@ def get_check_preview(
     host_config = config_cache.get_host_config(host_name)
 
     ip_address = None if host_config.is_cluster else config.lookup_ip_address(host_config)
+    host_attrs = get_host_attributes(host_name, config_cache)
 
     cmk.core_helpers.cache.FileCacheFactory.use_outdated = True
     cmk.core_helpers.cache.FileCacheFactory.maybe = use_cached_snmp_data
 
-    parsed_sections_broker, _source_results = make_broker(
+    parsed_sections_broker, _source_results, _fetcher_messages = make_broker(
         config_cache=config_cache,
         host_config=host_config,
         ip_address=ip_address,
@@ -1272,7 +1284,7 @@ def get_check_preview(
 
     return [
         *passive_rows,
-        *_active_check_preview_rows(host_config),
+        *_active_check_preview_rows(host_config, host_attrs),
         *_custom_check_preview_rows(host_config),
     ], host_labels
 
@@ -1339,6 +1351,7 @@ def _custom_check_preview_rows(
 
 def _active_check_preview_rows(
     host_config: config.HostConfig,
+    host_attrs: ObjectAttributes,
 ) -> Sequence[CheckPreviewEntry]:
     return list(
         {
@@ -1354,10 +1367,8 @@ def _active_check_preview_rows(
             )
             for plugin_name, entries in host_config.active_checks
             for params in entries
-            if (
-                descr := config.active_check_service_description(
-                    host_config.hostname, host_config.alias, plugin_name, params
-                )
+            for descr in get_active_check_descriptions(
+                host_config.hostname, host_config.alias, host_attrs, plugin_name, params
             )
         }.values()
     )

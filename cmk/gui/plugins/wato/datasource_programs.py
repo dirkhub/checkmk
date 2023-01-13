@@ -4,9 +4,8 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+import copy
 from typing import Any, Dict, List, Optional
-
-from cmk.utils import aws_constants
 
 import cmk.gui.bi as bi
 import cmk.gui.watolib as watolib
@@ -14,16 +13,24 @@ from cmk.gui.exceptions import MKUserError
 from cmk.gui.i18n import _
 from cmk.gui.mkeventd import service_levels, syslog_facilities, syslog_priorities
 from cmk.gui.plugins.metrics.utils import MetricName
+from cmk.gui.plugins.wato.special_agents.common import (
+    api_request_authentication,
+    api_request_connection_elements,
+    RulespecGroupDatasourceProgramsApps,
+    RulespecGroupDatasourceProgramsCustom,
+    RulespecGroupDatasourceProgramsHardware,
+    RulespecGroupDatasourceProgramsOS,
+    RulespecGroupDatasourceProgramsTesting,
+    RulespecGroupVMCloudContainer,
+    validate_aws_tags,
+)
 from cmk.gui.plugins.wato.utils import (
     HostRulespec,
     HTTPProxyReference,
     IndividualOrStoredPassword,
     monitoring_macro_help,
     PasswordFromStore,
-    rulespec_group_registry,
     rulespec_registry,
-    RulespecGroup,
-    RulespecSubGroup,
 )
 from cmk.gui.valuespec import (
     Age,
@@ -51,6 +58,32 @@ from cmk.gui.valuespec import (
     Transform,
     Tuple,
 )
+
+# ==================================================================================================
+# These imports and statements are only here to garantuee compatibility with local extensions.
+from cmk.utils import aws_constants  # isort:skip  # pylint: disable=unused-import
+from cmk.gui.plugins.wato.special_agents.common import (  # isort:skip  # pylint: disable=unused-import
+    RulespecGroupDatasourcePrograms,
+    RulespecGroupDatasourceProgramsCloud,
+    RulespecGroupDatasourceProgramsContainer,
+)
+from cmk.gui.plugins.wato.special_agents.aws import (  # isort:skip  # pylint: disable=unused-import
+    _transform_aws,
+    _valuespec_special_agents_aws,
+    _vs_aws_tags,
+    _vs_element_aws_limits,
+    _vs_element_aws_service_selection,
+)
+from cmk.gui.plugins.wato.utils import (  # isort:skip  # pylint: disable=unused-import
+    rulespec_group_registry,
+    RulespecGroup,
+    RulespecSubGroup,
+)
+
+_api_request_authentication = api_request_authentication
+_api_request_connection_elements = api_request_connection_elements
+_validate_aws_tags = validate_aws_tags
+# ==================================================================================================
 
 
 def connection_set(
@@ -247,140 +280,6 @@ def _auth_option(option: str) -> List[Any]:
             )
         )
     return auth
-
-
-@rulespec_group_registry.register
-class RulespecGroupVMCloudContainer(RulespecGroup):
-    @property
-    def name(self):
-        return "vm_cloud_container"
-
-    @property
-    def title(self):
-        return _("VM, Cloud, Container")
-
-    @property
-    def help(self):
-        return _("Integrate with VM, cloud or container platforms")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourcePrograms(RulespecGroup):
-    @property
-    def name(self):
-        return "datasource_programs"
-
-    @property
-    def title(self):
-        return _("Other integrations")
-
-    @property
-    def help(self):
-        return _("Integrate platforms using special agents, e.g. SAP R/3")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourceProgramsOS(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "os"
-
-    @property
-    def title(self):
-        return _("Operating systems")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourceProgramsApps(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "apps"
-
-    @property
-    def title(self):
-        return _("Applications")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourceProgramsCloud(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "cloud"
-
-    @property
-    def title(self):
-        return _("Cloud based environments")
-
-
-class RulespecGroupDatasourceProgramsContainer(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "container"
-
-    @property
-    def title(self):
-        return _("Containerization")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourceProgramsCustom(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "custom"
-
-    @property
-    def title(self):
-        return _("Custom integrations")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourceProgramsHardware(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "hw"
-
-    @property
-    def title(self):
-        return _("Hardware")
-
-
-@rulespec_group_registry.register
-class RulespecGroupDatasourceProgramsTesting(RulespecSubGroup):
-    @property
-    def main_group(self):
-        return RulespecGroupDatasourcePrograms
-
-    @property
-    def sub_group_name(self):
-        return "testing"
-
-    @property
-    def title(self):
-        return _("Testing")
 
 
 def _valuespec_datasource_programs():
@@ -860,8 +759,11 @@ def _valuespec_special_agents_kube():
                                 allow_empty=False,
                                 default_value="https://<control plane ip>:443",
                                 help=_(
-                                    "The full URL to the Kubernetes API server including the "
-                                    "protocol (http or https) and the port."
+                                    "The full URL to the Kubernetes API server "
+                                    "including the protocol (http or https) and "
+                                    "the port. Be aware that a trailing slash at "
+                                    "the end of the URL is likely to result in "
+                                    "an error."
                                 ),
                                 size=80,
                             ),
@@ -950,7 +852,7 @@ def _valuespec_special_agents_kube():
                             _("Monitor namespaces matching"),
                             ListOf(
                                 RegExp(
-                                    mode=RegExp.complete,
+                                    mode=RegExp.infix,
                                     title=_("Pattern"),
                                     allow_empty=False,
                                 ),
@@ -968,7 +870,7 @@ def _valuespec_special_agents_kube():
                             _("Exclude namespaces matching"),
                             ListOf(
                                 RegExp(
-                                    mode=RegExp.complete,
+                                    mode=RegExp.infix,
                                     title=_("Pattern"),
                                     allow_empty=False,
                                 ),
@@ -1049,7 +951,7 @@ def _valuespec_special_agents_kube():
                     ],
                     orientation="horizontal",
                     help=_(
-                        "By default, Checkmk does not imports annotations. If "
+                        "By default, Checkmk does not import annotations. If "
                         "this option is enabled, Checkmk will import any "
                         "annotation that is a valid Kubernetes label. These "
                         "imported annotations are added as host labels to their "
@@ -1087,67 +989,39 @@ def _check_not_empty_exporter_dict(value, _varprefix):
         raise MKUserError("dict_selection", _("Please select at least one element"))
 
 
-def _api_request_authentication():
-    return (
-        "auth_basic",
-        Transform(
-            CascadingDropdown(
-                title=_("Authentication"),
-                choices=[
-                    (
-                        "auth_login",
-                        _("Basic authentication"),
-                        Dictionary(
-                            elements=[
-                                (
-                                    "username",
-                                    TextInput(
-                                        title=_("Login username"),
-                                        allow_empty=False,
-                                    ),
-                                ),
-                                (
-                                    "password",
-                                    IndividualOrStoredPassword(
-                                        title=_("Password"),
-                                        allow_empty=False,
-                                    ),
-                                ),
-                            ],
-                            optional_keys=[],
-                        ),
+def _valuespec_connection_elements() -> Dictionary:
+    return Dictionary(
+        elements=[
+            ("port", Integer(title=_("Port"), default_value=6443)),
+            (
+                "path_prefix",
+                TextInput(
+                    title=_("Custom path prefix"),
+                    help=_(
+                        "Specifies a URL path prefix, which is prepended to API calls "
+                        "to the Prometheus API. If this option is not relevant for "
+                        "your installation, please leave it unchecked."
                     ),
-                    (
-                        "auth_token",
-                        _("Token authentication"),
-                        Dictionary(
-                            elements=[
-                                (
-                                    "token",
-                                    IndividualOrStoredPassword(
-                                        title=_("Login token"),
-                                        allow_empty=False,
-                                    ),
-                                ),
-                            ],
-                            optional_keys=[],
-                        ),
-                    ),
-                ],
+                    allow_empty=False,
+                ),
             ),
-            forth=lambda v: ("auth_login", v) if "username" in v else v,
-        ),
+            (
+                "base_prefix",
+                TextInput(
+                    title=_("Custom URL base prefix"),
+                    help=_(
+                        "Specifies a prefix, which is prepended to the hostname "
+                        "or base address. This is an exotic option, which is "
+                        "kept for legacy reasons. Consider using a custom URL instead. "
+                        "If this option is not relevant for your installation, "
+                        "please leave it unchecked."
+                    ),
+                    allow_empty=False,
+                ),
+            ),
+        ],
+        show_more_keys=["base_prefix"],
     )
-
-
-def _api_request_connection_elements(help_text: str, default_port: int):
-    return [
-        ("port", Integer(title=_("Port"), default_value=default_port)),
-        (
-            "path-prefix",
-            TextInput(title=_("Custom path prefix"), help=help_text, allow_empty=False),
-        ),
-    ]
 
 
 def _valuespec_generic_metrics_prometheus():
@@ -1176,34 +1050,8 @@ def _valuespec_generic_metrics_prometheus():
                     "connection",
                     CascadingDropdown(
                         choices=[
-                            (
-                                "ip_address",
-                                _("IP Address"),
-                                Dictionary(
-                                    elements=_api_request_connection_elements(
-                                        help_text=_(
-                                            "Specifies a URL path prefix, which is prepended to API calls "
-                                            "to the Prometheus API. If this option is not relevant for "
-                                            "your installation, please leave it unchecked."
-                                        ),
-                                        default_port=6443,
-                                    ),
-                                ),
-                            ),
-                            (
-                                "host_name",
-                                _("Host name"),
-                                Dictionary(
-                                    elements=_api_request_connection_elements(
-                                        help_text=_(
-                                            "Specifies a URL path prefix, which is prepended to API calls "
-                                            "to the Prometheus API. If this option is not relevant for "
-                                            "your installation, please leave it unchecked."
-                                        ),
-                                        default_port=6443,
-                                    ),
-                                ),
-                            ),
+                            ("ip_address", _("IP Address"), _valuespec_connection_elements()),
+                            ("host_name", _("Host name"), _valuespec_connection_elements()),
                             (
                                 "url_custom",
                                 _("Custom URL"),
@@ -1232,7 +1080,7 @@ def _valuespec_generic_metrics_prometheus():
                     ),
                 ),
                 _ssl_verification(),
-                _api_request_authentication(),
+                api_request_authentication(),
                 (
                     "protocol",
                     DropdownChoice(
@@ -1661,10 +1509,24 @@ def _valuespec_generic_metrics_prometheus():
 
 
 def _transform_agent_prometheus(params):
+    params = copy.deepcopy(params)
+
+    if isinstance(params.get("connection"), str):
+        params["connection"] = (params["connection"], {})
+
     if "port" in params:
         if params["connection"][0] in ("ip_address", "host_name"):
             params["connection"][1]["port"] = params["port"]
+            if (prefix := params["connection"][1].pop("path-prefix", None)) is not None:
+                params["connection"][1]["base_prefix"] = prefix
         params.pop("port", None)
+
+    if isinstance(params.get("auth_basic"), dict):
+        params["auth_basic"] = ("auth_login", params["auth_basic"])
+
+    if "verify-cert" not in params:
+        params["verify-cert"] = False
+
     return params
 
 
@@ -1713,7 +1575,7 @@ def _valuespec_generic_metrics_alertmanager():
                             "ip_address",
                             _("IP Address"),
                             Dictionary(
-                                elements=_api_request_connection_elements(
+                                elements=api_request_connection_elements(
                                     help_text=_(
                                         "Specifies a URL path prefix, which is prepended to API calls "
                                         "to the Alertmanager API. If this option is not relevant for "
@@ -1727,7 +1589,7 @@ def _valuespec_generic_metrics_alertmanager():
                             "host_name",
                             _("Host name"),
                             Dictionary(
-                                elements=_api_request_connection_elements(
+                                elements=api_request_connection_elements(
                                     help_text=_(
                                         "Specifies a URL path prefix, which is prepended to API calls "
                                         "to the Alertmanager API. If this option is not relevant for "
@@ -1765,7 +1627,7 @@ def _valuespec_generic_metrics_alertmanager():
                 ),
             ),
             _ssl_verification(),
-            _api_request_authentication(),
+            api_request_authentication(),
             (
                 "protocol",
                 DropdownChoice(
@@ -1855,9 +1717,9 @@ def _transform_agent_vsphere(params):
 def _valuespec_special_agents_vsphere():
     return Transform(
         Dictionary(
-            title=_("VMWare ESX via vSphere"),
+            title=_("VMware ESX via vSphere"),
             help=_(
-                "This rule allows monitoring of VMWare ESX via the vSphere API. "
+                "This rule allows monitoring of VMware ESX via the vSphere API. "
                 "You can configure your connection settings here.",
             ),
             elements=[
@@ -1904,9 +1766,7 @@ def _valuespec_special_agents_vsphere():
                             FixedValue(True, title=_("Use hostname"), totext=""),
                             TextInput(
                                 title=_("Use other hostname"),
-                                help=_(
-                                    "The IP of the other hostname needs to be the same IP as the host address"
-                                ),
+                                help=_("Use a custom name for the SSL certificate validation"),
                             ),
                         ],
                         default_value=True,
@@ -3980,448 +3840,6 @@ rulespec_registry.register(
 )
 
 
-def _validate_aws_tags(value, varprefix):
-    used_keys = []
-    # KEY:
-    # ve_p_services_p_ec2_p_choice_1_IDX_0
-    # VALUES:
-    # ve_p_services_p_ec2_p_choice_1_IDX_1_IDX
-    for idx_tag, (tag_key, tag_values) in enumerate(value):
-        tag_field = "%s_%s_0" % (varprefix, idx_tag + 1)
-        if tag_key not in used_keys:
-            used_keys.append(tag_key)
-        else:
-            raise MKUserError(
-                tag_field, _("Each tag must be unique and cannot be used multiple times")
-            )
-        if tag_key.startswith("aws:"):
-            raise MKUserError(tag_field, _("Do not use 'aws:' prefix for the key."))
-        if len(tag_key) > 128:
-            raise MKUserError(tag_field, _("The maximum key length is 128 characters."))
-        if len(tag_values) > 50:
-            raise MKUserError(tag_field, _("The maximum number of tags per resource is 50."))
-
-        for idx_values, v in enumerate(tag_values):
-            values_field = "%s_%s_1_%s" % (varprefix, idx_tag + 1, idx_values + 1)
-            if len(v) > 256:
-                raise MKUserError(values_field, _("The maximum value length is 256 characters."))
-            if v.startswith("aws:"):
-                raise MKUserError(values_field, _("Do not use 'aws:' prefix for the values."))
-
-
-def _vs_aws_tags(title):
-    return ListOf(
-        Tuple(
-            help=_(
-                "How to configure AWS tags please see "
-                "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Tags.html"
-            ),
-            orientation="horizontal",
-            elements=[
-                TextInput(title=_("Key")),
-                ListOfStrings(title=_("Values"), orientation="horizontal"),
-            ],
-        ),
-        add_label=_("Add new tag"),
-        movable=False,
-        title=title,
-        validate=_validate_aws_tags,
-    )
-
-
-def _vs_element_aws_service_selection():
-    return (
-        "selection",
-        CascadingDropdown(
-            title=_("Selection of service instances"),
-            help=_(
-                "<i>Gather all service instances and restrict by overall tags</i> means that "
-                "if overall tags are stated above then all service instances are filtered "
-                "by these tags. Otherwise all instances are gathered.<br>"
-                "With <i>Use explicit service tags and overwrite overall tags</i> you can "
-                "specify explicit tags for these services. The overall tags are ignored for "
-                "these services.<br>"
-                "<i>Use explicit service names and ignore overall tags</i>: With this selection "
-                "you can state explicit names. The overall tags are ignored for these service."
-            ),
-            choices=[
-                ("all", _("Gather all service instances and restrict by overall AWS tags")),
-                (
-                    "tags",
-                    _("Use explicit AWS service tags and overrule overall AWS tags"),
-                    _vs_aws_tags(_("AWS Tags")),
-                ),
-                (
-                    "names",
-                    _("Use explicit service names and ignore overall AWS tags"),
-                    ListOfStrings(),
-                ),
-            ],
-        ),
-    )
-
-
-def _vs_element_aws_limits():
-    return (
-        "limits",
-        FixedValue(
-            True,
-            help=_(
-                "If limits are enabled all instances are fetched regardless of "
-                "possibly configured restriction to names or tags"
-            ),
-            title=_("Service limits"),
-            totext=_("Monitor service limits"),
-        ),
-    )
-
-
-def _transform_aws(d):
-    services = d["services"]
-    if "cloudwatch" in services:
-        services["cloudwatch_alarms"] = services["cloudwatch"]
-        del services["cloudwatch"]
-    if "assume_role" not in d:
-        d["assume_role"] = {}
-    return d
-
-
-def _valuespec_special_agents_aws():
-    return Transform(
-        Dictionary(
-            title=_("Amazon Web Services (AWS)"),
-            elements=[
-                (
-                    "access_key_id",
-                    TextInput(
-                        title=_("The access key ID for your AWS account"),
-                        allow_empty=False,
-                        size=50,
-                    ),
-                ),
-                (
-                    "secret_access_key",
-                    IndividualOrStoredPassword(
-                        title=_("The secret access key for your AWS account"),
-                        allow_empty=False,
-                    ),
-                ),
-                (
-                    "proxy_details",
-                    Dictionary(
-                        title=_("Proxy server details"),
-                        elements=[
-                            ("proxy_host", TextInput(title=_("Proxy host"), allow_empty=False)),
-                            ("proxy_port", Integer(title=_("Port"))),
-                            (
-                                "proxy_user",
-                                TextInput(
-                                    title=_("Username"),
-                                    size=32,
-                                ),
-                            ),
-                            ("proxy_password", IndividualOrStoredPassword(title=_("Password"))),
-                        ],
-                        optional_keys=["proxy_port", "proxy_user", "proxy_password"],
-                    ),
-                ),
-                (
-                    "assume_role",
-                    Dictionary(
-                        title=_("Assume a different IAM role"),
-                        elements=[
-                            (
-                                "role_arn_id",
-                                Tuple(
-                                    title=_("Use STS AssumeRole to assume a different IAM role"),
-                                    elements=[
-                                        TextInput(
-                                            title=_("The ARN of the IAM role to assume"),
-                                            size=50,
-                                            help=_(
-                                                "The Amazon Resource Name (ARN) of the role to assume."
-                                            ),
-                                        ),
-                                        TextInput(
-                                            title=_("External ID (optional)"),
-                                            size=50,
-                                            help=_(
-                                                "A unique identifier that might be required when you assume a role in another "
-                                                "account. If the administrator of the account to which the role belongs provided "
-                                                "you with an external ID, then provide that value in the External ID parameter. "
-                                            ),
-                                        ),
-                                    ],
-                                ),
-                            )
-                        ],
-                    ),
-                ),
-                (
-                    "global_services",
-                    Dictionary(
-                        title=_("Global services to monitor"),
-                        elements=[
-                            (
-                                "ce",
-                                FixedValue(
-                                    None,
-                                    totext=_("Monitor costs and usage"),
-                                    title=_("Costs and usage (CE)"),
-                                ),
-                            ),
-                            (
-                                "route53",
-                                FixedValue(None, totext=_("Monitor Route53"), title=_("Route53")),
-                            ),
-                        ],
-                    ),
-                ),
-                (
-                    "regions",
-                    ListChoice(
-                        title=_("Regions to use"),
-                        choices=sorted(aws_constants.AWSRegions, key=lambda x: x[1]),
-                    ),
-                ),
-                (
-                    "services",
-                    Dictionary(
-                        title=_("Services per region to monitor"),
-                        elements=[
-                            (
-                                "ec2",
-                                Dictionary(
-                                    title=_("Elastic Compute Cloud (EC2)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "ebs",
-                                Dictionary(
-                                    title=_("Elastic Block Storage (EBS)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "s3",
-                                Dictionary(
-                                    title=_("Simple Storage Service (S3)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                        (
-                                            "requests",
-                                            FixedValue(
-                                                None,
-                                                totext=_("Monitor request metrics"),
-                                                title=_("Request metrics"),
-                                                help=_(
-                                                    "In order to monitor S3 request metrics you have to "
-                                                    "enable request metric monitoring in the AWS/S3 console. "
-                                                    "This is a paid feature"
-                                                ),
-                                            ),
-                                        ),
-                                    ],
-                                    optional_keys=["limits", "requests"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "glacier",
-                                Dictionary(
-                                    title=_("Amazon S3 Glacier (Glacier)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "elb",
-                                Dictionary(
-                                    title=_("Classic Load Balancing (ELB)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "elbv2",
-                                Dictionary(
-                                    title=_("Application and Network Load Balancing (ELBv2)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "rds",
-                                Dictionary(
-                                    title=_("Relational Database Service (RDS)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "cloudwatch_alarms",
-                                Dictionary(
-                                    title=_("CloudWatch Alarms"),
-                                    elements=[
-                                        (
-                                            "alarms",
-                                            CascadingDropdown(
-                                                title=_("Selection of alarms"),
-                                                choices=[
-                                                    ("all", _("Gather all")),
-                                                    (
-                                                        "names",
-                                                        _("Use explicit names"),
-                                                        ListOfStrings(),
-                                                    ),
-                                                ],
-                                            ),
-                                        ),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["alarms", "limits"],
-                                    default_keys=["alarms", "limits"],
-                                ),
-                            ),
-                            (
-                                "dynamodb",
-                                Dictionary(
-                                    title=_("DynamoDB"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                            (
-                                "wafv2",
-                                Dictionary(
-                                    title=_("Web Application Firewall (WAFV2)"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                        (
-                                            "cloudfront",
-                                            FixedValue(
-                                                None,
-                                                totext=_("Monitor CloudFront WAFs"),
-                                                title=_("CloudFront WAFs"),
-                                                help=_(
-                                                    "Include WAFs in front of CloudFront resources in the "
-                                                    "monitoring"
-                                                ),
-                                            ),
-                                        ),
-                                    ],
-                                    optional_keys=["limits", "cloudfront"],
-                                    default_keys=["limits", "cloudfront"],
-                                ),
-                            ),
-                            (
-                                "lambda",
-                                Dictionary(
-                                    title=_("Lambda"),
-                                    elements=[
-                                        _vs_element_aws_service_selection(),
-                                        _vs_element_aws_limits(),
-                                    ],
-                                    optional_keys=["limits"],
-                                    default_keys=["limits"],
-                                ),
-                            ),
-                        ],
-                        default_keys=[
-                            "ec2",
-                            "ebs",
-                            "s3",
-                            "glacier",
-                            "elb",
-                            "elbv2",
-                            "rds",
-                            "cloudwatch_alarms",
-                            "dynamodb",
-                            "wafv2",
-                            "lambda",
-                        ],
-                    ),
-                ),
-                (
-                    "overall_tags",
-                    _vs_aws_tags(_("Restrict monitoring services by one of these AWS tags")),
-                ),
-            ],
-            optional_keys=["overall_tags", "proxy_details"],
-        ),
-        forth=_transform_aws,
-    )
-
-
-rulespec_registry.register(
-    HostRulespec(
-        group=RulespecGroupVMCloudContainer,
-        name="special_agents:aws",
-        title=lambda: _("Amazon Web Services (AWS)"),
-        valuespec=_valuespec_special_agents_aws,
-    )
-)
-
-
-def _valuespec_special_agents_gcp():
-    return Dictionary(
-        title=_("Google Cloud Platform"),
-        elements=[
-            ("project", TextInput(title=_("Project ID"), allow_empty=False, size=50)),
-            (
-                "credentials",
-                IndividualOrStoredPassword(
-                    title=_("JSON credentials for service account"), allow_empty=False
-                ),
-            ),
-        ],
-        optional_keys=[],
-    )
-
-
-rulespec_registry.register(
-    HostRulespec(
-        group=RulespecGroupVMCloudContainer,
-        name="special_agents:gcp",
-        title=lambda: _("Google Cloud Platform (GCP)"),
-        valuespec=_valuespec_special_agents_gcp,
-    )
-)
-
-
 def _factory_default_special_agents_vnx_quotas():
     # No default, do not use setting if no rule matches
     return watolib.Rulespec.FACTORY_DEFAULT_UNUSED
@@ -5085,7 +4503,7 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                     title=_("Fetch events"),
                     help=_(
                         "Fetch events from the event stream of your datadog instance. Fetched "
-                        "events will be forwared to the event console of the site where the "
+                        "events will be forwared to the Event Console of the site where the "
                         "special agent is executed."
                     ),
                     elements=[
@@ -5126,7 +4544,7 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                             "tags_to_show",
                             ListOfStrings(
                                 valuespec=RegExp(
-                                    RegExp.prefix,
+                                    mode=RegExp.prefix,
                                     size=30,
                                 ),
                                 title=_("Tags shown in Event Console"),
@@ -5143,7 +4561,7 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                         (
                             "syslog_facility",
                             DropdownChoice(
-                                syslog_facilities,
+                                choices=syslog_facilities,
                                 title=_("Syslog facility"),
                                 help=_(
                                     "Syslog facility of forwarded events shown in Event Console."
@@ -5154,7 +4572,7 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                         (
                             "syslog_priority",
                             DropdownChoice(
-                                syslog_priorities,
+                                choices=syslog_priorities,
                                 title=_("Syslog priority"),
                                 help=_(
                                     "Syslog priority of forwarded events shown in Event Console."
@@ -5165,7 +4583,7 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                         (
                             "service_level",
                             DropdownChoice(
-                                service_levels(),
+                                choices=service_levels(),
                                 title=_("Service level"),
                                 help=_("Service level of forwarded events shown in Event Console."),
                                 prefix_values=True,
@@ -5174,7 +4592,7 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                         (
                             "add_text",
                             DropdownChoice(
-                                [
+                                choices=[
                                     (
                                         False,
                                         "Do not add text",
@@ -5196,8 +4614,98 @@ def _valuespec_special_agents_datadog() -> Dictionary:
                     optional_keys=["tags", "tags_to_show"],
                 ),
             ),
+            (
+                "logs",
+                Dictionary(
+                    title=_("Fetch logs"),
+                    help=_(
+                        "Fetch logs of your datadog instance. Fetched logs will be forwared to the "
+                        "Event Console of the site where the special agent is executed."
+                    ),
+                    elements=[
+                        (
+                            "max_age",
+                            Age(
+                                title=_("Maximum age of fetched logs (10 hours max.)"),
+                                help=_(
+                                    "During each run, the agent will fetch logs which are at "
+                                    "maximum this old. The agent memorizes logs already fetched "
+                                    "during the last run, s.t. no logs will be sent to the event "
+                                    "console multiple times. Setting this value lower than the "
+                                    "check interval of the host will result in missing logs. "
+                                ),
+                                minvalue=10,
+                                maxvalue=10 * 3600,
+                                default_value=600,
+                                display=["hours", "minutes", "seconds"],
+                            ),
+                        ),
+                        (
+                            "query",
+                            TextInput(
+                                title=_("Log search query"),
+                                help=_(
+                                    "Query to speficy which logs should be forwarded to the event "
+                                    "console. Use the Datadog "
+                                    "<a href='https://docs.datadoghq.com/logs/explorer/search_syntax'>log search syntax</a>."
+                                ),
+                            ),
+                        ),
+                        (
+                            "indexes",
+                            ListOfStrings(
+                                title=_("Indexes to search"),
+                                default_value=["*"],
+                                help=_(
+                                    "Indexes to search, defaults to '*', which means all indexes."
+                                ),
+                            ),
+                        ),
+                        (
+                            "syslog_facility",
+                            DropdownChoice(
+                                choices=syslog_facilities,
+                                title=_("Syslog facility"),
+                                help=_("Syslog facility of forwarded logs shown in Event Console."),
+                                default_value=1,
+                            ),
+                        ),
+                        (
+                            "service_level",
+                            DropdownChoice(
+                                choices=service_levels(),
+                                title=_("Service level"),
+                                help=_("Service level of forwarded logs shown in Event Console."),
+                                prefix_values=True,
+                            ),
+                        ),
+                        (
+                            "text",
+                            ListOf(
+                                title=_("Text of forwarded events"),
+                                help=_(
+                                    "The text of the event can be constructed from the "
+                                    "<a href='https://docs.datadoghq.com/api/latest/logs/#search-logs'>attributes section of a log entry</a>. "
+                                    "The text elements are rendered as 'Name:str(attributes[Key])', separated by a comma. "
+                                    "To access nested fields, use 'key.subkey'. Defaults to the message of the log."
+                                ),
+                                add_label=_("new element"),
+                                default_value=[("message", "message")],
+                                valuespec=Tuple(
+                                    orientation="horizontal",
+                                    elements=[
+                                        TextInput(title=_("Name")),
+                                        TextInput(title=_("Key")),
+                                    ],
+                                ),
+                            ),
+                        ),
+                    ],
+                    optional_keys=[],
+                ),
+            ),
         ],
-        optional_keys=["proxy", "monitors", "events"],
+        optional_keys=["proxy", "monitors", "events", "logs"],
     )
 
 
@@ -5251,7 +4759,7 @@ def _vs_jira_projects(title):
         add_label=_("Add new project"),
         movable=False,
         title=title,
-        validate=_validate_aws_tags,
+        validate=validate_aws_tags,
     )
 
 
@@ -5686,5 +5194,67 @@ rulespec_registry.register(
         group=RulespecGroupDatasourceProgramsApps,
         name="special_agents:smb_share",
         valuespec=_valuespec_special_agents_smb_share,
+    )
+)
+
+
+def _valuespec_special_agents_mobileiron():
+    return Dictionary(
+        elements=[
+            ("username", TextInput(title=_("Username"), allow_empty=False)),
+            ("password", IndividualOrStoredPassword(title=_("Password"), allow_empty=False)),
+            (
+                "port",
+                NetworkPort(
+                    title=_("Port"),
+                    default_value=443,
+                    help=_("The port that is used for the API call."),
+                ),
+            ),
+            (
+                "no-cert-check",
+                FixedValue(
+                    True,
+                    title=_("Disable SSL certificate validation"),
+                    totext=_("SSL certificate validation is disabled"),
+                ),
+            ),
+            (
+                "partition",
+                ListOfStrings(
+                    allow_empty=False,
+                    title=_("Retrieve information about the following partitions"),
+                ),
+            ),
+            (
+                "proxy_details",
+                Dictionary(
+                    title=_("Use proxy for MobileIron API connection"),
+                    elements=[
+                        ("proxy_host", TextInput(title=_("Proxy host"), allow_empty=True)),
+                        ("proxy_port", Integer(title=_("Port"))),
+                        (
+                            "proxy_user",
+                            TextInput(
+                                title=_("Username"),
+                                size=32,
+                            ),
+                        ),
+                        ("proxy_password", IndividualOrStoredPassword(title=_("Password"))),
+                    ],
+                    optional_keys=["proxy_port", "proxy_user", "proxy_password"],
+                ),
+            ),
+        ],
+        optional_keys=["no-cert-check"],
+        title=_("MobileIron API"),
+    )
+
+
+rulespec_registry.register(
+    HostRulespec(
+        group=RulespecGroupDatasourceProgramsApps,
+        name="special_agents:mobileiron",
+        valuespec=_valuespec_special_agents_mobileiron,
     )
 )

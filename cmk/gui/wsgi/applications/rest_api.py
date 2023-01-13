@@ -19,23 +19,28 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Type, TYPE_CHECKING
 
 from apispec.yaml_utils import dict_to_yaml  # type: ignore[import]
-from werkzeug import Request, Response
 from werkzeug.exceptions import HTTPException, NotFound
 from werkzeug.routing import Map, Rule, Submount
 
+import cmk.utils.store
 from cmk.utils import crash_reporting, paths
+from cmk.utils.crypto import Password
 from cmk.utils.exceptions import MKException
 from cmk.utils.type_defs import UserId
 
-from cmk.gui import config, userdb
-from cmk.gui.config import omd_site
+from cmk.gui import config, sites, userdb
+from cmk.gui.display_options import DisplayOptions
 from cmk.gui.exceptions import MKAuthException, MKUserError
-from cmk.gui.globals import user
-from cmk.gui.login import check_parsed_auth_cookie, user_from_cookie
+from cmk.gui.globals import AppContext, RequestContext, user
+from cmk.gui.http import Request, Response
+from cmk.gui.login import check_auth_by_cookie
 from cmk.gui.openapi import add_once, ENDPOINT_REGISTRY, generate_data
+from cmk.gui.permissions import load_dynamic_permissions
 from cmk.gui.plugins.openapi.utils import problem, ProblemException
+from cmk.gui.utils.logged_in import LoggedInNobody
+from cmk.gui.utils.output_funnel import OutputFunnel
 from cmk.gui.wsgi.auth import automation_auth, gui_user_auth, rfc7662_subject, set_user_context
-from cmk.gui.wsgi.middleware import OverrideRequestMethod, with_context_middleware
+from cmk.gui.wsgi.middleware import OverrideRequestMethod
 from cmk.gui.wsgi.wrappers import ParameterDict
 
 if TYPE_CHECKING:
@@ -48,6 +53,9 @@ if TYPE_CHECKING:
         WSGIEnvironment,
         WSGIResponse,
     )
+
+if TYPE_CHECKING:
+    from cmk.gui.plugins.openapi.restful_objects import Endpoint
 
 ARGS_KEY = "CHECK_MK_REST_API_ARGS"
 
@@ -90,11 +98,9 @@ def _verify_user(environ) -> RFC7662:
             raise MKAuthException("Mismatch in authentication headers.")
         verified.append(rfc7662_subject(UserId(remote_user), "web_server"))
 
-    cookie = Request(environ).cookies.get(f"auth_{omd_site()}")
-    if cookie:
-        user_id, session_id, cookie_hash = user_from_cookie(cookie)
-        check_parsed_auth_cookie(user_id, session_id, cookie_hash)
-        verified.append(rfc7662_subject(user_id, "cookie"))
+    cookie_user = check_auth_by_cookie()
+    if cookie_user is not None:
+        verified.append(rfc7662_subject(cookie_user, "cookie"))
 
     if not verified:
         raise MKAuthException("You need to be authenticated to use the REST API.")
@@ -170,12 +176,13 @@ def user_from_basic_header(auth_header: str) -> Tuple[UserId, str]:
     return UserId(user_id), secret
 
 
-def user_from_bearer_header(auth_header: str) -> Tuple[UserId, str]:
+def user_from_bearer_header(auth_header: str) -> Tuple[UserId, Password[str]]:
     """
 
     Examples:
 
-        >>> user_from_bearer_header("Bearer username password")
+        >>> username, password = user_from_bearer_header("Bearer username password")
+        >>> (username, password.raw)
         ('username', 'password')
 
     Args:
@@ -199,42 +206,33 @@ def user_from_bearer_header(auth_header: str) -> Tuple[UserId, str]:
     if "/" in user_id:
         raise MKAuthException("No slashes / allowed in username.")
 
-    return UserId(user_id), secret
+    return UserId(user_id), Password(secret)
 
 
-class Authenticate:
-    """Wrap an Endpoint so it will be authenticated
+class EndpointAdapter:
+    """Wrap an Endpoint
 
-    This is not very memory efficient as it wraps every individual endpoint in its own
-    authenticator, even though this does not need to be. This has to be done this way right now,
-    because we have multiple endpoints without authentication in this app. A refactoring to lower
-    the memory foot-print of this is feasible and should be done if a good way has been found.
+    Makes a "real" WSGI application out of an endpoint. Should be refactored away.
     """
 
-    def __init__(self, func):
-        self.func = func
+    def __init__(self, endpoint: Endpoint):
+        self.endpoint = endpoint
 
-    def __repr__(self):
-        return f"<Authenticate {self.func!r}>"
+    def __repr__(self) -> str:
+        return f"<Authenticate {self.endpoint!r}>"
 
-    def __call__(self, environ, start_response):
+    def __call__(self, environ: WSGIEnvironment, start_response: StartResponse) -> WSGIResponse:
         path_args = environ[ARGS_KEY]
-
-        try:
-            rfc7662 = _verify_user(environ)
-        except MKException as exc:
-            return problem(
-                status=401,
-                title=str(exc),
-            )(environ, start_response)
-
-        with set_user_context(rfc7662["sub"], rfc7662):
-            wsgi_app = self.func(ParameterDict(path_args))
-            return wsgi_app(environ, start_response)
+        wsgi_app = self.endpoint.wrapped(ParameterDict(path_args))
+        return wsgi_app(environ, start_response)
 
 
 @functools.lru_cache
-def serve_file(file_name: str, content: bytes) -> Response:
+def serve_file(
+    file_name: str,
+    content: bytes,
+    default_content_type="text/plain; charset=utf-8",
+) -> Response:
     """Construct and cache a Response from a static file."""
     content_type, _ = mimetypes.guess_type(file_name)
 
@@ -243,6 +241,8 @@ def serve_file(file_name: str, content: bytes) -> Response:
     resp.data = content
     if content_type is not None:
         resp.headers["Content-Type"] = content_type
+    else:
+        resp.headers["Content-Type"] = default_content_type
     resp.freeze()
     return resp
 
@@ -388,7 +388,7 @@ class ServeSwaggerUI:
 
 
 class CheckmkRESTAPI:
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False) -> None:
         self.debug = debug
         # This intermediate data structure is necessary because `Rule`s can't contain anything
         # other than str anymore. Technically they could, but the typing is now fixed to str.
@@ -413,7 +413,7 @@ class CheckmkRESTAPI:
                     endpoint=endpoint.ident,
                 )
             )
-            self.endpoints[endpoint.ident] = Authenticate(endpoint.wrapped)
+            self.endpoints[endpoint.ident] = EndpointAdapter(endpoint)
 
         self.url_map = Map(
             [
@@ -431,17 +431,22 @@ class CheckmkRESTAPI:
                 )
             ]
         )
-        self.wsgi_app = with_context_middleware(OverrideRequestMethod(self._wsgi_app))
+        self.wsgi_app = OverrideRequestMethod(self._wsgi_app)
 
     def __call__(self, environ: WSGIEnvironment, start_response: StartResponse) -> WSGIResponse:
         return self.wsgi_app(environ, start_response)
 
     def _wsgi_app(self, environ: WSGIEnvironment, start_response: StartResponse) -> WSGIResponse:
         urls = self.url_map.bind_to_environ(environ)
+        endpoint: Endpoint | None
         try:
             result: Tuple[str, Mapping[str, Any]] = urls.match(return_rule=False)
             endpoint_ident, matched_path_args = result  # pylint: disable=unpacking-non-sequence
             wsgi_app = self.endpoints[endpoint_ident]
+            if isinstance(wsgi_app, EndpointAdapter):
+                endpoint = wsgi_app.endpoint
+            else:
+                endpoint = None
 
             # Remove _path again (see Submount above), so the validators don't go crazy.
             path_args = {key: value for key, value in matched_path_args.items() if key != "_path"}
@@ -449,7 +454,32 @@ class CheckmkRESTAPI:
             # This is an implicit dependency, as we only know the args at runtime, but the
             # function at setup-time.
             environ[ARGS_KEY] = path_args
-            return wsgi_app(environ, start_response)
+
+            req = Request(environ)
+            resp = Response()
+            with AppContext(self), RequestContext(
+                req=req,
+                resp=resp,
+                funnel=OutputFunnel(resp),
+                config_obj=config.make_config_object(config.get_default_config()),
+                endpoint=endpoint,
+                user=LoggedInNobody(),
+                display_options=DisplayOptions(),
+            ), cmk.utils.store.cleanup_locks(), sites.cleanup_connections():
+                config.initialize()
+                load_dynamic_permissions()
+
+                # Authenticate the user for all endpoints and sub-applications.
+                try:
+                    rfc7662 = _verify_user(environ)
+                except MKException as exc:
+                    return problem(
+                        status=401,
+                        title=str(exc),
+                    )(environ, start_response)
+
+                with set_user_context(rfc7662["sub"], rfc7662):
+                    return wsgi_app(environ, start_response)
         except ProblemException as exc:
             return exc(environ, start_response)
         except HTTPException as exc:

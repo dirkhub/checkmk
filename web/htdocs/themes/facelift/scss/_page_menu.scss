@@ -392,7 +392,7 @@ div#top_heading {
       }
 
       input[type="text"] {
-        width: 110px !important;
+        width: 180px !important;
         height: 18px;
       }
 
@@ -573,8 +573,8 @@ div#page_menu_popups {
 
       a.close_popup img {
         position: absolute;
-        top: 6px;
-        right: $spacing;
+        top: 8px;
+        right: $simplebar-track-width;
         width: 12px;
         height: auto;
       }
@@ -615,7 +615,7 @@ body.dashboard {
     left: 0;
     align-content: center;
     // Important needed to override swal2 internal definition
-    background-color: rgba($black, 0.2) !important; // sass-lint:disable-line no-important
+    background-color: rgba($black, 0.2) !important;
 
     .confirm_popup {
       width: 400px;
@@ -808,8 +808,8 @@ div#page_menu_popups div.side_popup {
 
     a.more {
       position: absolute;
-      top: 6px;
-      right: 4px;
+      top: 8px;
+      right: 6px;
     }
 
     ul {

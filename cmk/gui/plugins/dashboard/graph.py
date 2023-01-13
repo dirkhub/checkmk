@@ -206,7 +206,8 @@ class GraphDashlet(Dashlet):
         except Exception:
             raise MKGeneralException(_("Failed to calculate a graph recipe."))
 
-        self._dashlet_spec["_graph_title"] = graph_recipes[0]["title"]
+        if graph_recipes:
+            self._dashlet_spec["_graph_title"] = graph_recipes[0]["title"]
 
     @staticmethod
     def _resolve_site(host: str):
@@ -346,7 +347,7 @@ function handle_dashboard_render_graph_response(handler_data, response_body)
             self._dashlet_id,
             json.dumps(self._dashlet_spec["_graph_identification"]),
             json.dumps(self._dashlet_spec["graph_render_options"]),
-            json.dumps(Timerange.compute_range(self._dashlet_spec["timerange"]).range),
+            json.dumps(self._dashlet_spec["timerange"]),
         )
 
     def show(self):

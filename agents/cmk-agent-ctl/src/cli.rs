@@ -2,9 +2,9 @@
 // This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 // conditions defined in the file COPYING, which is part of this source code package.
 
-use super::site_spec;
 #[cfg(windows)]
 use super::types;
+use super::{constants, site_spec};
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -34,6 +34,12 @@ pub struct ClientOpts {
     /// The default is to ignore configured proxies and to connect directly.
     #[structopt(long, short = "d")]
     pub detect_proxy: bool,
+
+    /// Enable TLS certificate validation for querying the agent receiver port from the Checkmk
+    /// REST API. By default, certificate validation is disabled because it is not security-relevant
+    /// at this stage, see werk #14715.
+    #[structopt(long)]
+    pub validate_api_cert: bool,
 }
 
 #[derive(StructOpt)]
@@ -76,6 +82,10 @@ pub struct StatusArgs {
     /// Write output in JSON format
     #[structopt(long)]
     pub json: bool,
+
+    /// Do not query the remote about our status
+    #[structopt(long)]
+    pub no_query_remote: bool,
 
     #[structopt(flatten)]
     pub client_opts: ClientOpts,
@@ -181,7 +191,7 @@ pub struct SharedArgsOnly {
 }
 
 #[derive(StructOpt)]
-#[structopt(name = "cmk-agent-ctl", about = "Checkmk agent controller.")]
+#[structopt(about = "Checkmk agent controller.", version = constants::VERSION)]
 pub enum Args {
     /// Register with a Checkmk site
     ///

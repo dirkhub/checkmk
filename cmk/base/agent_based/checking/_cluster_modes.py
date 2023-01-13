@@ -34,7 +34,7 @@ from cmk.base.api.agent_based.checking_classes import (
     Result,
     State,
 )
-from cmk.base.api.agent_based.value_store import load_host_value_store
+from cmk.base.api.agent_based.value_store import ValueStoreManager
 from cmk.base.check_utils import ServiceID
 
 _Kwargs = Mapping[str, Any]
@@ -68,6 +68,7 @@ def get_cluster_check_function(
     service_id: ServiceID,
     plugin: CheckPlugin,
     persist_value_store_changes: bool,
+    value_store_manager: ValueStoreManager,
 ) -> CheckFunction:
     if mode == "native":
         return plugin.cluster_check_function or _unfit_for_clustering
@@ -75,6 +76,7 @@ def get_cluster_check_function(
     executor = NodeCheckExecutor(
         service_id=service_id,
         persist_value_store_changes=persist_value_store_changes,
+        value_store_manager=value_store_manager,
     )
 
     if mode == "failover":
@@ -212,7 +214,11 @@ class Summarizer:
         *,
         levels_additional_nodes_count: Tuple[float, float],
     ) -> Iterable[Result]:
-        secondary_nodes = sorted(n for n in self._node_results.results if n != self._pivoting)
+        secondary_nodes = sorted(
+            node
+            for node, results in self._node_results.results.items()
+            if node != self._pivoting and results
+        )
         if not secondary_nodes:
             return
 
@@ -223,7 +229,7 @@ class Summarizer:
         yield from (
             Result(
                 state=State.OK,
-                notice=r.summary,
+                notice=r.summary if r.summary else r.details,
                 details=f"{r.details}{state_markers[int(r.state)]}",
             )
             for node in secondary_nodes
@@ -250,9 +256,16 @@ class Summarizer:
 
 
 class NodeCheckExecutor:
-    def __init__(self, *, service_id: ServiceID, persist_value_store_changes: bool) -> None:
+    def __init__(
+        self,
+        *,
+        service_id: ServiceID,
+        persist_value_store_changes: bool,
+        value_store_manager: ValueStoreManager,
+    ) -> None:
         self._service_id = service_id
         self._persist_value_store_changes = persist_value_store_changes
+        self._value_store_manager = value_store_manager
 
     def __call__(
         self,
@@ -266,7 +279,9 @@ class NodeCheckExecutor:
 
         for node, kwargs in self._iter_node_kwargs(cluster_kwargs):
 
-            elements = self._consume_checkresult(node, check_function(**kwargs))
+            elements = self._consume_checkresult(
+                node, check_function(**kwargs), self._value_store_manager
+            )
             metrics[node] = [e for e in elements if isinstance(e, Metric)]
             ignores[node] = [e for e in elements if isinstance(e, IgnoreResults)]
             results[node] = [
@@ -305,21 +320,18 @@ class NodeCheckExecutor:
         self,
         node: str,
         result_generator: CheckResult,
+        value_store_manager: ValueStoreManager,
     ) -> Sequence[Union[Result, Metric, IgnoreResults]]:
-        with load_host_value_store(
-            node,
-            store_changes=self._persist_value_store_changes,
-        ) as value_store_manager:
-            with value_store_manager.namespace(self._service_id):
-                try:
-                    return list(result_generator)
-                except IgnoreResultsError as exc:
-                    return [IgnoreResults(str(exc))]
+        with value_store_manager.namespace(self._service_id, host_name=node):
+            try:
+                return list(result_generator)
+            except IgnoreResultsError as exc:
+                return [IgnoreResults(str(exc))]
 
     @staticmethod
     def _add_node_name(result: Result, node_name: str) -> Result:
         return Result(
             state=result.state,
-            summary=result.summary,
+            summary="FAKE",
             details="\n".join(f"[{node_name}]: {line}" for line in result.details.splitlines()),
-        )
+        )._replace(summary=result.summary)

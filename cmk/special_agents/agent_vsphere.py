@@ -14,12 +14,13 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Any, Counter, Dict, List, Sequence
+from typing import Any, Counter, Dict, List, Sequence, Union
 from xml.dom import minidom  # type: ignore[import]
 
 import dateutil.parser
 import requests
 import urllib3  # type: ignore[import]
+from requests.adapters import HTTPAdapter
 
 import cmk.utils.password_store
 import cmk.utils.paths
@@ -329,6 +330,11 @@ class SoapTemplates:
         '      <ns1:pathSet>runtime.healthSystemRuntime.hardwareStatusInfo.memoryStatusInfo</ns1:pathSet>'
         '      <ns1:pathSet>runtime.inMaintenanceMode</ns1:pathSet>'
         '      <ns1:pathSet>hardware.memorySize</ns1:pathSet>'
+        '      <ns1:pathSet>config.product.vendor</ns1:pathSet>'
+        '      <ns1:pathSet>config.product.licenseProductName</ns1:pathSet>'
+        '      <ns1:pathSet>config.product.osType</ns1:pathSet>'
+        '      <ns1:pathSet>config.product.version</ns1:pathSet>'
+        '      <ns1:pathSet>config.product.build</ns1:pathSet>'
         '    </ns1:propSet>'
         '    <ns1:objectSet>'
         '      <ns1:obj type="Folder">%(rootFolder)s</ns1:obj><ns1:skip>false</ns1:skip>'
@@ -908,6 +914,10 @@ def parse_arguments(argv):
         help="""Disables the checking of the servers ssl certificate""",
     )
     parser.add_argument(
+        "--cert-server-name",
+        help="""Expect this as the servers name in the ssl certificate. Overrides '--no-cert-check'.""",
+    )
+    parser.add_argument(
         "-D",
         "--direct",
         action="store_true",
@@ -1004,7 +1014,7 @@ def parse_arguments(argv):
 
     # positional arguments
     parser.add_argument(
-        "host_address", metavar="HOST", help="""Host name or IP address of VMWare HostSystem"""
+        "host_address", metavar="HOST", help="""Host name or IP address of VMware HostSystem"""
     )
 
     return parser.parse_args(argv)
@@ -1025,6 +1035,16 @@ class ESXCookieInvalid(RuntimeError):
     pass
 
 
+class HostNameValidationAdapter(HTTPAdapter):
+    def __init__(self, host_name: str) -> None:
+        super().__init__()
+        self._reference_host_name = host_name
+
+    def cert_verify(self, conn, url, verify, cert):
+        conn.assert_hostname = self._reference_host_name
+        return super().cert_verify(conn, url, verify, cert)
+
+
 class ESXSession(requests.Session):
     """Encapsulates the Sessions with the ESX system"""
 
@@ -1042,15 +1062,19 @@ class ESXSession(requests.Session):
         "</SOAP-ENV:Envelope>"
     )
 
-    def __init__(self, address, port, no_cert_check=False):
+    def __init__(self, address: str, port: str, *, cert_check: Union[bool, str] = True) -> None:
         super().__init__()
-        if no_cert_check:
+
+        service = f"https://{address}:{port}"
+        if cert_check is False:
             # Watch out: we must provide the verify keyword to every individual request call!
             # Else it will be overwritten by the REQUESTS_CA_BUNDLE env variable
             self.verify = False
             urllib3.disable_warnings(category=urllib3.exceptions.InsecureRequestWarning)
+        elif isinstance(cert_check, str):
+            self.mount(service, HostNameValidationAdapter(cert_check))
 
-        self._post_url = "https://%s:%s/sdk" % (address, port)
+        self._post_url = f"{service}/sdk"
         self.headers.update(
             {
                 "Content-Type": 'text/xml; charset="utf-8"',
@@ -1096,7 +1120,9 @@ class ESXConnection:
         self._perf_samples_path = AGENT_TMP_PATH / ("%s.timer" % address)
         self._perf_samples = None
 
-        self._session = ESXSession(address, port, opt.no_cert_check)
+        self._session = ESXSession(
+            address, port, cert_check=opt.cert_server_name or not opt.no_cert_check
+        )
         self.system_info = self._fetch_systeminfo()
         self._soap_templates = SoapTemplates(self.system_info)
 

@@ -19,15 +19,28 @@ import http.client
 
 from cmk.utils.bi.bi_aggregation import BIAggregation, BIAggregationSchema
 from cmk.utils.bi.bi_lib import ReqBoolean, ReqList, ReqString
-from cmk.utils.bi.bi_packs import BIAggregationPack
+from cmk.utils.bi.bi_packs import (
+    AggregationNotFoundException,
+    BIAggregationPack,
+    DeleteErrorUsedByAggregation,
+    DeleteErrorUsedByRule,
+    RuleNotFoundException,
+)
 from cmk.utils.bi.bi_rule import BIRule, BIRuleSchema
 from cmk.utils.bi.bi_schema import Schema
 from cmk.utils.exceptions import MKGeneralException
 
-from cmk.gui.bi import get_cached_bi_packs
+from cmk.gui import fields as gui_fields
+from cmk.gui.bi import api_get_aggregation_state, get_cached_bi_packs
+from cmk.gui.globals import user
 from cmk.gui.http import Response
-from cmk.gui.plugins.openapi.restful_objects import constructors, Endpoint, response_schemas
-from cmk.gui.plugins.openapi.utils import ProblemException
+from cmk.gui.plugins.openapi.restful_objects import (
+    constructors,
+    Endpoint,
+    permissions,
+    response_schemas,
+)
+from cmk.gui.plugins.openapi.utils import ProblemException, serve_json
 
 from cmk import fields
 
@@ -73,6 +86,36 @@ class BIRuleEndpointSchema(BIRuleSchema):
     )
 
 
+RO_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.bi_rules"),
+        permissions.Ignore(
+            permissions.AnyPerm(
+                [
+                    permissions.Perm("bi.see_all"),
+                    permissions.Perm("general.see_all"),
+                    permissions.Perm("mkeventd.seeall"),
+                ]
+            )
+        ),
+    ]
+)
+
+RW_BI_RULES_PERMISSION = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        permissions.Perm("wato.bi_rules"),
+    ]
+)
+
+RW_BI_ADMIN_PERMISSIONS = permissions.AllPerm(
+    [
+        *RW_BI_RULES_PERMISSION.perms,
+        permissions.Perm("wato.bi_admin"),
+    ]
+)
+
+
 @Endpoint(
     constructors.object_href("bi_rule", "{rule_id}"),
     "cmk/get_bi_rule",
@@ -80,19 +123,21 @@ class BIRuleEndpointSchema(BIRuleSchema):
     path_params=[BI_RULE_ID],
     convert_response=False,
     response_schema=BIRuleEndpointSchema,
+    permissions_required=RO_PERMISSIONS,
 )
 def get_bi_rule(params):
     """Show a BI rule"""
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     try:
         bi_rule = bi_packs.get_rule_mandatory(params["rule_id"])
-    except KeyError:
+    except RuleNotFoundException:
         _bailout_with_message("Unknown bi_rule: %s" % params["rule_id"])
 
     data = {"pack_id": bi_rule.pack_id}
     data.update(BIRuleSchema().dump(bi_rule))
-    return constructors.serve_json(data)
+    return serve_json(data)
 
 
 @Endpoint(
@@ -103,6 +148,7 @@ def get_bi_rule(params):
     convert_response=False,
     request_schema=BIRuleEndpointSchema,
     response_schema=BIRuleEndpointSchema,
+    permissions_required=RW_BI_RULES_PERMISSION,
 )
 def put_bi_rule(params):
     """Update an existing BI rule"""
@@ -117,6 +163,7 @@ def put_bi_rule(params):
     convert_response=False,
     request_schema=BIRuleEndpointSchema,
     response_schema=BIRuleEndpointSchema,
+    permissions_required=RW_BI_RULES_PERMISSION,
 )
 def post_bi_rule(params):
     """Create a new BI rule"""
@@ -124,6 +171,8 @@ def post_bi_rule(params):
 
 
 def _update_bi_rule(params, must_exist: bool):
+    user.need_permission("wato.edit")
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     rule_config = params["body"]
@@ -146,7 +195,7 @@ def _update_bi_rule(params, must_exist: bool):
 
     data = {"pack_id": bi_rule.pack_id}
     data.update(bi_rule.schema()().dump(bi_rule))
-    return constructors.serve_json(data)
+    return serve_json(data)
 
 
 @Endpoint(
@@ -156,17 +205,24 @@ def _update_bi_rule(params, must_exist: bool):
     path_params=[BI_RULE_ID],
     convert_response=False,
     output_empty=True,
+    permissions_required=RW_BI_RULES_PERMISSION,
+    additional_status_codes=[409],
 )
 def delete_bi_rule(params):
     """Delete BI rule"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     try:
         bi_rule = bi_packs.get_rule_mandatory(params["rule_id"])
-    except KeyError:
+    except RuleNotFoundException:
         _bailout_with_message("Unknown bi_rule: %s" % params["rule_id"])
 
-    bi_packs.delete_rule(bi_rule.id)
+    try:
+        bi_packs.delete_rule(bi_rule.id)
+    except (DeleteErrorUsedByRule, DeleteErrorUsedByAggregation) as e:
+        raise ProblemException(status=409, title=http.client.responses[409], detail=e.args[0])
     bi_packs.save_config()
     return Response(status=204)
 
@@ -189,6 +245,50 @@ class BIAggregationEndpointSchema(BIAggregationSchema):
     )
 
 
+class BIAggregationStateRequestSchema(Schema):
+    filter_names = fields.List(fields.String(), description="Filter by names", example=["Host foo"])
+    filter_groups = fields.List(
+        fields.String(), description="Filter by group", example=["My Group"]
+    )
+
+
+class BIAggregationStateResponseSchema(Schema):
+    aggregations = fields.Dict(
+        description="The Aggregation state",
+        example={},
+    )
+    missing_sites = fields.List(
+        fields.String(),
+        description="The missing sites",
+        example=["beta", "heute"],
+    )
+    missing_aggr = fields.List(
+        fields.String(), description="the missing aggregations", example=["Host heute"]
+    )
+
+
+@Endpoint(
+    constructors.domain_type_action_href("bi_aggregation", "aggregation_state"),
+    "cmk/get_bi_aggregation_state",
+    method="post",
+    convert_response=False,
+    request_schema=BIAggregationStateRequestSchema,
+    response_schema=BIAggregationStateResponseSchema,
+    permissions_required=RO_PERMISSIONS,
+    tag_group="Monitoring",
+    skip_locking=True,
+)
+def get_bi_aggregation_state(params):
+    """Get the state of BI aggregations"""
+    user.need_permission("wato.bi_rules")
+    filter_config = params.get("body", {})
+    filter_names = filter_config.get("filter_names")
+    filter_groups = filter_config.get("filter_groups")
+    return serve_json(
+        api_get_aggregation_state(filter_names=filter_names, filter_groups=filter_groups)
+    )
+
+
 @Endpoint(
     constructors.object_href("bi_aggregation", "{aggregation_id}"),
     "cmk/get_bi_aggregation",
@@ -196,19 +296,21 @@ class BIAggregationEndpointSchema(BIAggregationSchema):
     path_params=[BI_AGGR_ID],
     convert_response=False,
     response_schema=BIAggregationEndpointSchema,
+    permissions_required=RO_PERMISSIONS,
 )
 def get_bi_aggregation(params):
     """Get a BI aggregation"""
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     try:
         bi_aggregation = bi_packs.get_aggregation_mandatory(params["aggregation_id"])
-    except KeyError:
+    except AggregationNotFoundException:
         _bailout_with_message("Unknown bi_aggregation: %s" % params["aggregation_id"])
 
     data = {"pack_id": bi_aggregation.pack_id}
     data.update(BIAggregationSchema().dump(bi_aggregation))
-    return constructors.serve_json(data)
+    return serve_json(data)
 
 
 @Endpoint(
@@ -219,6 +321,7 @@ def get_bi_aggregation(params):
     convert_response=False,
     request_schema=BIAggregationEndpointSchema,
     response_schema=BIAggregationEndpointSchema,
+    permissions_required=RW_BI_RULES_PERMISSION,
 )
 def put_bi_aggregation(params):
     """Update an existing BI aggregation"""
@@ -233,6 +336,7 @@ def put_bi_aggregation(params):
     convert_response=False,
     request_schema=BIAggregationEndpointSchema,
     response_schema=BIAggregationEndpointSchema,
+    permissions_required=RW_BI_RULES_PERMISSION,
 )
 def post_bi_aggregation(params):
     """Create a BI aggregation"""
@@ -240,6 +344,8 @@ def post_bi_aggregation(params):
 
 
 def _update_bi_aggregation(params, must_exist: bool):
+    user.need_permission("wato.edit")
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     aggregation_config = params["body"]
@@ -262,7 +368,7 @@ def _update_bi_aggregation(params, must_exist: bool):
 
     data = {"pack_id": bi_aggregation.pack_id}
     data.update(bi_aggregation.schema()().dump(bi_aggregation))
-    return constructors.serve_json(data)
+    return serve_json(data)
 
 
 @Endpoint(
@@ -272,14 +378,17 @@ def _update_bi_aggregation(params, must_exist: bool):
     path_params=[BI_AGGR_ID],
     convert_response=False,
     output_empty=True,
+    permissions_required=RW_BI_RULES_PERMISSION,
 )
 def delete_bi_aggregation(params):
     """Delete a BI aggregation"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     try:
         bi_aggregation = bi_packs.get_aggregation_mandatory(params["aggregation_id"])
-    except KeyError:
+    except AggregationNotFoundException:
         _bailout_with_message("Unknown bi_aggregation: %s" % params["aggregation_id"])
 
     bi_packs.delete_aggregation(bi_aggregation.id)
@@ -303,10 +412,11 @@ def delete_bi_aggregation(params):
     method="get",
     convert_response=False,
     response_schema=response_schemas.DomainObjectCollection,
+    permissions_required=RO_PERMISSIONS,
 )
 def get_bi_packs(params):
     """Show all BI packs"""
-
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     packs = [
@@ -323,7 +433,7 @@ def get_bi_packs(params):
         value=packs,
         links=[constructors.link_rel("self", constructors.collection_href("bi_pack"))],
     )
-    return constructors.serve_json(collection_object)
+    return serve_json(collection_object)
 
 
 @Endpoint(
@@ -333,9 +443,11 @@ def get_bi_packs(params):
     path_params=[BI_PACK_ID],
     convert_response=False,
     response_schema=response_schemas.DomainObject,
+    permissions_required=RO_PERMISSIONS,
 )
 def get_bi_pack(params):
     """Get a BI pack and its rules and aggregations"""
+    user.need_permission("wato.bi_rules")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
     bi_pack = bi_packs.get_pack(params["pack_id"])
@@ -379,7 +491,7 @@ def get_bi_pack(params):
         members=domain_members,
     )
 
-    return constructors.serve_json(domain_object)
+    return serve_json(domain_object)
 
 
 @Endpoint(
@@ -389,9 +501,13 @@ def get_bi_pack(params):
     path_params=[BI_PACK_ID],
     convert_response=False,
     output_empty=True,
+    permissions_required=RW_BI_ADMIN_PERMISSIONS,
 )
 def delete_bi_pack(params):
     """Delete BI pack"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.bi_rules")
+    user.need_permission("wato.bi_admin")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
 
@@ -419,7 +535,7 @@ class BIPackEndpointSchema(Schema):
         description="TODO: Hier muß Andreas noch etwas reinschreiben!",
     )
     contact_groups = ReqList(
-        fields.String(),
+        gui_fields.GroupField(should_exist=True, group_type="contact", example="important_persons"),
         dump_default=[],
         example=["contact", "contactgroup_b"],
         description="TODO: Hier muß Andreas noch etwas reinschreiben!",
@@ -439,6 +555,7 @@ class BIPackEndpointSchema(Schema):
     convert_response=False,
     request_schema=BIPackEndpointSchema,
     response_schema=BIPackEndpointSchema,
+    permissions_required=RW_BI_ADMIN_PERMISSIONS,
 )
 def put_bi_pack(params):
     """Update an existing BI pack"""
@@ -453,6 +570,7 @@ def put_bi_pack(params):
     convert_response=False,
     request_schema=BIPackEndpointSchema,
     response_schema=BIPackEndpointSchema,
+    permissions_required=RW_BI_ADMIN_PERMISSIONS,
 )
 def post_bi_pack(params):
     """Create a new BI pack"""
@@ -460,6 +578,9 @@ def post_bi_pack(params):
 
 
 def _update_bi_pack(params, must_exist: bool):
+    user.need_permission("wato.edit")
+    user.need_permission("wato.bi_rules")
+    user.need_permission("wato.bi_admin")
     bi_packs = get_cached_bi_packs()
     bi_packs.load_config()
 
@@ -481,4 +602,4 @@ def _update_bi_pack(params, must_exist: bool):
     new_pack = BIAggregationPack(pack_config)
     bi_packs.add_pack(new_pack)
     bi_packs.save_config()
-    return constructors.serve_json(BIPackEndpointSchema().dump(new_pack.serialize()))
+    return serve_json(BIPackEndpointSchema().dump(new_pack.serialize()))

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # Copyright (C) 2019 tribe29 GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+from typing import Any, Mapping
+
 import pytest
 
 from cmk.base.plugins.agent_based.agent_based_api.v1 import Metric, Result, State
+from cmk.base.plugins.agent_based.agent_based_api.v1.type_defs import CheckResult
 from cmk.base.plugins.agent_based.utils import ipmi
 
 
@@ -123,16 +125,11 @@ from cmk.base.plugins.agent_based.utils import ipmi
                 crit_high=1.13,
             ),
             False,
-            lambda txt: State.OK,
+            lambda txt: State.WARN if txt.startswith("nc") else State.OK,
             [
-                Result(state=State.OK, summary="Status: nc"),
+                Result(state=State.WARN, summary="Status: nc"),
                 Result(state=State.OK, summary="1.04 Volts"),
                 Metric("PCH_1.05V", 1.04, levels=(None, 1.13)),
-                Result(
-                    state=State.WARN,
-                    summary="Sensor is non-critical",
-                    details="Sensor is non-critical",
-                ),
             ],
         ),
         (
@@ -271,23 +268,24 @@ from cmk.base.plugins.agent_based.utils import ipmi
             False,
             lambda txt: State.OK,
             [
-                Result(state=State.OK, summary="Status: ok"),
+                Result(
+                    state=State.UNKNOWN,
+                    summary="Status: ok",
+                    details="Monitoring state of sensor status set by user-configured rules",
+                ),
                 Result(state=State.OK, summary="1.04 Volts"),
                 Metric("PCH_1.05V", 1.04, levels=(None, 1.13)),
-                Result(
-                    state=State.UNKNOWN, summary="User-defined state", details="User-defined state"
-                ),
             ],
         ),
     ],
 )
 def test_check_ipmi_detailed(
-    item,
-    params,
-    sensor,
-    temperature_metrics_only,
-    status_txt_mapping,
-    exp_result,
+    item: str,
+    params: Mapping[str, Any],
+    sensor: ipmi.Sensor,
+    temperature_metrics_only: bool,
+    status_txt_mapping: ipmi.StatusTxtMapping,
+    exp_result: CheckResult,
 ):
     assert (
         list(

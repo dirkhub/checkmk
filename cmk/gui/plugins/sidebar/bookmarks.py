@@ -11,7 +11,7 @@ import cmk.utils.store as store
 
 import cmk.gui.pagetypes as pagetypes
 from cmk.gui.exceptions import MKUserError
-from cmk.gui.globals import request, transactions, user
+from cmk.gui.globals import request, user
 from cmk.gui.htmllib.foldable_container import foldable_container
 from cmk.gui.i18n import _
 from cmk.gui.plugins.sidebar.utils import (
@@ -24,6 +24,7 @@ from cmk.gui.plugins.sidebar.utils import (
 )
 from cmk.gui.type_defs import RoleName
 from cmk.gui.utils import is_allowed_url
+from cmk.gui.utils.csrf_token import check_csrf_token
 from cmk.gui.valuespec import (
     Alternative,
     FixedValue,
@@ -194,6 +195,10 @@ class BookmarkList(pagetypes.Overridable):
 
     @classmethod
     def load_legacy_bookmarks(cls) -> None:
+        # Don't load the bookmarks when there is no user logged in
+        if user.id is None:
+            return
+
         # Don't load the legacy bookmarks when there is already a my_bookmarks list
         if cls.has_instance((user.id, "my_bookmarks")):
             return
@@ -282,7 +287,7 @@ class Bookmarks(SidebarSnapin):
         link(
             _("Add Bookmark"),
             "javascript:void(0)",
-            onclick="cmk.sidebar.add_bookmark('%s')" % transactions.get(),
+            onclick="cmk.sidebar.add_bookmark()",
         )
         link(_("Edit"), "bookmark_lists.py")
         end_footnote_links()
@@ -304,9 +309,10 @@ class Bookmarks(SidebarSnapin):
         return ["admin", "user", "guest"]
 
     def _ajax_add_bookmark(self) -> None:
+        check_csrf_token()
         title = request.var("title")
         url = request.var("url")
-        if title and url and transactions.transaction_valid():
+        if title and url:
             BookmarkList.validate_url(url, "url")
             self._add_bookmark(title, url)
         self.show()

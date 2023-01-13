@@ -171,6 +171,8 @@ class PageMenuTopic:
 
     title: str
     entries: List[PageMenuEntry] = field(default_factory=list)
+    # Added to skip topics from update on service discovery page
+    id_: Optional[str] = None
 
 
 @dataclass
@@ -327,6 +329,7 @@ def make_display_options_dropdown() -> PageMenuDropdown:
                         ),
                     ),
                 ],
+                id_="general_display_options",
             ),
         ],
     )
@@ -407,7 +410,7 @@ def make_checkbox_selection_topic(selection_key: str, is_enabled: bool = True) -
         entries=[
             PageMenuEntry(
                 name="checkbox_selection",
-                title=_("Select all checkboxes"),
+                title=_("Deselect all checkboxes") if is_selected else _("Select all checkboxes"),
                 icon_name="checkbox" if is_selected else "checked_checkbox",
                 item=make_javascript_link(
                     "cmk.selection.toggle_all_rows(this.form, %s, %s);"
@@ -566,7 +569,7 @@ class PageMenuRenderer:
         html.close_div()
 
     def _show_topic(self, topic: PageMenuTopic) -> None:
-        html.open_div(class_="topic")
+        html.open_div(class_="topic", id_=topic.id_)
         html.div(
             topic.title,
             class_=[

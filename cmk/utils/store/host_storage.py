@@ -67,11 +67,16 @@ def get_hosts_file_variables():
         "explicit_host_conf": {},
         "extra_host_conf": {"alias": []},
         "extra_service_conf": {"_WATO": []},
+        "folder_attributes": {},
         "host_attributes": {},
         "host_contactgroups": [],
         "service_contactgroups": [],
         "_lock": False,
     }
+
+
+class FolderAttributes(TypedDict):
+    bake_agent_package: bool
 
 
 class ContactGroupsField(TypedDict):
@@ -93,6 +98,7 @@ class HostsStorageData:
     contact_groups: ContactGroupsField
     explicit_host_conf: Dict[str, Dict[HostName, Any]]
     host_attributes: Dict[HostName, Any]
+    folder_attributes: Dict[str, FolderAttributes]
 
 
 class HostsStorageFieldsGenerator:
@@ -231,15 +237,17 @@ class StandardHostsStorage(ABCHostsStorage[str]):
                 out.write("explicit_host_conf['%s'].update(%r)\n" % (varname, entries))
 
         if folder_host_contactgroups := contact_groups["folder_hosts"]:
-            out.write("\nhost_contactgroups.insert(0, \n%r)\n" % folder_host_contactgroups)
+            for group in folder_host_contactgroups:
+                out.write("\nhost_contactgroups.insert(0, %r)\n" % group)
 
         if folder_service_contactgroups := contact_groups["folder_services"]:
             for group in folder_service_contactgroups:
-                out.write("\nservice_contactgroups.insert(0, %r)" % group)
+                out.write("\nservice_contactgroups.insert(0, %r)\n" % group)
 
         # TODO: discuss. cmk.base also parses host_attributes. ipaddresses, mgmtboard, etc.
         out.write("\n# Host attributes (needed for WATO)")
         out.write("\nhost_attributes.update(%s)\n" % value_formatter(data.host_attributes))
+        out.write("\nfolder_attributes.update(%s)\n" % value_formatter(data.folder_attributes))
 
         # final
         store.save_text_to_file(file_path, host_storage_fileheader() + out.getvalue())
@@ -255,7 +263,7 @@ class PickleHostsStorage(ABCHostsStorage[HostsData]):
     def _write(
         self, file_path: Path, data: HostsStorageData, value_formatter: Callable[[Any], str]
     ) -> None:
-        pickle_store = store.ObjectStore(file_path, serializer=PickleSerializer())
+        pickle_store = store.ObjectStore(file_path, serializer=PickleSerializer[HostsData]())
         with pickle_store.locked():
             pickle_store.write_obj(asdict(data))
 
@@ -401,6 +409,7 @@ class ExperimentalStorageLoader(ABCHostsStorageLoader[HostsData]):
             "management_snmp_credentials",
             "management_protocol",
             "host_attributes",
+            "folder_attributes",
         ]:
             global_dict[key].update(data.get(key, {}))
 

@@ -679,6 +679,10 @@ def _filter_rows(rows: TableRows, search_term: str) -> TableRows:
             # Filter out buttons
             if cell.css is not None and "buttons" in cell.css:
                 continue
+            # The inpage search of the folder page adds href with
+            # "search=searchterm" to cell.content and would always match
+            if "inpage_search_form" in cell.content:
+                continue
             if match_regex.search(str(cell.content)):
                 filtered_rows.append(row)
                 break  # skip other cells when matched
@@ -723,3 +727,18 @@ def init_rowselect(selection_key: str) -> None:
         "selected_rows": selected,
     }
     html.javascript("cmk.selection.init_rowselect(%s);" % (json.dumps(selection_properties)))
+
+
+def show_row_count(
+    row_count: int,
+    row_info: str,
+    selection_id: Optional[str] = None,
+) -> None:
+    """
+    Shows the row count on top of a table.
+    Needs empty div "row_id" set before the table.
+    """
+    row_info = "%d %s" % (row_count, row_info)
+    html.javascript("cmk.utils.update_row_info(%s);" % json.dumps(row_info))
+    if selection_id is not None:
+        init_rowselect(selection_id)

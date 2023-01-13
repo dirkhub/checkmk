@@ -48,7 +48,10 @@ class Performance(SidebarSnapin):
             data = sites.live().query(
                 "GET status\nColumns: service_checks_rate host_checks_rate "
                 "external_commands_rate connections_rate forks_rate "
-                "log_messages_rate cached_log_messages\n"
+                "log_messages_rate cached_log_messages "
+                "carbon_overflows_rate carbon_queue_usage carbon_bytes_sent_rate "
+                "influxdb_overflows_rate influxdb_queue_usage influxdb_bytes_sent_rate "
+                "rrdcached_overflows_rate rrdcached_queue_usage rrdcached_bytes_sent_rate\n"
             )
         finally:
             sites.live().set_only_sites(None)
@@ -61,10 +64,19 @@ class Performance(SidebarSnapin):
             ("Process creations", True, 4, "%.2f/s"),
             ("New log messages", True, 5, "%.2f/s"),
             ("Cached log messages", True, 6, "%d"),
+            ("Carbon overflow rate", True, 7, "%d/s"),
+            ("Carbon queue usage", True, 8, "%.2f %%"),
+            ("Carbon I/O", True, 9, "%d bytes/s"),
+            ("InfluxDB overflow rate", True, 10, "%d/s"),
+            ("InfluxDB queue usage", True, 11, "%.2f %%"),
+            ("InfluxDB I/O", True, 12, "%d bytes/s"),
+            ("RRD overflow rate", True, 13, "%d/s"),
+            ("RRD queue usage", True, 14, "%.2f %%"),
+            ("RRD I/O", True, 15, "%d bytes/s"),
         ]:
             write_line(what + ":", format_str % sum(row[col] for row in data), show_more=show_more)
 
-        if only_sites is None and len(sites.allsites()) == 1:
+        if only_sites is None and len(sites.get_enabled_sites()) == 1:
             try:
                 data = sites.live().query(
                     "GET status\nColumns: external_command_buffer_slots "

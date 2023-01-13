@@ -1,4 +1,4 @@
-$CMK_VERSION = "2.1.0b9"
+$CMK_VERSION = "2.1.0p20"
 # Copyright (C) 2019 tribe29 GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
@@ -205,17 +205,22 @@ Function get_dbversion_database ($ORACLE_HOME) {
 }
 
 
-function is_async_running {
+function is_async_running ($fullPath) {
      if (-not(Test-Path -path "$ASYNC_PROC_PATH")) {
           # no file, no running process
           return $false
      }
 
      $proc_pid = (Get-Content ${ASYNC_PROC_PATH})
-     $proc = Get-Process -id $proc_pid -ErrorAction SilentlyContinue
-     if ($proc) {
+
+     # Check if the process with `$proc_pid` is still running AND if its commandline contains `$fullPath`.
+     # Our async process always contains `$fullPath` in their own command line.
+     $command_line = (Get-WmiObject -Query "SELECT CommandLine FROM Win32_Process WHERE ProcessID = $proc_pid").commandline
+
+     if ($command_line -like "*$fullPath*") {
          return $true
      }
+
      # The process to the PID cannot be found, so remove also the proc file
      rm $ASYNC_PROC_PATH
      return $false
@@ -259,6 +264,7 @@ Function sqlcall {
      $SKIP_DOUBLE_ERROR = 0
      $ASM_FIRST_CHAR = "+"
      $CHECK_FIRST_CHAR = $sqlsid.substring(0, 1)
+     $UPPER_SID = $sqlsid.toupper()
      if ( $CHECK_FIRST_CHAR.compareTo($ASM_FIRST_CHAR) -eq 0 ) {
           if ($ASMUSER) {
                # The ASMUSER variable is set in the config file , so we will use that for the connection
@@ -289,7 +295,6 @@ Function sqlcall {
                     $assysdbaconnect = ""
                }
                #$TNSALIAS="$the_host`:$the_port/$sqlsid"
-               $UPPER_SID = $sqlsid.toupper()
                $TNSALIAS = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=$the_host)(PORT=$the_port))(CONNECT_DATA=(SERVICE_NAME=+ASM)(INSTANCE_NAME=$UPPER_SID)(UR=A)))"
                # we presume we can use an EZconnect
                $SQL_CONNECT = "$the_user/$the_password@$TNSALIAS$assysdbaconnect"
@@ -313,7 +318,6 @@ Function sqlcall {
                $the_sysdba = ""
                $the_host = "localhost"
                $the_port = "1521"
-               $the_service = ""
 
                # cycle through the "$ASMUSER$inst_name" variable, to get our connection data
                foreach ($the_dbuser in (get-variable "asmuser_$sqlsid").value) {
@@ -324,7 +328,6 @@ Function sqlcall {
                          3 { $the_sysdba = $the_dbuser }
                          4 { $the_host = $the_dbuser }
                          5 { $the_port = $the_dbuser }
-                         6 { $the_service = $the_dbuser }
                          default { "Error handling Oracle database connection with config for ASMUSER_SID." }
                     }
                }
@@ -335,7 +338,7 @@ Function sqlcall {
                     $assysdbaconnect = ""
                }
                # $TNSALIAS="$the_host`:$the_port/$the_service"
-               $TNSALIAS = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=$the_host)(PORT=$the_port))(CONNECT_DATA=(SID=$the_service)))"
+               $TNSALIAS = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=$the_host)(PORT=$the_port))(CONNECT_DATA=(SID=$UPPER_SID)))"
                # we presume we can use an EZconnect
                $SQL_CONNECT = "$the_user/$the_password@$TNSALIAS$assysdbaconnect"
                debug_echo "value of sql_connect in asmuser_sid = $SQL_CONNECT"
@@ -403,7 +406,6 @@ Function sqlcall {
                $the_sysdba = ""
                $the_host = "localhost"
                $the_port = "1521"
-               $the_service = ""
 
                # cycle through the "$DBUSER$inst_name" variable, to get our connection data
                foreach ($the_dbuser in (get-variable "dbuser_$sqlsid").value) {
@@ -414,7 +416,6 @@ Function sqlcall {
                          3 { $the_sysdba = $the_dbuser }
                          4 { $the_host = $the_dbuser }
                          5 { $the_port = $the_dbuser }
-                         6 { $the_service = $the_dbuser }
                          default { "Error handling Oracle database connection with config for DBUSER_SID." }
                     }
                }
@@ -425,7 +426,7 @@ Function sqlcall {
                     $assysdbaconnect = ""
                }
                # $TNSALIAS="$the_host`:$the_port/$the_service"
-               $TNSALIAS = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=$the_host)(PORT=$the_port))(CONNECT_DATA=(SID=$the_service)))"
+               $TNSALIAS = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=$the_host)(PORT=$the_port))(CONNECT_DATA=(SID=$UPPER_SID)))"
                # we presume we can use an EZconnect
                $SQL_CONNECT = "$the_user/$the_password@$TNSALIAS$assysdbaconnect"
                debug_echo "value of sql_connect in dbuser_sid = $SQL_CONNECT"
@@ -509,7 +510,7 @@ Function sqlcall {
                # now we ensure that the async SQL Calls have up-to-date SQL outputs, running this job asynchronously...
                #####################################################
                debug_echo "about to call bg task $sql_message"
-               if (-not(is_async_running)) {
+               if (-not(is_async_running($fullPath))) {
 
                     $command = {
                         param([string]$sql_connect, [string]$sql, [string]$path, [string]$sql_sid)
@@ -2306,5 +2307,3 @@ if ($the_count -gt 0) {
 
 }
 debug_echo "got to the end"
-
-

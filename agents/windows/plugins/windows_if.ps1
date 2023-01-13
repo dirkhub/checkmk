@@ -1,4 +1,4 @@
-$CMK_VERSION = "2.1.0b9"
+$CMK_VERSION = "2.1.0p20"
 
 ## runs on windows 2012 or newer
 ## TeamName        TeamingMode     LoadBalancingAlgorithm  MemberMACAddresses      MemberNames     MemberDescriptions      Speed   GUID
@@ -44,7 +44,7 @@ if ([Environment]::OSVersion.Version.Major -ge "5"){
 	try {
 		Write-Host "<<<winperf_if_get_netadapter:sep(124)>>>"
 		foreach ($net in Get-NetAdapter -IncludeHidden){
-			$description = $($net.InterfaceDescription).replace('|', '/')`
+			$description = $($net.InterfaceDescription).replace('|', '/')
 			$alias = $($net.InterfaceAlias).replace('|', '/')
 			Write-Host ("$description|" +
 			            "$alias|" +
@@ -72,5 +72,3 @@ if ([Environment]::OSVersion.Version.Major -ge "5"){
 		}
 	}
 }
-
-

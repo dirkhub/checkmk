@@ -26,6 +26,7 @@ from typing import (
 import cmk.base.plugins.agent_based.utils.eval_regex as eval_regex
 from cmk.base.plugins.agent_based.agent_based_api.v1 import (
     check_levels,
+    Metric,
     regex,
     render,
     Result,
@@ -330,6 +331,17 @@ def _fileinfo_check_function(
         if metric.value is None:
             continue
 
+        if "age" in metric.title.lower() and metric.value < 0:
+            age = metric.verbose_func(abs(metric.value))
+            message = (
+                "The timestamp of the file is in the future. Please investigate your host times"
+            )
+
+            yield Result(state=State.UNKNOWN, summary=f"{metric.title}: -{age}, {message}")
+            yield Metric(metric.key, metric.value)
+
+            continue
+
         max_levels = params.get("max" + metric.key, (None, None))
         min_levels = params.get("min" + metric.key, (None, None))
 
@@ -341,6 +353,14 @@ def _fileinfo_check_function(
             label=metric.title,
             render_func=metric.verbose_func,
         )
+
+
+def change_results_state_to_ok(results: CheckResult):
+    for result in results:
+        if isinstance(result, Result):
+            yield Result(state=State.OK, summary=result.summary)
+        else:
+            yield result
 
 
 def check_fileinfo_data(
@@ -363,16 +383,21 @@ def check_fileinfo_data(
                 MetricInfo("Size", "size", file_info.size, render.filesize),
                 MetricInfo("Age", "age", age, render.timespan),
             ]
-            yield from _fileinfo_check_function(check_definition, params)
+            check_results = _fileinfo_check_function(check_definition, params)
 
             if outof_range_txt:
                 yield Result(state=State.OK, summary=outof_range_txt)
+                yield from change_results_state_to_ok(check_results)
+            else:
+                yield from check_results
 
     elif outof_range_txt:
         yield Result(state=State.OK, summary="File not found - %s" % outof_range_txt)
 
     else:
-        yield Result(state=params.get("state_missing", State.UNKNOWN), summary="File not found")
+        yield Result(
+            state=State(value=params.get("state_missing", State.UNKNOWN)), summary="File not found"
+        )
 
 
 def _filename_matches(
@@ -458,8 +483,15 @@ def _check_individual_files(
     if skip_ok_files and State(overall_state) == State.OK:
         return
 
-    age = render.timespan(file_age)
     size = render.filesize(file_size)
+    age = render.timespan(abs(file_age))
+
+    if file_age < 0:
+        message = "The timestamp of the file is in the future. Please investigate your host times"
+        yield Result(
+            state=State.UNKNOWN, summary=f"[{file_name}] Age: -{age}, Size: {size}, {message}"
+        )
+        return
 
     yield Result(
         state=State.OK,
@@ -494,12 +526,12 @@ def _fileinfo_check_conjunctions(
         matches = 0
         for title, key, value, readable_f in check_definition:
             level = levels.get(key)
-            if level is not None and value >= level:
+            if level is not None and value and value is not None and value >= level:
                 match_texts.append("%s at %s" % (title.lower(), readable_f(level)))
                 matches += 1
 
             level_lower = levels.get("%s_lower" % key)
-            if level_lower is not None and value < level_lower:
+            if level_lower is not None and value is not None and value < level_lower:
                 match_texts.append("%s below %s" % (title.lower(), readable_f(level_lower)))
                 matches += 1
 
@@ -590,10 +622,13 @@ def check_fileinfo_groups_data(
             state=State.WARN, summary="Files with unknown stat: %s" % ", ".join(files_stat_failed)
         )
 
-    yield from _fileinfo_check_function(check_definition, params)
-
     outof_range_txt = fileinfo_check_timeranges(params)
+    check_results = _fileinfo_check_function(check_definition, params)
+
     if outof_range_txt:
         yield Result(state=State.OK, summary=outof_range_txt)
+        yield from change_results_state_to_ok(check_results)
+    else:
+        yield from check_results
 
     yield from _fileinfo_check_conjunctions(check_definition, params)

@@ -120,6 +120,12 @@ bool GetConfiguredLocalOnly() {
                        cfg::defaults::kControllerLocalOnly);
 }
 
+bool GetConfiguredAllowElevated() {
+    auto controller_config = GetControllerNode();
+    return cfg::GetVal(controller_config, cfg::vars::kControllerAllowElevated,
+                       cfg::defaults::kControllerAllowElevated);
+}
+
 bool IsConfiguredEmergencyOnCrash() {
     auto controller_config = GetControllerNode();
     return cfg::GetVal(controller_config, cfg::vars::kControllerOnCrash,
@@ -198,8 +204,6 @@ bool CreateTomlConfig(const fs::path &toml_file) {
 }
 
 std::wstring BuildCommandLine(const fs::path &controller) {
-    auto port =
-        cfg::GetVal(cfg::groups::kGlobal, cfg::vars::kPort, cfg::kMainPort);
     auto only_from =
         cfg::GetInternalArray(cfg::groups::kGlobal, cfg::vars::kOnlyFrom);
     auto agent_channel = GetConfiguredAgentChannel();
@@ -232,11 +236,16 @@ std::optional<uint32_t> StartAgentController(const fs::path &service) {
             "Checkmk rule set \"Windows agent controller\" for this host.");
         return false;
     }
+    auto killed_count = wtools::KillProcessesByDir(cfg::GetUserBinDir());
+    XLOG::d.i("killed {} processes in '{}'", killed_count,
+              wtools::ToUtf8(cfg::GetUserBinDir()));
     auto controller_name = CopyControllerToBin(service);
     if (controller_name.empty()) {
         XLOG::l("can't copy controller");
         return {};
     }
+
+    ac::CreateTomlConfig(ac::TomlConfigFile());
 
     wtools::AppRunner ar;
     const auto cmdline = BuildCommandLine(controller_name);
@@ -295,6 +304,8 @@ bool KillAgentController(const fs::path &service) {
             XLOG::d("error deleting controller");
             std::this_thread::sleep_for(200ms);
         }
+        std::error_code ec;
+        fs::remove(ac::TomlConfigFile(), ec);
         return ret;
     }
     return false;
@@ -352,7 +363,8 @@ bool CreateLegacyModeFile(const fs::path &marker) {
                                              "is bad, assuming fresh install");
     }
 
-    bool reinstall_new = (*data).starts_with(kCmkAgentMarkerNew);
+    bool reinstall_new = (*data).starts_with(kCmkAgentMarkerNewDeprecated) ||
+                         (*data).starts_with(kCmkAgentMarkerLatest);
     if (reinstall_new) {
         XLOG::l.i("File '{}' is from 2.1+ legacy pull mode  N/A", marker);
         return false;

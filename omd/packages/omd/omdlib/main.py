@@ -57,7 +57,6 @@ from typing import (
 )
 
 import psutil  # type: ignore[import]
-from passlib.hash import sha256_crypt  # type: ignore[import]
 
 import omdlib
 import omdlib.backup
@@ -74,6 +73,7 @@ from omdlib.config_hooks import (
     save_site_conf,
     sort_hooks,
 )
+from omdlib.console import ok, show_success
 from omdlib.contexts import AbstractSiteContext, RootContext, SiteContext
 from omdlib.dialog import (
     ask_user_choices,
@@ -85,6 +85,14 @@ from omdlib.dialog import (
 )
 from omdlib.init_scripts import call_init_scripts, check_status
 from omdlib.skel_permissions import Permissions, read_skel_permissions, skel_permissions_file_path
+from omdlib.system_apache import (
+    create_old_apache_hook,
+    delete_apache_hook,
+    has_old_apache_hook_in_site,
+    is_apache_hook_up_to_date,
+    register_with_system_apache,
+    unregister_from_system_apache,
+)
 from omdlib.tmpfs import (
     add_to_fstab,
     mark_tmpfs_initialized,
@@ -109,12 +117,14 @@ from omdlib.users_and_groups import (
     useradd,
     userdel,
 )
-from omdlib.utils import chdir, delete_user_file, ok
+from omdlib.utils import chdir, delete_user_file
 from omdlib.version_info import VersionInfo
 
 import cmk.utils.log
 import cmk.utils.tty as tty
 from cmk.utils.certs import cert_dir, root_cert_path, RootCA
+from cmk.utils.crypto import Password
+from cmk.utils.crypto.password_hashing import hash_password
 from cmk.utils.exceptions import MKTerminate
 from cmk.utils.log import VERBOSE
 from cmk.utils.paths import mkbackup_lock_dir
@@ -191,14 +201,6 @@ def stop_logging() -> None:
     g_stderr_log = None
 
 
-def show_success(exit_code: int) -> int:
-    if exit_code is True or exit_code == 0:
-        ok()
-    else:
-        sys.stdout.write(tty.error + "\n")
-    return exit_code
-
-
 # .
 #   .--Sites---------------------------------------------------------------.
 #   |                        ____  _ _                                     |
@@ -267,13 +269,13 @@ def create_version_symlink(site: SiteContext, version: str) -> None:
     os.symlink("../../versions/%s" % version, linkname)
 
 
-def calculate_admin_password(options: CommandOptions) -> str:
-    if options.get("admin-password"):
-        return cast(str, options["admin-password"])
-    return random_password()
+def calculate_admin_password(options: CommandOptions) -> Password[str]:
+    if pw := options.get("admin-password"):
+        return Password(pw)
+    return Password(random_password())
 
 
-def set_admin_password(site: SiteContext, pw: str) -> None:
+def set_admin_password(site: SiteContext, pw: Password[str]) -> None:
     with open("%s/etc/htpasswd" % site.dir, "w") as f:
         f.write("cmkadmin:%s\n" % hash_password(pw))
 
@@ -1310,7 +1312,9 @@ def initialize_site_ca(site: SiteContext) -> None:
         ca.create_agent_receiver_certificate(site.name, days_valid=999 * 365)
 
 
-def config_change(version_info: VersionInfo, site: SiteContext, config_hooks: ConfigHooks) -> None:
+def config_change(
+    version_info: VersionInfo, site: SiteContext, config_hooks: ConfigHooks
+) -> list[str]:
     # Check whether or not site needs to be stopped. Stop and remember to start again later
     site_was_stopped = False
     if not site.is_stopped():
@@ -1325,10 +1329,13 @@ def config_change(version_info: VersionInfo, site: SiteContext, config_hooks: Co
 
         validate_config_change_commands(config_hooks, settings)
 
+        changed: list[str] = []
         for key, value in settings:
             config_set_value(site, config_hooks, key, value, save=False)
+            changed.append(key)
 
         save_site_conf(site)
+        return changed
     finally:
         if site_was_stopped:
             start_site(version_info, site)
@@ -1375,22 +1382,22 @@ def validate_config_change_commands(
             raise NotImplementedError()
 
 
-def config_set(site: SiteContext, config_hooks: ConfigHooks, args: Arguments) -> None:
+def config_set(site: SiteContext, config_hooks: ConfigHooks, args: Arguments) -> list[str]:
     if len(args) != 2:
         sys.stderr.write("Please specify variable name and value\n")
         config_usage()
-        return
+        return []
 
     if not site.is_stopped():
         sys.stderr.write("Cannot change config variables while site is running.\n")
-        return
+        return []
 
     hook_name = args[0]
     value = args[1]
     hook = config_hooks.get(hook_name)
     if not hook:
         sys.stderr.write("No such variable '%s'\n" % hook_name)
-        return
+        return []
 
     # Check if value is valid. Choices are either a list of allowed
     # keys or a regular expression
@@ -1400,15 +1407,16 @@ def config_set(site: SiteContext, config_hooks: ConfigHooks, args: Arguments) ->
             sys.stderr.write(
                 "Invalid value for '%s'. Allowed are: %s\n" % (value, ", ".join(choices))
             )
-            return
+            return []
     elif isinstance(hook["choices"], re.Pattern):
         if not hook["choices"].match(value):
             sys.stderr.write("Invalid value for '%s'. Does not match allowed pattern.\n" % value)
-            return
+            return []
     else:
         raise NotImplementedError()
 
     config_set_value(site, config_hooks, hook_name, value)
+    return [hook_name]
 
 
 def config_set_all(site: SiteContext, ignored_hooks: Optional[list] = None) -> None:
@@ -1490,7 +1498,7 @@ def config_show(site: SiteContext, config_hooks: ConfigHooks, args: Arguments) -
 
 def config_configure(
     site: SiteContext, global_opts: "GlobalOptions", config_hooks: ConfigHooks
-) -> None:
+) -> list[str]:
     hook_names = sorted(config_hooks.keys())
     current_hook_name: Optional[str] = ""
     menu_open = False
@@ -1524,7 +1532,7 @@ def config_configure(
                 "Exit",
             )
             if not change:
-                return
+                return []
             current_hook_name = None
             menu_open = True
 
@@ -1534,7 +1542,7 @@ def config_configure(
             )
             if change:
                 try:
-                    config_configure_hook(site, global_opts, config_hooks, current_hook_name)
+                    return config_configure_hook(site, global_opts, config_hooks, current_hook_name)
                 except MKTerminate:
                     raise
                 except Exception as e:
@@ -1545,13 +1553,13 @@ def config_configure(
 
 def config_configure_hook(
     site: SiteContext, global_opts: "GlobalOptions", config_hooks: ConfigHooks, hook_name: str
-) -> None:
+) -> list[str]:
     if not site.is_stopped():
         if not dialog_yesno(
             "You cannot change configuration value while the "
             "site is running. Do you want me to stop the site now?"
         ):
-            return
+            return []
         stop_site(site)
         dialog_message("The site has been stopped.")
 
@@ -1577,6 +1585,8 @@ def config_configure_hook(
         config_set_value(site, config_hooks, cast(str, hook["name"]), new_value)
         save_site_conf(site)
         config_hooks = load_hook_dependencies(site, config_hooks)
+        return [hook_name]
+    return []
 
 
 def init_action(
@@ -1656,8 +1666,10 @@ def getenv(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def clear_environment() -> None:
-    # first remove *all* current environment variables
-    keep = ["TERM"]
+    # first remove *all* current environment variables, except:
+    # TERM
+    # CMK_CONTAINERIZED: To better detect when running inside container (e.g. used for omd update)
+    keep = ["TERM", "CMK_CONTAINERIZED"]
     for key in os.environ:
         if key not in keep:
             del os.environ[key]
@@ -1715,53 +1727,6 @@ def hostname() -> str:
     return p.communicate()[0].strip()
 
 
-def create_apache_hook(site: SiteContext) -> None:
-    with open("/omd/apache/%s.conf" % site.name, "w") as f:
-        f.write("Include %s/etc/apache/mode.conf\n" % site.dir)
-
-
-def delete_apache_hook(sitename: str) -> None:
-    hook_path = "/omd/apache/%s.conf" % sitename
-    if not os.path.exists(hook_path):
-        return
-
-    try:
-        os.remove(hook_path)
-    except Exception as e:
-        sys.stderr.write("Cannot remove apache hook %s: %s\n" % (hook_path, e))
-
-
-def init_cmd(version_info: VersionInfo, name: str, action: str) -> str:
-    return version_info.INIT_CMD % {
-        "name": name,
-        "action": action,
-    }
-
-
-def reload_apache(version_info: VersionInfo) -> None:
-    sys.stdout.write("Reloading Apache...")
-    sys.stdout.flush()
-    show_success(subprocess.call([version_info.APACHE_CTL, "graceful"]) >> 8)
-
-
-def restart_apache(version_info: VersionInfo) -> None:
-    if (
-        os.system(  # nosec
-            init_cmd(version_info, version_info.APACHE_INIT_NAME, "status") + " >/dev/null 2>&1"
-        )
-        >> 8
-        == 0
-    ):
-        sys.stdout.write("Restarting Apache...")
-        sys.stdout.flush()
-        show_success(
-            os.system(  # nosec
-                init_cmd(version_info, version_info.APACHE_INIT_NAME, "restart") + " >/dev/null"
-            )
-            >> 8
-        )
-
-
 def replace_tags(content: bytes, replacements: Replacements) -> bytes:
     for var, value in replacements.items():
         content = content.replace(var.encode("utf-8"), value.encode("utf-8"))
@@ -1794,7 +1759,8 @@ def call_scripts(site: SiteContext, phase: str) -> None:
     if os.path.exists(path):
         putenv("OMD_ROOT", site.dir)
         putenv("OMD_SITE", site.name)
-        for f in os.listdir(path):
+        # NOTE: scripts have an order!
+        for f in sorted(os.listdir(path)):
             if f[0] == ".":
                 continue
             sys.stdout.write('Executing %s script "%s"...' % (phase, f))
@@ -2108,7 +2074,7 @@ def main_create(
         sys.stdout.write("Afterwards you can initialize the site with 'omd init'.\n")
 
 
-def welcome_message(site: SiteContext, admin_password: str) -> None:
+def welcome_message(site: SiteContext, admin_password: Password[str]) -> None:
     sys.stdout.write("Created new site %s with version %s.\n\n" % (site.name, omdlib.__version__))
     sys.stdout.write(
         "  The site can be started with %somd start %s%s.\n" % (tty.bold, site.name, tty.normal)
@@ -2120,7 +2086,7 @@ def welcome_message(site: SiteContext, admin_password: str) -> None:
     sys.stdout.write("\n")
     sys.stdout.write(
         "  The admin user for the web applications is %scmkadmin%s with password: %s%s%s\n"
-        % (tty.bold, tty.normal, tty.bold, admin_password, tty.normal)
+        % (tty.bold, tty.normal, tty.bold, admin_password.raw, tty.normal)
     )
     sys.stdout.write(
         "  For command line administration of the site, log in with %s'omd su %s'%s.\n"
@@ -2128,7 +2094,7 @@ def welcome_message(site: SiteContext, admin_password: str) -> None:
     )
     sys.stdout.write(
         "  After logging in, you can change the password for cmkadmin with "
-        "%s'htpasswd etc/htpasswd cmkadmin'%s.\n" % (tty.bold, tty.normal)
+        "%s'cmk-passwd cmkadmin'%s.\n" % (tty.bold, tty.normal)
     )
     sys.stdout.write("\n")
 
@@ -2183,7 +2149,7 @@ def init_site(
     global_opts: "GlobalOptions",
     config_settings: Config,
     options: CommandOptions,
-) -> str:
+) -> Password[str]:
     apache_reload = "apache-reload" in options
 
     # Create symbolic link to version
@@ -2252,13 +2218,11 @@ def finalize_site(
         if status:
             bail_out("Error in non-priviledged sub-process.")
 
-    # Finally reload global apache - with root permissions - and
-    # create include-hook for Apache and reload apache
-    create_apache_hook(site)
-    if apache_reload:
-        reload_apache(version_info)
-    else:
-        restart_apache(version_info)
+    # The config changes above, made with the site user, have to be also available for
+    # the root user, so load the site config again. Otherwise e.g. changed
+    # APACHE_TCP_PORT would not be recognized
+    site.load_config()
+    register_with_system_apache(version_info, site, apache_reload)
 
 
 def finalize_site_as_user(
@@ -2313,7 +2277,7 @@ def main_rm(
     # Needs to be cleaned up before removing the site directory. Otherwise a
     # parallel restart / reload of the apache may fail, because the apache hook
     # refers to a not existing site apache config.
-    delete_apache_hook(site.name)
+    unregister_from_system_apache(version_info, site, apache_reload="apache-reload" in options)
 
     if not reuse:
         remove_from_fstab(site)
@@ -2331,11 +2295,6 @@ def main_rm(
         create_site_dir(site)
         os.mkdir(site.tmp_dir)
         os.chown(site.tmp_dir, user_id(site.name), group_id(site.name))
-
-    if "apache-reload" in options:
-        reload_apache(version_info)
-    else:
-        restart_apache(version_info)
 
 
 def create_site_dir(site: SiteContext) -> None:
@@ -2362,9 +2321,7 @@ def main_disable(
     stop_if_not_stopped(site)
     unmount_tmpfs(site, kill="kill" in options)
     sys.stdout.write("Disabling Apache configuration for this site...")
-    delete_apache_hook(site.name)
-    ok()
-    restart_apache(version_info)
+    unregister_from_system_apache(version_info, site, apache_reload=False)
 
 
 def main_enable(
@@ -2379,9 +2336,25 @@ def main_enable(
         sys.stderr.write("This site is already enabled.\n")
         sys.exit(0)
     sys.stdout.write("Re-enabling Apache configuration for this site...")
-    create_apache_hook(site)
-    ok()
-    restart_apache(version_info)
+    register_with_system_apache(version_info, site, apache_reload=False)
+
+
+def main_update_apache_config(
+    version_info: VersionInfo,
+    site: SiteContext,
+    global_opts: "GlobalOptions",
+    args: Arguments,
+    options: CommandOptions,
+) -> None:
+    site.load_config()
+    if _is_apache_enabled(site):
+        register_with_system_apache(version_info, site, apache_reload=True)
+    else:
+        unregister_from_system_apache(version_info, site, apache_reload=True)
+
+
+def _is_apache_enabled(site: SiteContext) -> bool:
+    return site.conf["APACHE_MODE"] != "none"
 
 
 def _get_conflict_mode(options: CommandOptions) -> str:
@@ -2759,6 +2732,26 @@ def main_update(
     ):
         bail_out("Aborted.")
 
+    try:
+        hook_up_to_date = is_apache_hook_up_to_date(site)
+    except PermissionError:
+        # In case the hook can not be read, assume the hook needs to be updated
+        hook_up_to_date = False
+
+    if (
+        not hook_up_to_date
+        and not global_opts.force
+        and not dialog_yesno(
+            "This update requires additional actions: The system apache configuration has changed "
+            "with the new version and needs to be updated.\n\n"
+            f"You will have to execute 'omd update-apache-config {site.name}' as root user.\n\n"
+            "Please do it right after 'omd update' to prevent inconsistencies. Have a look at "
+            "#14281 for further information.\n\n"
+            "Do you want to proceed?"
+        )
+    ):
+        bail_out("Aborted.")
+
     start_logging(site.dir + "/var/log/update.log")
 
     sys.stdout.write(
@@ -2802,6 +2795,13 @@ def main_update(
         from_skelroot, conflict_mode=conflict_mode, depth_first=True, exclude_if_in=to_skelroot
     ):
         _execute_update_file(relpath, site, conflict_mode, from_version, to_version, old_perms)
+
+    if has_old_apache_hook_in_site(site):
+        # The site was not yet updated from the insecure site owned apache hook. In this situation
+        # we still need to have the referenced apache-own.conf in the site. This file must not be
+        # deployed with the skel mechanism anymore. It is removed from the site later once the site
+        # is updated to the secure hook.
+        create_old_apache_hook(site)
 
     # Change symbolic link pointing to new version
     create_version_symlink(site, to_version)
@@ -3206,19 +3206,26 @@ def main_config(
         need_start = False
 
     config_hooks = load_config_hooks(site)
+    set_hooks: list[str] = []
     if len(args) == 0:
-        config_configure(site, global_opts, config_hooks)
+        set_hooks = config_configure(site, global_opts, config_hooks)
     else:
         command = args[0]
         args = args[1:]
         if command == "show":
             config_show(site, config_hooks, args)
         elif command == "set":
-            config_set(site, config_hooks, args)
+            set_hooks = config_set(site, config_hooks, args)
         elif command == "change":
-            config_change(version_info, site, config_hooks)
+            set_hooks = config_change(version_info, site, config_hooks)
         else:
             config_usage()
+
+    if set(set_hooks).intersection({"APACHE_TCP_ADDR", "APACHE_TCP_PORT", "APACHE_MODE"}):
+        sys.stdout.write(
+            f"WARNING: You have to execute 'omd update-apache-config {site.name}' as "
+            "root to update and apply the configuration of the system apache.\n"
+        )
 
     if need_start:
         start_site(version_info, site)
@@ -4011,6 +4018,21 @@ commands.append(
 
 commands.append(
     Command(
+        command="update-apache-config",
+        only_root=True,
+        no_suid=False,
+        needs_site=1,
+        site_must_exist=1,
+        confirm=False,
+        args_text="",
+        handler=main_update_apache_config,
+        options=[],
+        description="Update the system apache config of a site (and reload apache)",
+        confirm_text="",
+    )
+)
+commands.append(
+    Command(
         command="mv",
         only_root=True,
         no_suid=False,
@@ -4515,10 +4537,6 @@ def exec_other_omd(site: SiteContext, version: str, command: str) -> NoReturn:
 
 def random_password() -> str:
     return "".join(random.choice(string.ascii_letters + string.digits) for i in range(8))
-
-
-def hash_password(password: str) -> str:
-    return sha256_crypt.hash(password)
 
 
 def ensure_mkbackup_lock_dir_rights() -> None:

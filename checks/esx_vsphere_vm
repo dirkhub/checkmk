@@ -23,7 +23,8 @@ def check_esx_vsphere_vm_mem(_no_item, params, section):
     # If the machine is powered of, we do not get data
     powerstate = section["runtime.powerState"][0]
     if powerstate != "poweredOn":
-        raise MKCounterWrapped("VM is %s, skipping this check" % powerstate)
+        yield 0, "VM is %s, skipping this check" % powerstate
+        return
 
     try:
         # consumed host memory
@@ -221,7 +222,7 @@ def check_esx_vsphere_vm_guest_tools(_no_item, params, section):
         "guestToolsCurrent": (0, "VMware Tools are installed and the version is current"),
         "guestToolsNeedUpgrade": (1, "VMware Tools are installed, but the version is not current"),
         "guestToolsNotInstalled": (2, "VMware Tools are not installed"),
-        "guestToolsUnmanaged": (0, "VMware Tools are installed, but are not managed by VMWare"),
+        "guestToolsUnmanaged": (0, "VMware Tools are installed, but are not managed by VMware"),
     }
     state, info = guest_tools_map.get(vm_status, (3, "Unknown status for VMware Tools"))
 
@@ -279,7 +280,7 @@ def check_esx_vsphere_vm_hb_status(_no_item, params, section):
         else:
             state = vm_heartbeat_map.get(vm_status)[0]
         if vm_status == "gray":
-            return state, "No VMWare Tools installed, outdated or not running"
+            return state, "No VMware Tools installed, outdated or not running"
         return state, "Heartbeat status is %s" % vm_status
     else:
         return 3, "Unknown heartbeat status %s" % vm_status

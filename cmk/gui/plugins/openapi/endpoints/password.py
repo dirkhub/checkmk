@@ -10,21 +10,22 @@ password store. You can use in a rule a password stored in the password store wi
 entering the password.
 """
 
-import json
 from typing import cast
 
 from cmk.utils import version
 
+from cmk.gui.globals import user
 from cmk.gui.http import Response
 from cmk.gui.plugins.openapi.endpoints.utils import complement_customer, update_customer_info
 from cmk.gui.plugins.openapi.restful_objects import (
     constructors,
     Endpoint,
+    permissions,
     request_schemas,
     response_schemas,
 )
 from cmk.gui.plugins.openapi.restful_objects.parameters import NAME_FIELD
-from cmk.gui.plugins.openapi.utils import problem
+from cmk.gui.plugins.openapi.utils import problem, serve_json
 from cmk.gui.watolib.passwords import (
     load_password,
     load_password_to_modify,
@@ -32,6 +33,21 @@ from cmk.gui.watolib.passwords import (
     Password,
     remove_password,
     save_password,
+)
+
+PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.passwords"),
+        permissions.Optional(permissions.Perm("wato.edit_all_passwords")),
+    ]
+)
+
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        permissions.Perm("wato.passwords"),
+        permissions.Optional(permissions.Perm("wato.edit_all_passwords")),
+    ]
 )
 
 
@@ -42,9 +58,12 @@ from cmk.gui.watolib.passwords import (
     request_schema=request_schemas.InputPassword,
     etag="output",
     response_schema=response_schemas.PasswordObject,
+    permissions_required=RW_PERMISSIONS,
 )
 def create_password(params):
     """Create a password"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.passwords")
     body = params["body"]
     ident = body["ident"]
     password_details = cast(
@@ -75,18 +94,21 @@ def create_password(params):
     request_schema=request_schemas.UpdatePassword,
     etag="both",
     response_schema=response_schemas.PasswordObject,
+    permissions_required=RW_PERMISSIONS,
 )
 def update_password(params):
     """Update a password"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.passwords")
     body = params["body"]
     ident = params["name"]
     try:
         password_details = load_password_to_modify(ident)
     except KeyError:
         return problem(
-            404,
-            f'Password "{ident}" is not known.',
-            "The password you asked for is not known. Please check for eventual misspellings.",
+            status=404,
+            title=f'Password "{ident}" is not known.',
+            detail="The password you asked for is not known. Please check for eventual misspellings.",
         )
     password_details.update(body)
     save_password(ident, password_details)
@@ -99,15 +121,18 @@ def update_password(params):
     method="delete",
     path_params=[NAME_FIELD],
     output_empty=True,
+    permissions_required=RW_PERMISSIONS,
 )
 def delete_password(params):
     """Delete a password"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.passwords")
     ident = params["name"]
     if ident not in load_passwords():
         return problem(
-            404,
-            f'Password "{ident}" is not known.',
-            "The password you asked for is not known. Please check for eventual misspellings.",
+            status=404,
+            title='Password "{ident}" is not known.',
+            detail="The password you asked for is not known. Please check for eventual misspellings.",
         )
     remove_password(ident)
     return Response(status=204)
@@ -119,16 +144,18 @@ def delete_password(params):
     method="get",
     path_params=[NAME_FIELD],
     response_schema=response_schemas.PasswordObject,
+    permissions_required=PERMISSIONS,
 )
 def show_password(params):
     """Show a password"""
+    user.need_permission("wato.passwords")
     ident = params["name"]
     passwords = load_passwords()
     if ident not in passwords:
         return problem(
-            404,
-            f'Password "{ident}" is not known.',
-            "The password you asked for is not known. Please check for eventual misspellings.",
+            status=404,
+            title=f'Password "{ident}" is not known.',
+            detail="The password you asked for is not known. Please check for eventual misspellings.",
         )
     password_details = passwords[ident]
     return _serve_password(ident, password_details)
@@ -139,9 +166,11 @@ def show_password(params):
     ".../collection",
     method="get",
     response_schema=response_schemas.DomainObjectCollection,
+    permissions_required=PERMISSIONS,
 )
 def list_passwords(params):
     """Show all passwords"""
+    user.need_permission("wato.passwords")
     password_collection = {
         "id": "password",
         "domainType": "password",
@@ -155,13 +184,11 @@ def list_passwords(params):
         ],
         "links": [constructors.link_rel("self", constructors.collection_href("password"))],
     }
-    return constructors.serve_json(password_collection)
+    return serve_json(password_collection)
 
 
 def _serve_password(ident, password_details):
-    response = Response()
-    response.set_data(json.dumps(serialize_password(ident, complement_customer(password_details))))
-    response.set_content_type("application/json")
+    response = serve_json(serialize_password(ident, complement_customer(password_details)))
     response.headers.add("ETag", constructors.etag_of_dict(password_details).to_header())
     return response
 

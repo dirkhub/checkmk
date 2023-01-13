@@ -57,18 +57,18 @@ setversion:
 	    check_mk_agent.openwrt \
 	    check_mk_agent.solaris
 	sed -i "s/^#define CMK_WIN_AGENT_VERSION .*/#define CMK_WIN_AGENT_VERSION \"$(NEW_VERSION)\"/" wnx/src/common/wnx_version.h
+	sed -i 's/pub const VERSION: &str = "[^"]*";/pub const VERSION: \&str = "$(NEW_VERSION)";/' cmk-agent-ctl/src/constants.rs
 
 build: $(DEB_PACKAGE) $(RPM_PACKAGE) $(WIN_PACKAGE) controller
 
 controller:
 	rm -f linux/cmk-agent-ctl
+	rm -f linux/cmk-agent-ctl.gz
 	(cd cmk-agent-ctl; ../../scripts/run-cargo-command build --release) \
 	&& mkdir -p linux \
 	&& cp cmk-agent-ctl/target/x86_64-unknown-linux-musl/release/cmk-agent-ctl linux \
 	&& strip linux/cmk-agent-ctl ; \
-	which upx >/dev/null 2>&1 \
-	&& upx linux/cmk-agent-ctl \
-	|| true
+	gzip --best --keep --force linux/cmk-agent-ctl
 
 packages: $(DEB_PACKAGE) $(RPM_PACKAGE)
 
@@ -84,10 +84,8 @@ $(RPM_PACKAGE): controller waitmax
 	mkdir -p "$(RPM_BUILDROOT)/etc/check_mk"
 	install -m 644 "conffiles/super-server.cfg" "$(RPM_BUILDROOT)/etc/check_mk/super-server.cfg"
 	mkdir -p "$(RPM_BUILDROOT)/usr/bin"
-	mkdir -p "$(RPM_BUILDROOT)/var/lib/cmk-agent"
 	install -m 755 check_mk_agent.linux "$(RPM_BUILDROOT)/usr/bin/check_mk_agent"
 	install -m 755 check_mk_caching_agent.linux "$(RPM_BUILDROOT)/usr/bin/check_mk_caching_agent"
-	install -m 755 linux/cmk-agent-ctl "$(RPM_BUILDROOT)/usr/bin/cmk-agent-ctl"
 	install -m 755 mk-job "$(RPM_BUILDROOT)/usr/bin/mk-job"
 	install -m 755 waitmax "$(RPM_BUILDROOT)/usr/bin/waitmax"
 	mkdir -p "$(RPM_BUILDROOT)/usr/lib/check_mk_agent/local"
@@ -95,6 +93,8 @@ $(RPM_PACKAGE): controller waitmax
 	mkdir -p "$(RPM_BUILDROOT)/var/lib/check_mk_agent/cache"
 	mkdir -p "$(RPM_BUILDROOT)/var/lib/check_mk_agent/job"
 	mkdir -p "$(RPM_BUILDROOT)/var/lib/check_mk_agent/spool"
+	mkdir -p "$(RPM_BUILDROOT)/var/lib/cmk-agent"
+	install -m 640 linux/cmk-agent-ctl.gz "$(RPM_BUILDROOT)/var/lib/cmk-agent/cmk-agent-ctl.gz"
 	cp -r scripts "$(RPM_BUILDROOT)/var/lib/cmk-agent"
 	mv "$(RPM_BUILDROOT)/var/lib/cmk-agent/scripts/super-server/1_xinetd/check-mk-agent" "$(RPM_BUILDROOT)/etc/check_mk/xinetd-service-template.cfg"
 	# use this build root, and build
@@ -132,7 +132,7 @@ $(DEB_PACKAGE): $(RPM_PACKAGE)
 	sed -i -e '/^Depends:/d' \
 	       -e 's/^Version:.*/Version: $(VERSION)-1/' \
 	       -e 's/^Maintainer:.*/Maintainer: feedback@checkmk.com/' ctrl/control && \
-	tar czf control.tar.gz $(TAROPTS) -C ctrl . && \
+	tar czf control.tar.gz $(TAROPTS) --group=0 --owner=0 -C ctrl . && \
 	xz --decompress data.tar.xz && \
 	gzip data.tar && \
 	ar r ../$(DEB_PACKAGE) debian-binary control.tar.gz data.tar.gz

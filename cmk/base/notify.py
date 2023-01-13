@@ -25,6 +25,7 @@ import sys
 import time
 import traceback
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Any,
@@ -51,17 +52,22 @@ from cmk.utils.exceptions import MKGeneralException
 from cmk.utils.log import console
 from cmk.utils.macros import replace_macros_in_str
 from cmk.utils.notify import (
+    create_spoolfile,
     ensure_utf8,
     find_wato_folder,
     notification_message,
     notification_result_message,
     NotificationContext,
+    NotificationForward,
     NotificationPluginName,
     NotificationResultCode,
+    NotificationViaPlainMail,
+    NotificationViaPlugin,
 )
 from cmk.utils.regex import regex
 from cmk.utils.timeout import MKTimeout, Timeout
 from cmk.utils.type_defs import (
+    ContactgroupName,
     ContactName,
     EventRule,
     NotifyAnalysisInfo,
@@ -336,7 +342,11 @@ def notify_notify(raw_context: EventContext, analyse: bool = False) -> Optional[
 
     # Spool notification to remote host, if this is enabled
     if config.notification_spooling in ("remote", "both"):
-        create_spoolfile({"context": raw_context, "forward": True})
+        create_spoolfile(
+            logger,
+            Path(notification_spooldir),
+            NotificationForward({"context": raw_context, "forward": True}),
+        )
 
     if config.notification_spooling != "remote":
         return locally_deliver_raw_context(raw_context, analyse=analyse)
@@ -676,7 +686,11 @@ def _process_notifications(
                     if bulk:
                         do_bulk_notify(plugin_name, params, context, bulk)
                     elif config.notification_spooling in ("local", "both"):
-                        create_spoolfile({"context": context, "plugin": plugin_name})
+                        create_spoolfile(
+                            logger,
+                            Path(notification_spooldir),
+                            NotificationViaPlugin({"context": context, "plugin": plugin_name}),
+                        )
                     else:
                         call_notification_script(plugin_name, context)
 
@@ -1234,28 +1248,27 @@ def rbn_all_contacts(with_email: bool = False) -> List[ContactId]:
     return [contact_id for (contact_id, contact) in config.contacts.items() if contact.get("email")]
 
 
+@lru_cache()
+def _contactgroup_members() -> Mapping[ContactgroupName, Set[ContactName]]:
+    """Get the members of all contact groups
+
+    Is computed once  for the process lifetime since it's either a short lived process or in case of
+    the Microcore notify helper, it is restarted once a new configuration is applied to the core.
+    """
+    members: Dict[ContactgroupName, Set[ContactName]] = {}
+    for name, contact in config.contacts.items():
+        for group_name in contact.get("contactgroups", []):
+            members.setdefault(group_name, set()).add(name)
+    return members
+
+
 def rbn_groups_contacts(groups: List[str]) -> Set[str]:
+    """Return all members of the given groups"""
     if not groups:
-        return set()
+        return set()  # optimization only
 
-    query = "GET contactgroups\nColumns: members\n"
-    for group in groups:
-        query += "Filter: name = %s\n" % group
-    query += "Or: %d\n" % len(groups)
-
-    try:
-        contacts: Set[ContactName] = set()
-        for contact_list in livestatus.LocalConnection().query_column(query):
-            contacts.update(contact_list)
-        return contacts
-
-    except livestatus.MKLivestatusNotFoundError:
-        return set()
-
-    except Exception:
-        if cmk.utils.debug.enabled():
-            raise
-        return set()
+    members = _contactgroup_members()
+    return set(m for group in groups for m in members.get(group, []))
 
 
 def rbn_emails_contacts(emails: List[str]) -> List[str]:
@@ -1292,7 +1305,11 @@ def notify_flexible(raw_context: EventContext, notification_table: NotificationT
         plugin_context = create_plugin_context(raw_context, parameters)
 
         if config.notification_spooling in ("local", "both"):
-            create_spoolfile({"context": plugin_context, "plugin": plugin_name})
+            create_spoolfile(
+                logger,
+                Path(notification_spooldir),
+                NotificationViaPlugin({"context": plugin_context, "plugin": plugin_name}),
+            )
         else:
             call_notification_script(plugin_name, plugin_context)
 
@@ -1485,7 +1502,11 @@ def notify_plain_email(raw_context: EventContext) -> None:
     plugin_context = create_plugin_context(raw_context, [])
 
     if config.notification_spooling in ("local", "both"):
-        create_spoolfile({"context": plugin_context, "plugin": None})
+        create_spoolfile(
+            logger,
+            Path(notification_spooldir),
+            NotificationViaPlainMail({"context": plugin_context, "plugin": None}),
+        )
     else:
         logger.info("Sending plain email to %s", plugin_context["CONTACTNAME"])
         notify_via_email(plugin_context)
@@ -1603,7 +1624,9 @@ def path_to_notification_script(plugin_name: NotificationPluginNameStr) -> Optio
 #
 # Note: this function is *not* being called for bulk notification.
 def call_notification_script(
-    plugin_name: NotificationPluginNameStr, plugin_context: PluginContext
+    plugin_name: NotificationPluginNameStr,
+    plugin_context: PluginContext,
+    is_spoolfile: bool = False,
 ) -> int:
     _log_to_history(
         notification_message(
@@ -1662,14 +1685,17 @@ def call_notification_script(
     if exitcode := 1 if timeout_guard.signaled else p.returncode:
         plugin_log("Plugin exited with code %d" % exitcode)
 
-    _log_to_history(
-        notification_result_message(
-            NotificationPluginName(plugin_name),
-            NotificationContext(plugin_context),
-            NotificationResultCode(exitcode),
-            output_lines,
+    # Result is already logged to history for spoolfiles by
+    # mknotifyd.spool_handler
+    if not is_spoolfile:
+        _log_to_history(
+            notification_result_message(
+                NotificationPluginName(plugin_name),
+                NotificationContext(plugin_context),
+                NotificationResultCode(exitcode),
+                output_lines,
+            )
         )
-    )
 
     return exitcode
 
@@ -1716,14 +1742,6 @@ def notification_script_env(plugin_context: PluginContext) -> PluginContext:
 #   '----------------------------------------------------------------------'
 
 
-def create_spoolfile(data: Any) -> None:
-    if not os.path.exists(notification_spooldir):
-        os.makedirs(notification_spooldir)
-    file_path = "%s/%s" % (notification_spooldir, fresh_uuid())
-    logger.info("Creating spoolfile: %s", file_path)
-    store.save_object_to_file(file_path, data, pretty=True)
-
-
 # There are three types of spool files:
 # 1. Notifications to be forwarded. Contain key "forward"
 # 2. Notifications for async local delivery. Contain key "plugin"
@@ -1732,8 +1750,13 @@ def create_spoolfile(data: Any) -> None:
 def handle_spoolfile(spoolfile: str) -> int:
     notif_uuid = spoolfile.rsplit("/", 1)[-1]
     logger.info("----------------------------------------------------------------------")
+    data = None
     try:
-        data = store.load_object_from_file(spoolfile, default={})
+        data = store.load_object_from_file(spoolfile, default={}, lock=True)
+        if not data:
+            logger.warning("Skipping empty spool file %s", notif_uuid[:8])
+            return 2
+
         if "plugin" in data:
             plugin_context = data["context"]
             plugin_name = data["plugin"]
@@ -1743,7 +1766,11 @@ def handle_spoolfile(spoolfile: str) -> int:
                 events.find_host_service_in_context(plugin_context),
                 (plugin_name or "plain mail"),
             )
-            return call_notification_script(plugin_name, plugin_context)
+            return call_notification_script(
+                plugin_name=plugin_name,
+                plugin_context=plugin_context,
+                is_spoolfile=True,
+            )
 
         # We received a forwarded raw notification. We need to process
         # this with our local notification rules in order to call one,
@@ -1760,7 +1787,8 @@ def handle_spoolfile(spoolfile: str) -> int:
         return 0  # No error handling for async delivery
 
     except Exception:
-        logger.exception("ERROR:")
+        logger.exception("ERROR while processing %s:", spoolfile)
+        logger.error("Content: %r", data)
         return 2
 
 
@@ -2296,27 +2324,20 @@ def dead_nagios_variable(value: str) -> bool:
     return True
 
 
-def fresh_uuid() -> str:
-    try:
-        return open("/proc/sys/kernel/random/uuid").read().strip()
-    except IOError:
-        # On platforms where the above file does not exist we try to
-        # use the python uuid module which seems to be a good fallback
-        # for those systems. Well, if got python < 2.5 you are lost for now.
-        return str(uuid.uuid4())
-
-
-# TODO: Copy'n paste: enterprise/cmk/cee/mknotifyd/main.py, cmk/base/notify.py
+# TODO: Copy'n paste: enterprise/cmk/cee/mknotifyd/utils.py, cmk/base/notify.py
 def _log_to_history(message: str) -> None:
     _livestatus_cmd("LOG;%s" % message)
 
 
-# TODO: Copy'n paste: enterprise/cmk/cee/mknotifyd/main.py, cmk/base/notify.py
+# TODO: Copy'n paste: enterprise/cmk/cee/mknotifyd/utils.py, cmk/base/notify.py
 def _livestatus_cmd(command: str) -> None:
+    timeout = 2
     try:
-        livestatus.LocalConnection().command("[%d] %s" % (time.time(), command))
+        connection = livestatus.LocalConnection()
+        connection.set_timeout(timeout)
+        connection.command("[%d] %s" % (time.time(), command))
     except Exception as e:
         if cmk.utils.debug.enabled():
             raise
-        logger.info("WARNING: cannot send livestatus command: %s", e)
+        logger.info("WARNING: cannot send livestatus command (Timeout: %d sec): %s", timeout, e)
         logger.info("Command was: %s", command)

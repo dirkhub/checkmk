@@ -5,7 +5,6 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 import contextlib
 import hashlib
-import json
 import re
 from http import HTTPStatus
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -14,22 +13,20 @@ from urllib.parse import quote
 from werkzeug.datastructures import ETags
 
 from cmk.utils.site import omd_site
+from cmk.utils.type_defs import HTTPMethod
 
 from cmk.gui.globals import config, request
-from cmk.gui.http import Response
 from cmk.gui.plugins.openapi.restful_objects.endpoint_registry import ENDPOINT_REGISTRY
 from cmk.gui.plugins.openapi.restful_objects.type_defs import (
     CollectionItem,
     CollectionObject,
     DomainObject,
     DomainType,
-    HTTPMethod,
     LinkRelation,
     LinkType,
     ObjectProperty,
     PropertyFormat,
     ResultType,
-    Serializable,
 )
 from cmk.gui.plugins.openapi.utils import ProblemException
 
@@ -60,8 +57,7 @@ def absolute_url(href):
 
     Examples:
 
-
-        This function has to be used within an request context.
+        This function has to be used within a request context.
 
         >>> with _request_context(secure=False):
         ...     absolute_url("objects/host_config/example.com")
@@ -75,6 +71,7 @@ def absolute_url(href):
         href:
 
     Returns:
+        An absolute URL.
 
     """
     if href.startswith("/"):
@@ -879,16 +876,6 @@ def collection_item(
         method="get",
         title=title,
     )
-
-
-def serve_json(data: Serializable, profile: Optional[Dict[str, str]] = None) -> Response:
-    content_type = "application/json"
-    if profile is not None:
-        content_type += ';profile="%s"' % (profile,)
-    response = Response()
-    response.set_content_type(content_type)
-    response.set_data(json.dumps(data))
-    return response
 
 
 def action_parameter(action, parameter, friendly_name, optional, pattern):

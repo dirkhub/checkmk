@@ -4,16 +4,16 @@
 # conditions defined in the file COPYING, which is part of this source code package.
 
 import os
+import shlex
 import struct
 import subprocess
 import threading
 import time
 from logging import Logger
 from pathlib import Path
-from typing import Any, AnyStr, Iterable, Optional, Union
+from typing import Any, AnyStr, Callable, Iterable, Optional, Sequence, Union
 
 from cmk.utils.log import VERBOSE
-from cmk.utils.misc import quote_shell_string
 from cmk.utils.render import date_and_time
 
 from .config import Config
@@ -436,54 +436,60 @@ def _expire_logfiles(
             logger.exception("Error expiring log files: %s" % e)
 
 
+# Please note: Keep this in sync with livestatus/src/TableEventConsole.cc.
+_GREPABLE_COLUMNS = {
+    "event_id",
+    "event_text",
+    "event_comment",
+    "event_host",
+    "event_contact",
+    "event_application",
+    "event_rule_id",
+    "event_owner",
+    "event_ipaddress",
+    "event_core_host",
+}
+
+
+# Optimization: use grep in order to reduce amount of read lines based on some frequently used
+# filters. It's OK if the filters don't match 100% accurately on the right lines. If in doubt, you
+# can output more lines than necessary. This is only a kind of prefiltering.
+def _grep_pipeline(filters: list[tuple[str, str, Callable, Any]]) -> list[str]:
+    return [
+        command
+        for column_name, operator_name, _predicate, argument in filters
+        if column_name in _GREPABLE_COLUMNS
+        for command in [_grep_command(operator_name, argument)]
+        if command is not None
+    ]
+
+
+def _grep_command(operator_name: str, argument: Any) -> Optional[str]:
+    if operator_name == "=":
+        return f"grep -F {_grep_pattern(argument)}"
+    if operator_name == "=~":
+        return f"grep -F -i {_grep_pattern(argument)}"
+    if operator_name == "~":
+        return f"grep -E {_grep_pattern(argument)}"
+    if operator_name == "~~":
+        return f"grep -E -i {_grep_pattern(argument)}"
+    return None
+
+
+def _grep_pattern(argument: Any) -> str:
+    return f"-e {shlex.quote(str(argument))}"
+
+
 def _get_files(history: History, logger: Logger, query: QueryGET) -> Iterable[Any]:
-    filters, limit = query.filters, query.limit
-    history_entries: list[Any] = []
     if not history._settings.paths.history_dir.value.exists():
         return []
 
+    filters = query.filters
     logger.debug("Filters: %r", filters)
+    limit = query.limit
     logger.debug("Limit: %r", limit)
 
-    # Be aware: The order here is important. It must match the order of the fields
-    # in the history file entries (See get_event_history_from_file). The fields in
-    # the file are currectly in the same order as StatusTableHistory.columns.
-    #
-    # Please note: Keep this in sync with livestatus/src/TableEventConsole.cc.
-    grepping_filters = [
-        "event_id",
-        "event_text",
-        "event_comment",
-        "event_host",
-        "event_host_regex",
-        "event_contact",
-        "event_application",
-        "event_rule_id",
-        "event_owner",
-        "event_ipaddress",
-        "event_core_host",
-    ]
-
-    # Optimization: use grep in order to reduce amount of read lines based on
-    # some frequently used filters.
-    #
-    # It's ok if the filters don't match 100% accurately on the right lines. If in
-    # doubt, you can output more lines than necessary. This is only a kind of
-    # prefiltering.
-    grep_pairs: list[tuple[int, str]] = []
-    for column_name, operator_name, _predicate, argument in filters:
-        # Make sure that the greptexts are in the same order as in the
-        # actual logfiles. They will be joined with ".*"!
-        try:
-            nr = grepping_filters.index(column_name)
-            if operator_name in ["=", "~~"]:
-                grep_pairs.append((nr, str(argument)))
-        except Exception:
-            pass
-
-    grep_pairs.sort()
-    greptexts = [x[1] for x in grep_pairs]
-    logger.debug("Texts for grep: %r", greptexts)
+    grep_pipeline = _grep_pipeline(filters)
 
     time_filters = [
         (operator_name, argument)
@@ -509,18 +515,23 @@ def _get_files(history: History, logger: Logger, query: QueryGET) -> Iterable[An
     # already be done by the GUI, so we don't do that twice. Skipping
     # this # will lead into some lines of a single file to be limited in
     # wrong order. But this should be better than before.
+    history_entries: list[Any] = []
     for path in sorted(history._settings.paths.history_dir.value.glob("*.log"), reverse=True):
         if limit is not None and limit <= 0:
             logger.debug("query limit reached")
             break
-        if _intersects(time_range, _get_logfile_timespan(path)):
-            logger.debug("parsing history file %s", path)
-            new_entries = _parse_history_file(history, path, query, greptexts, limit, logger)
-            history_entries += new_entries
-            if limit is not None:
-                limit -= len(new_entries)
-        else:
+        if not _intersects(time_range, _get_logfile_timespan(path)):
             logger.debug("skipping history file %s because of time filters", path)
+            continue
+        tac = f"nl -b a {shlex.quote(str(path))} | tac"  # Process younger lines first
+        cmd = " | ".join([tac] + grep_pipeline)
+        logger.debug("preprocessing history file with command [%s]", cmd)
+        new_entries = parse_history_file(
+            history._history_columns, path, query.filter_row, cmd, limit, logger
+        )
+        history_entries += new_entries
+        if limit is not None:
+            limit -= len(new_entries)
     return history_entries
 
 
@@ -534,7 +545,7 @@ def _greatest_lower_bound_for_filters(filters: Iterable[tuple[str, float]]) -> O
 
 
 def _greatest_lower_bound_for_filter(operator: str, value: float) -> Optional[float]:
-    if operator in ("==", ">="):
+    if operator in ("=", ">="):
         return value
     if operator == ">":
         return value + 1
@@ -551,7 +562,7 @@ def _least_upper_bound_for_filters(filters: Iterable[tuple[str, float]]) -> Opti
 
 
 def _least_upper_bound_for_filter(operator: str, value: float) -> Optional[float]:
-    if operator in ("==", "<="):
+    if operator in ("=", "<="):
         return value
     if operator == "<":
         return value - 1
@@ -567,22 +578,15 @@ def _intersects(
     return (lo2 is None or hi1 is None or lo2 <= hi1) and (lo1 is None or hi2 is None or lo1 <= hi2)
 
 
-def _parse_history_file(
-    history: History,
+def parse_history_file(
+    history_columns: Sequence[tuple[str, Any]],
     path: Path,
-    query: Any,
-    greptexts: list[str],
+    filter_row: Callable[[Sequence[Any]], bool],
+    cmd: str,
     limit: Optional[int],
     logger: Logger,
 ) -> list[Any]:
     entries: list[Any] = []
-    line_no = 0
-    # If we have greptexts we pre-filter the file using the extremely
-    # fast GNU Grep
-    # Revert lines from the log file to have the newer lines processed first
-    cmd = "tac %s" % quote_shell_string(str(path))
-    if greptexts:
-        cmd += " | egrep -i -e %s" % quote_shell_string(".*".join(greptexts))
     with subprocess.Popen(
         cmd,
         shell=True,  # nosec
@@ -593,59 +597,57 @@ def _parse_history_file(
             raise Exception("Huh? stdout vanished...")
 
         for line in grep.stdout:
-            line_no += 1
             if limit is not None and len(entries) > limit:
-                grep.kill()
                 break
-
             try:
                 parts: list[Any] = line.decode("utf-8").rstrip("\n").split("\t")
-                _convert_history_line(history, parts)
-                values = [line_no] + parts
-                if query.filter_row(values):
-                    entries.append(values)
+                convert_history_line(history_columns, parts)
+                if filter_row(parts):
+                    entries.append(parts)
             except Exception as e:
                 logger.exception(f"Invalid line '{line!r}' in history file {path}: {e}")
 
     return entries
 
 
-# Speed-critical function for converting string representation
-# of log line back to Python values
-def _convert_history_line(history: History, values: list[Any]) -> None:
-    # NOTE: history_line column is missing here, so indices are off by 1! :-P
-    values[0] = float(values[0])  # history_time
-    values[4] = int(values[4])  # event_id
-    values[5] = int(values[5])  # event_count
-    values[7] = float(values[7])  # event_first
-    values[8] = float(values[8])  # event_last
-    values[10] = int(values[10])  # event_sl
-    values[14] = int(values[14])  # event_pid
-    values[15] = int(values[15])  # event_priority
-    values[16] = int(values[16])  # event_facility
-    values[18] = int(values[18])  # event_state
-    values[21] = _unsplit(values[21])  # event_match_groups
+def convert_history_line(history_columns: Sequence[tuple[str, Any]], values: list[Any]) -> None:
+    """
+    Speed-critical function for converting string representation
+    of log line back to Python values.
+    """
+    values[0] = int(values[0])  # history_line
+    values[1] = float(values[1])  # history_time
+    values[5] = int(values[5])  # event_id
+    values[6] = int(values[6])  # event_count
+    values[8] = float(values[8])  # event_first
+    values[9] = float(values[9])  # event_last
+    values[11] = int(values[11])  # event_sl
+    values[15] = int(values[15])  # event_pid
+    values[16] = int(values[16])  # event_priority
+    values[17] = int(values[17])  # event_facility
+    values[19] = int(values[19])  # event_state
+    values[22] = _unsplit(values[22])  # event_match_groups
     num_values = len(values)
-    if num_values <= 22:  # event_contact_groups
+    if num_values <= 23:  # event_contact_groups
         values.append(None)
     else:
-        values[22] = _unsplit(values[22])
-    if num_values <= 23:  # event_ipaddress
-        values.append(history._history_columns[24][1])
-    if num_values <= 24:  # event_orig_host
-        values.append(history._history_columns[25][1])
-    if num_values <= 25:  # event_contact_groups_precedence
-        values.append(history._history_columns[26][1])
-    if num_values <= 26:  # event_core_host
-        values.append(history._history_columns[27][1])
-    if num_values <= 27:  # event_host_in_downtime
-        values.append(history._history_columns[28][1])
+        values[23] = _unsplit(values[23])
+    if num_values <= 24:  # event_ipaddress
+        values.append(history_columns[25][1])
+    if num_values <= 25:  # event_orig_host
+        values.append(history_columns[26][1])
+    if num_values <= 26:  # event_contact_groups_precedence
+        values.append(history_columns[27][1])
+    if num_values <= 27:  # event_core_host
+        values.append(history_columns[28][1])
+    if num_values <= 28:  # event_host_in_downtime
+        values.append(history_columns[29][1])
     else:
-        values[27] = values[27] == "1"
-    if num_values <= 28:  # event_match_groups_syslog_application
-        values.append(history._history_columns[29][1])
+        values[28] = values[28] == "1"
+    if num_values <= 29:  # event_match_groups_syslog_application
+        values.append(history_columns[30][1])
     else:
-        values[28] = _unsplit(values[28])
+        values[29] = _unsplit(values[29])
 
 
 def _unsplit(s: Any) -> Any:

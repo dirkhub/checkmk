@@ -2,13 +2,12 @@
 // This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 // conditions defined in the file COPYING, which is part of this source code package.
 
-/* Disable data-ajax per default, as it makes problems in most
-   of our cases */
+import * as forms from "forms";
 
 // NOTE: We use an up-to-date version of jQuery from the package-lock.json together
 // with a patched version of jQuery mobile to make it compatible with jQuery:
 // https://github.com/jquery/jquery-mobile/issues/8662#issuecomment-687738965
-var $ = require("script-loader!jquery");
+require("script-loader!jquery");
 require("script-loader!../jquery/jquery.mobile-1.4.5.min.js");
 
 // Optional import is currently not possible using the ES6 imports
@@ -19,6 +18,8 @@ try {
     graphs = null;
 }
 
+/* Disable data-ajax per default, as it makes problems in most
+   of our cases */
 $(document).ready(function () {
     $("a").attr("data-ajax", "false");
     $("form").attr("data-ajax", "false");
@@ -29,8 +30,8 @@ $(document).ready(function () {
 });
 
 $(document).bind("mobileinit", function () {
-    $.mobile.ajaxEnabled = false;
-    $.mobile.hashListeningEnabled = false;
+    $["mobile"].ajaxEnabled = false;
+    $["mobile"].hashListeningEnabled = false;
 });
 
 // Never allow the mobile page to be opened in an iframe. Redirect top page to the current content page.
@@ -40,14 +41,15 @@ if (top != self) {
 }
 
 $(document).ready(function () {
-    $("a").click(function (event) {
+    $("a:not(.results_button)").click(function (event) {
         event.preventDefault();
-        window.location = $(this).attr("href");
+        window.location.href = $(this).attr("href") as string;
     });
 });
 
 export const cmk_export = {
     cmk: {
+        forms: forms,
         graphs: graphs,
     },
 };

@@ -8,7 +8,7 @@
 import re
 from typing import Iterable, List, Optional, Type
 
-from cmk.utils.type_defs import CheckPluginNameStr, HostName, Item, ServiceName
+from cmk.utils.type_defs import CheckPluginNameStr, HostName, Item, Labels, ServiceName
 
 # Tolerate this for 1.6. Should be cleaned up in future versions,
 # e.g. by trying to move the common code to a common place
@@ -33,6 +33,7 @@ from cmk.gui.table import table_element
 from cmk.gui.utils.escaping import escape_to_html
 from cmk.gui.utils.urls import makeuri_contextless
 from cmk.gui.wato.pages.rulesets import ModeEditRuleset
+from cmk.gui.watolib.check_mk_automations import analyse_service
 from cmk.gui.watolib.search import (
     ABCMatchItemGenerator,
     match_item_generator_registry,
@@ -202,6 +203,17 @@ class ModePatternEditor(WatoMode):
         # Loop all rules for this ruleset
         already_matched = False
         abs_rulenr = 0
+        service_labels: Labels = {}
+        if self._hostname:
+            service_desc = self._get_service_description(self._hostname, "logwatch", self._item)
+            host = watolib.Folder.current().host(self._hostname)
+            if not host:
+                raise MKUserError("host", _("The given host does not exist"))
+            service_labels = analyse_service(
+                host.site_id(),
+                self._hostname,
+                service_desc,
+            ).service_info.get("labels", {})
         for folder, rulenr, rule in ruleset.get_rules():
             # Check if this rule applies to the given host/service
             if self._hostname:
@@ -209,7 +221,11 @@ class ModePatternEditor(WatoMode):
 
                 # If hostname (and maybe filename) try match it
                 rule_matches = rule.matches_host_and_item(
-                    watolib.Folder.current(), self._hostname, self._item, service_desc
+                    watolib.Folder.current(),
+                    self._hostname,
+                    self._item,
+                    service_desc,
+                    service_labels=service_labels,
                 )
             else:
                 # If no host/file given match all rules

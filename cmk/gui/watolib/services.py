@@ -11,10 +11,24 @@ import os
 import sys
 import time
 from hashlib import sha256
-from typing import Any, Iterable, List, NamedTuple, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+)
+
+from mypy_extensions import NamedArg
 
 import cmk.utils.rulesets.ruleset_matcher as ruleset_matcher
-from cmk.utils.type_defs import HostOrServiceConditions, SetAutochecksTable
+from cmk.utils.type_defs import HostOrServiceConditions, Item, SetAutochecksTable
 
 from cmk.automations.results import CheckPreviewEntry, TryDiscoveryResult
 
@@ -23,11 +37,17 @@ import cmk.gui.watolib as watolib
 from cmk.gui.background_job import BackgroundProcessInterface, JobStatusStates
 from cmk.gui.globals import config, user
 from cmk.gui.i18n import _
-from cmk.gui.sites import get_site_config, site_is_local, SiteStatus, states
+from cmk.gui.sites import get_site_config, site_is_local
+from cmk.gui.watolib import CREHost
 from cmk.gui.watolib.automations import sync_changes_before_remote_automation
-from cmk.gui.watolib.check_mk_automations import discovery, set_autochecks, try_discovery
+from cmk.gui.watolib.check_mk_automations import (
+    discovery,
+    get_services_labels,
+    set_autochecks,
+    try_discovery,
+    update_host_labels,
+)
 from cmk.gui.watolib.rulesets import RuleConditions, service_description_to_condition
-from cmk.gui.watolib.utils import is_pre_17_remote_site
 from cmk.gui.watolib.wato_background_job import WatoBackgroundJob
 
 
@@ -135,14 +155,27 @@ class StartDiscoveryRequest(NamedTuple):
     options: DiscoveryOptions
 
 
+class DiscoveryInfo(TypedDict):
+    update_source: Optional[str]
+    update_target: Optional[str]
+    update_services: Sequence[str]
+
+
 class Discovery:
-    def __init__(self, host, discovery_options, api_request):
+    def __init__(
+        self,
+        host,
+        discovery_options,
+        update_target: Optional[str],
+        update_services: List[str],
+        update_source: Optional[str] = None,
+    ) -> None:
         self._host = host
         self._options = discovery_options
-        self._discovery_info = {
-            "update_source": api_request.get("update_source"),
-            "update_target": api_request["update_target"],
-            "update_services": api_request.get("update_services", []),  # list of service hash
+        self._discovery_info: DiscoveryInfo = {
+            "update_source": update_source,
+            "update_target": update_target,
+            "update_services": update_services,  # list of service hash
         }
 
     def execute_discovery(self, discovery_result=None):
@@ -201,7 +234,14 @@ class Discovery:
                 remove_disabled_rule,
             )
 
-            if entry.check_source in [DiscoveryState.MONITORED, DiscoveryState.IGNORED]:
+            # Vanished services have to be added here because of audit log entries.
+            # Otherwise, on each change all vanished services would lead to an
+            # "added" entry, also on remove of a vanished service
+            if entry.check_source in [
+                DiscoveryState.MONITORED,
+                DiscoveryState.IGNORED,
+                DiscoveryState.VANISHED,
+            ]:
                 old_autochecks[key] = value
 
         if apply_changes:
@@ -235,21 +275,11 @@ class Discovery:
             ),
         )
 
-        site_id = self._host.site_id()
-        site_status = states().get(site_id, SiteStatus({}))
-        if is_pre_17_remote_site(site_status):
-            # is this branch still needed?
-            set_autochecks(
-                site_id,
-                self._host.name(),
-                {x: y[1:3] for x, y in checks.items()},  # type: ignore[misc]
-            )
-        else:
-            set_autochecks(
-                site_id,
-                self._host.name(),
-                checks,
-            )
+        set_autochecks(
+            self._host.site_id(),
+            self._host.name(),
+            checks,
+        )
 
     def _save_host_service_enable_disable_rules(self, to_enable, to_disable):
         self._save_service_enable_disable_rules(to_enable, value=False)
@@ -289,10 +319,15 @@ class Discovery:
         # Check whether or not the service still needs a host specific setting after removing
         # the host specific setting above and remove all services from the service list
         # that are fine without an additional change.
+        services_labels = get_services_labels(self._host.site_id(), self._host.name(), services)
         for service in list(services):
-            value_without_host_rule = ruleset.analyse_ruleset(self._host.name(), service, service)[
-                0
-            ]
+            service_labels = services_labels.labels[service]
+            value_without_host_rule, _ = ruleset.analyse_ruleset(
+                self._host.name(),
+                service,
+                service,
+                service_labels=service_labels,
+            )
             if (
                 not value and value_without_host_rule in [None, False]
             ) or value == value_without_host_rule:
@@ -398,7 +433,154 @@ class Discovery:
         )
 
 
-def _apply_state_change(
+def service_discovery_call(
+    perform_action_call: Union[
+        Callable[
+            [DiscoveryOptions, DiscoveryResult, NamedArg(CREHost, "host")],
+            DiscoveryResult,
+        ],
+        Callable[
+            [
+                DiscoveryOptions,
+                DiscoveryResult,
+                List[str],
+                Optional[str],
+                Optional[str],
+                NamedArg(CREHost, "host"),
+            ],
+            DiscoveryResult,
+        ],
+    ]
+):
+    def decorate(*args, **kwargs) -> DiscoveryResult:
+        user.need_permission("wato.services")
+        result = perform_action_call(*args, **kwargs)
+        host: CREHost = kwargs["host"]
+        if not host.locked():
+            host.clear_discovery_failed()
+        return result
+
+    return decorate
+
+
+@service_discovery_call
+def perform_fix_all(
+    discovery_options: DiscoveryOptions,
+    discovery_result: DiscoveryResult,
+    *,
+    host: CREHost,
+) -> DiscoveryResult:
+    """
+    Handle fix all ('Accept All' on UI) discovery action
+    """
+    _perform_update_host_labels(host, discovery_result.host_labels)
+    Discovery(
+        host,
+        discovery_options,
+        update_target=None,
+        update_services=[],
+        update_source=None,
+    ).do_discovery(discovery_result)
+    discovery_result = get_check_table(
+        StartDiscoveryRequest(host, host.folder(), discovery_options)
+    )
+    return discovery_result
+
+
+@service_discovery_call
+def perform_host_label_discovery(
+    discovery_options: DiscoveryOptions,
+    discovery_result: DiscoveryResult,
+    *,
+    host: CREHost,
+) -> DiscoveryResult:
+    """Handle update host labels discovery action"""
+    _perform_update_host_labels(host, discovery_result.host_labels)
+    discovery_result = get_check_table(
+        StartDiscoveryRequest(host, host.folder(), discovery_options)
+    )
+    return discovery_result
+
+
+@service_discovery_call
+def perform_service_discovery(
+    discovery_options: DiscoveryOptions,
+    discovery_result: DiscoveryResult,
+    update_services: List[str],
+    update_source: Optional[str],
+    update_target: Optional[str],
+    *,
+    host: CREHost,
+) -> DiscoveryResult:
+    """
+    Handle discovery action for Update Services, Single Update & Bulk Update
+    """
+    Discovery(
+        host,
+        discovery_options,
+        update_target=update_target,
+        update_services=update_services,
+        update_source=update_source,
+    ).do_discovery(discovery_result)
+    discovery_result = get_check_table(
+        StartDiscoveryRequest(host, host.folder(), discovery_options)
+    )
+    return discovery_result
+
+
+def has_discovery_action_specific_permissions(intended_discovery_action: str) -> bool:
+    if intended_discovery_action == DiscoveryAction.NONE and not user.may("wato.services"):
+        return False
+    if intended_discovery_action != DiscoveryAction.TABULA_RASA and not (
+        user.may("wato.service_discovery_to_undecided")
+        and user.may("wato.service_discovery_to_monitored")
+        and user.may("wato.service_discovery_to_ignored")
+        and user.may("wato.service_discovery_to_removed")
+    ):
+        return False
+    return True
+
+
+def initial_discovery_result(
+    discovery_options: DiscoveryOptions,
+    host: CREHost,
+    previous_discovery_result: Optional[DiscoveryResult],
+) -> DiscoveryResult:
+    if _use_previous_discovery_result(previous_discovery_result):
+        assert previous_discovery_result is not None
+        return previous_discovery_result
+
+    return get_check_table(StartDiscoveryRequest(host, host.folder(), discovery_options))
+
+
+def _use_previous_discovery_result(previous_discovery_result: Optional[DiscoveryResult]) -> bool:
+    if not previous_discovery_result:
+        return False
+
+    if has_active_job(previous_discovery_result):
+        return False
+
+    return True
+
+
+def _perform_update_host_labels(host, host_labels):
+    message = _("Updated discovered host labels of '%s' with %d labels") % (
+        host.name(),
+        len(host_labels),
+    )
+    watolib.add_service_change(
+        host,
+        "update-host-labels",
+        message,
+    )
+    update_host_labels(
+        host.site_id(),
+        host.name(),
+        host_labels,
+    )
+
+
+def _apply_state_change(  # pylint: disable=too-many-branches
     table_source: str,
     table_target: str,
     key: Tuple[Any, Any],
@@ -409,7 +591,6 @@ def _apply_state_change(
     add_disabled_rule: Set[str],
     remove_disabled_rule: Set[str],
 ):
-
     if table_source == DiscoveryState.UNDECIDED:
         if table_target == DiscoveryState.MONITORED:
             autochecks_to_save[key] = value
@@ -475,7 +656,7 @@ def _make_host_audit_log_object(checks: SetAutochecksTable) -> Set[str]:
     return {v[0] for v in checks.values()}
 
 
-def checkbox_id(check_type, item):
+def checkbox_id(check_type: str, item: Item) -> str:
     """Generate HTML variable for service
 
     This needs to be unique for each host. Since this text is used as
@@ -713,3 +894,7 @@ class ServiceDiscoveryBackgroundJob(WatoBackgroundJob):
 
     def _check_table_file_path(self):
         return os.path.join(self.get_work_dir(), "check_table.mk")
+
+
+def has_active_job(discovery_result: DiscoveryResult) -> bool:
+    return discovery_result.job_status["is_active"]

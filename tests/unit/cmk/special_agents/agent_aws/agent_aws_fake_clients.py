@@ -1637,7 +1637,9 @@ class EC2DescribeSpotInstanceRequestsIB(InstanceBuilder):
                                         [
                                             "standard",
                                             "io1",
+                                            "io2",
                                             "gp2",
+                                            "gp3",
                                             "sc1",
                                             "st1",
                                         ],
@@ -1835,7 +1837,9 @@ class EC2DescribeSpotFleetRequestsIB(InstanceBuilder):
                                                 [
                                                     "standard",
                                                     "io1",
+                                                    "io2",
                                                     "gp2",
+                                                    "gp3",
                                                     "sc1",
                                                     "st1",
                                                 ],
@@ -2417,7 +2421,9 @@ class EC2DescribeVolumesIB(InstanceBuilder):
                 [
                     "standard",
                     "io1",
+                    "io2",
                     "gp2",
+                    "gp3",
                     "sc1",
                     "st1",
                 ],
@@ -2974,29 +2980,92 @@ class FakeCloudwatchClient:
 
 class QueryResults(TypedDict):
     status: str
-    results: Mapping[str, Sequence[Mapping[str, str]]]
+    results: Sequence[Sequence[Mapping[str, str]]]
+    statistics: Mapping[str, float]
+    ResponseMetadata: Mapping[str, Any]
 
 
 FAKE_CLOUDWATCH_CLIENT_LOGS_CLIENT_DEFAULT_RESPONSE: QueryResults = {
+    "results": [
+        [
+            {"field": "@log", "value": "710145618630:/aws/lambda/FunctionName-0"},
+            {"field": "max_memory_used_bytes", "value": "29000000"},
+            {"field": "max_init_duration_ms", "value": "201.44"},
+            {"field": "count_cold_starts", "value": "1"},
+            {"field": "count_invocations", "value": "3"},
+        ],
+    ],
+    "statistics": {"recordsMatched": 2.0, "recordsScanned": 6.0, "bytesScanned": 710.0},
     "status": "Complete",
-    "results": {
-        "arn:aws:lambda:eu-central-1:710145618630:function:my_python_test_function": [
-            {"field": "max_memory_used_bytes", "value": "52000000"},
-            {"field": "max_init_duration_ms", "value": "1702.11"},
-            {"field": "count_cold_starts", "value": "2"},
-            {"field": "count_invocations", "value": "4"},
-        ]
+    "ResponseMetadata": {
+        "RequestId": "0bb17f7e-1230-474a-a9dc-93d583a6a01a",
+        "HTTPStatusCode": 200,
+        "HTTPHeaders": {
+            "x-amzn-requestid": "0bb17f7e-1230-474a-a9dc-93d583a6a01a",
+            "content-type": "application/x-amz-json-1.1",
+            "content-length": "250",
+            "date": "Thu, 16 Jun 2022 11:49:00 GMT",
+        },
+        "RetryAttempts": 0,
     },
 }
+
+
+FAKE_LOGWATCH_CLIENT_DESCRIBE_LOG_GROUPS_PAGINATOR_RESPONSE = [
+    {
+        "logGroups": [
+            {
+                "logGroupName": "/aws/lambda/FunctionName-0",
+                "creationTime": 1655379990007,
+                "metricFilterCount": 0,
+                "arn": "arn:aws:logs:us-east-1:710145618630:log-group:/aws/lambda/FunctionName-0:*",
+                "storedBytes": 5129,
+            },
+            {
+                "logGroupName": "/aws/lambda/deleted-function",
+                "creationTime": 1659443572877,
+                "metricFilterCount": 0,
+                "arn": "arn:aws:logs:us-east-1:710145618630:log-group:/aws/lambda/deleted-function:*",
+                "storedBytes": 4105,
+            },
+        ],
+        "ResponseMetadata": {
+            "RequestId": "ed9c2a23-f656-423c-9a47-f21c11e66ec9",
+            "HTTPStatusCode": 200,
+            "HTTPHeaders": {
+                "x-amzn-requestid": "ed9c2a23-f656-423c-9a47-f21c11e66ec9",
+                "content-type": "application/x-amz-json-1.1",
+                "content-length": "2503",
+                "date": "Wed, 03 Aug 2022 13:50:28 GMT",
+            },
+            "RetryAttempts": 0,
+        },
+    }
+]
 
 
 class QueryId(TypedDict):
     queryId: str
 
 
+class FakeResourceNotFoundException(Exception):
+    pass
+
+
+class FakeCloudwatchClientLogsClientExceptions:
+    ResourceNotFoundException = FakeResourceNotFoundException
+
+
+class FakeCloudwatchClientLogsDescribeLogGroupsPaginator:
+    def paginate(self, *args, **kwargs):
+        return FAKE_LOGWATCH_CLIENT_DESCRIBE_LOG_GROUPS_PAGINATOR_RESPONSE
+
+
 class FakeCloudwatchClientLogsClient:
+    exceptions = FakeCloudwatchClientLogsClientExceptions()
+
     def start_query(
-        self, logGroupName: str, startTime: int, endTime: int, queryString: str
+        self, logGroupNames: list[str], startTime: int, endTime: int, queryString: str
     ) -> QueryId:
         return {"queryId": "MY_QUERY_ID"}
 
@@ -3005,6 +3074,11 @@ class FakeCloudwatchClientLogsClient:
 
     def stop_query(self, queryId: str):
         pass
+
+    def get_paginator(self, api_call):
+        if api_call == "describe_log_groups":
+            return FakeCloudwatchClientLogsDescribeLogGroupsPaginator()
+        raise NotImplementedError(f"Please implement the paginator for {api_call}")
 
 
 class FakeServiceQuotasClient:
@@ -3139,4 +3213,17 @@ class LambdaListProvisionedConcurrencyConfigsIB(InstanceBuilder):
         }
 
 
-# .
+class SNSListSubscriptionsIB(InstanceBuilder):
+    def _fill_instance(self):
+        return [
+            Str("SubscriptionArn"),
+            Str("Owner"),
+            Str("Protocol"),
+            Str("Endpoint"),
+            Str("TopicArn"),
+        ]
+
+
+class SNSListTopicsIB(InstanceBuilder):
+    def _fill_instance(self):
+        return [Str("TopicArn")]

@@ -200,8 +200,7 @@ void CleanArtifacts() {
     fs::remove(ac::ControllerFlagFile(), ec);
     fs::remove(ac::ControllerFlagFile(), ec);
 }
-constexpr auto marker_new =
-    "Check MK monitoring and management Service - 2.1, 64-bit";
+constexpr auto marker_new = "Checkmk monitoring agent service - 2.1, 64-bit";
 constexpr auto marker_old =
     "Check MK monitoring and management Service, 64-bit";
 
@@ -407,7 +406,9 @@ TEST(AgentController, SimulationIntegration) {
         fs::path{cfg::GetUserBinDir()} / cfg::files::kAgentCtl;
     EXPECT_TRUE(ac::StartAgentController(service));
     EXPECT_TRUE(fs::exists(expected));
+    EXPECT_TRUE(fs::exists(ac::TomlConfigFile()));
     EXPECT_TRUE(ac::KillAgentController(service));
     EXPECT_FALSE(fs::exists(expected));
+    EXPECT_FALSE(fs::exists(ac::TomlConfigFile()));
 }
 }  // namespace cma::ac

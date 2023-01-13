@@ -15,7 +15,19 @@ import sys
 import time
 import traceback
 from collections import defaultdict, OrderedDict
-from typing import Any, Callable, DefaultDict, Dict, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 from urllib.parse import quote
 
 import requests
@@ -1467,25 +1479,19 @@ class PrometheusServer:
         response = self.api_client.query_static_endpoint("/-/healthy")
         return {"status_code": response.status_code, "status_text": response.reason}
 
-    def _prometheus_version(self) -> str:
-        promql_result = self.api_client.perform_multi_result_promql("prometheus_build_info")
+    def _prometheus_version(self) -> Sequence[str]:
+        try:
+            endpoint_result = self.api_client.query_static_endpoint("/status/buildinfo")
+            return [json.loads(endpoint_result.content)["data"]["version"]]
+        except requests.exceptions.HTTPError as e:  # This endpoint is only available from v2.14
+            if e.response.status_code not in (404, 405):
+                raise e
 
+        promql_result = self.api_client.perform_multi_result_promql("prometheus_build_info")
         if promql_result is None:
             raise ApiError("Missing Prometheus version")
 
-        try:
-            version = promql_result.promql_metrics[0]["labels"]["version"]
-        except IndexError:
-            return ""
-
-        if len(promql_result.promql_metrics) > 1:
-            for prometheus_instance in promql_result.promql_metrics:
-                if prometheus_instance["labels"]["version"] != version:
-                    raise ApiError(
-                        "Multiple Prometheus instances with different versions connected"
-                    )
-
-        return version
+        return [instance["labels"]["version"] for instance in promql_result.promql_metrics]
 
     def _scrape_targets(self) -> Dict[str, Any]:
         down_targets = []
@@ -1510,7 +1516,7 @@ class PrometheusServer:
 
     def _runtime_info(self) -> Dict[str, Any]:
         try:
-            endpoint_result = self.api_client.query_static_endpoint("/api/v1/status/runtimeinfo")
+            endpoint_result = self.api_client.query_static_endpoint("/status/runtimeinfo")
         except requests.exceptions.HTTPError:  # This endpoint is only available from v2.14
             return {}
 
@@ -1524,7 +1530,10 @@ class PrometheusAPI:
 
     def __init__(self, session) -> None:
         self.session = session
-        self.scrape_targets_dict = self._connected_scrape_targets()
+
+    @property
+    def scrape_targets_dict(self) -> Dict[str, Any]:
+        return self._connected_scrape_targets()
 
     def scrape_targets_attributes(self) -> Iterator[Tuple[str, Dict[str, Any]]]:
         """Format the scrape_targets_dict for information processing
